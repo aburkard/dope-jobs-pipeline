@@ -11,6 +11,10 @@ on:
         description: "Total shard count"
         required: true
         default: "1"
+      db_company_limit:
+        description: "Optional cap on DB-selected companies for this run"
+        required: false
+        default: ""
       max_per_company:
         description: "Max jobs fetched per company for this run"
         required: true
@@ -64,12 +68,16 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           ARGS=(
-            --companies "companies.smoke.txt"
+            --companies-from-db
             --shard-index "${{ inputs.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
             --max-per-company "${{ inputs.max_per_company }}"
             --parse-limit "${{ inputs.parse_limit }}"
           )
+
+          if [ -n "${{ inputs.db_company_limit }}" ]; then
+            ARGS+=(--db-company-limit "${{ inputs.db_company_limit }}")
+          fi
 
           if [ "${{ inputs.skip_scrape }}" = "true" ]; then
             ARGS+=(--skip-scrape)
