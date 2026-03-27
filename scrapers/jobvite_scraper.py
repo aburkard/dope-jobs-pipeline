@@ -1,4 +1,5 @@
 import html2text
+import json
 from bs4 import BeautifulSoup
 
 from .base_scraper import BaseScraper
@@ -105,8 +106,14 @@ class JobviteScraper(BaseScraper):
         job = {}
         job['id'] = job_id
         description_html = soup.select_one('div.jv-job-detail-description')
+        job['descriptionHtml'] = str(description_html or "")
         job['description'] = self.html2text.handle(
             str(description_html or "")).strip()
+        metadata = self.extract_job_metadata(soup)
+        if metadata.get("datePosted"):
+            job["datePosted"] = metadata["datePosted"]
+        if metadata.get("validThrough"):
+            job["validThrough"] = metadata["validThrough"]
         return job
 
     def normalize_job(self, job):
@@ -118,11 +125,47 @@ class JobviteScraper(BaseScraper):
             "company": company_name,
             "title": job['title'],
             "description": self.clean_description(job),
+            "descriptionHtml": job.get("descriptionHtml", ""),
             "location": job['location'],
             "url": job['url'],
             "updated_at": None,
+            "datePosted": job.get("datePosted"),
+            "validThrough": job.get("validThrough"),
         }
 
     def clean_description(self, job):
         # TODO: Do I need to do more here?
         return job.get('description', '')
+
+    def extract_job_metadata(self, soup):
+        metadata = {}
+        for script in soup.select('script[type="application/ld+json"]'):
+            text = script.string or script.get_text() or ""
+            text = text.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            for item in self._iter_structured_items(payload):
+                if item.get("@type") != "JobPosting":
+                    continue
+                if item.get("datePosted"):
+                    metadata["datePosted"] = item["datePosted"]
+                if item.get("validThrough"):
+                    metadata["validThrough"] = item["validThrough"]
+                return metadata
+        return metadata
+
+    def _iter_structured_items(self, payload):
+        if isinstance(payload, list):
+            for item in payload:
+                yield from self._iter_structured_items(item)
+            return
+        if isinstance(payload, dict):
+            yield payload
+            graph_items = payload.get("@graph")
+            if isinstance(graph_items, list):
+                for item in graph_items:
+                    yield from self._iter_structured_items(item)

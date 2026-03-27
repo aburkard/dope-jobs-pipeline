@@ -1,3 +1,5 @@
+import html as html_lib
+
 from bs4 import BeautifulSoup
 
 from .base_scraper import BaseScraper
@@ -47,6 +49,7 @@ class LeverScraper(BaseScraper):
 
     def normalize_job(self, job):
         description = self.clean_description(job)
+        description_html = self.clean_description_html(job)
         categories = job.get('categories', {}) or {}
 
         return {
@@ -55,11 +58,14 @@ class LeverScraper(BaseScraper):
             "company": utils.get_company_name(self.board_token),
             "title": job.get('text'),
             "description": description,
+            "descriptionHtml": description_html,
             "additionalPlain": job.get('additionalPlain', ''),  # often has compensation
             "location": categories.get('location'),
             "url": job.get('hostedUrl'),
             "applyUrl": job.get('applyUrl'),
             "country": job.get('country', ''),
+            "createdAt": job.get('createdAt'),
+            "updatedAt": job.get('updatedAt'),
 
             # Structured data from API
             "workplaceType": job.get('workplaceType', ''),  # onsite, remote, hybrid
@@ -77,6 +83,37 @@ class LeverScraper(BaseScraper):
             s += f"{title}\n{content}\n"
         s += job['additionalPlain']
         return s.strip()
+
+    def clean_description_html(self, job):
+        parts = []
+
+        description_html = job.get("description")
+        if description_html:
+            parts.append(description_html)
+        else:
+            description_plain = job.get("descriptionPlain", "").strip()
+            if description_plain:
+                escaped = html_lib.escape(description_plain).replace("\n", "<br>")
+                parts.append(f"<p>{escaped}</p>")
+
+        for item in job.get("lists", []):
+            title = (item.get("text") or "").strip()
+            content = item.get("content") or ""
+            if title:
+                parts.append(f"<p>{html_lib.escape(title)}</p>")
+            if content:
+                parts.append(content)
+
+        additional_html = job.get("additional")
+        if additional_html:
+            parts.append(additional_html)
+        else:
+            additional_plain = job.get("additionalPlain", "").strip()
+            if additional_plain:
+                escaped = html_lib.escape(additional_plain).replace("\n", "<br>")
+                parts.append(f"<p>{escaped}</p>")
+
+        return "\n".join(part for part in parts if part).strip()
 
     def _fetch_html(self, force=False):
         if not hasattr(self, '_cached_html') or force:

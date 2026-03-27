@@ -95,19 +95,27 @@ class TestScraperNormalization:
             "id": "abc-123",
             "text": "Designer",
             "descriptionPlain": "Design things",
-            "lists": [],
+            "description": "<div><p>Design things</p></div>",
+            "lists": [{"text": "What you'll do", "content": "<ul><li>Ship product</li></ul>"}],
             "additionalPlain": "Extra info",
+            "additional": "<p>Extra info</p>",
             "categories": {"location": "NYC", "department": "Design", "commitment": "Full-time", "team": "Product"},
             "hostedUrl": "https://example.com",
             "applyUrl": "https://example.com/apply",
             "workplaceType": "hybrid",
             "country": "US",
+            "createdAt": 1710000000000,
+            "updatedAt": 1710000005000,
         }
         normalized = scraper.normalize_job(raw)
         assert normalized["id"] == "lever__test__abc-123"
         assert normalized["workplaceType"] == "hybrid"
         assert normalized["department"] == "Design"
         assert normalized["commitment"] == "Full-time"
+        assert normalized["createdAt"] == 1710000000000
+        assert normalized["updatedAt"] == 1710000005000
+        assert "<ul><li>Ship product</li></ul>" in normalized["descriptionHtml"]
+        assert "Extra info" in normalized["description"]
 
     def test_ashby_fields(self):
         from scrapers.ashby_scraper import AshbyScraper
@@ -142,3 +150,23 @@ class TestScraperNormalization:
         assert normalized["compensationTierSummary"] == "$150K – $200K"
         assert normalized["locationCity"] == "New York"
         assert normalized["locationCountry"] == "US"
+
+    def test_jobvite_fields(self):
+        from scrapers.jobvite_scraper import JobviteScraper
+        scraper = JobviteScraper("test")
+        raw = {
+            "id": "abc123",
+            "title": "Data Engineer",
+            "description": "Build pipelines",
+            "descriptionHtml": "<div class='jv-job-detail-description'><p>Build pipelines</p></div>",
+            "location": "Remote, USA",
+            "url": "https://jobs.jobvite.com/test/job/abc123",
+            "company_name": "Example Co",
+            "datePosted": "2026-03-01",
+            "validThrough": "2026-04-01T00:00",
+        }
+        normalized = scraper.normalize_job(raw)
+        assert normalized["id"] == "jobvite__test__abc123"
+        assert normalized["descriptionHtml"].startswith("<div")
+        assert normalized["datePosted"] == "2026-03-01"
+        assert normalized["validThrough"] == "2026-04-01T00:00"
