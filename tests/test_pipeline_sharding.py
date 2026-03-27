@@ -192,3 +192,43 @@ def test_step_scrape_skips_greenhouse_pay_refetch_when_existing_pay_present(monk
     result = pipeline.step_scrape(object(), [("greenhouse", "figma")], max_per_company=5)
 
     assert result["changed_count"] == 0
+
+
+def test_step_scrape_without_cap_fetches_all_jobs(monkeypatch):
+    class FakeScraper:
+        def __init__(self, token):
+            self.token = token
+
+        def fetch_jobs(self):
+            for i in range(3):
+                yield {
+                    "id": f"greenhouse__figma__{i}",
+                    "ats_name": "greenhouse",
+                    "board_token": self.token,
+                    "title": f"Job {i}",
+                }
+
+        def get_company_name(self):
+            return "Figma"
+
+        def get_company_domain(self):
+            return "figma.com"
+
+        def get_company_logo_url(self):
+            return None
+
+    monkeypatch.setitem(pipeline.ATS_SCRAPERS, "greenhouse", FakeScraper)
+    monkeypatch.setattr(pipeline, "get_existing_jobs_for_board", lambda conn, ats, token: {})
+    monkeypatch.setattr(pipeline, "upsert_scraped_jobs", lambda conn, jobs: {
+        "new": jobs,
+        "changed": [],
+        "unchanged": 0,
+        "needs_detail_fetch": [],
+    })
+    monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
+    monkeypatch.setattr(pipeline, "upsert_company", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
+
+    result = pipeline.step_scrape(object(), [("greenhouse", "figma")], max_per_company=None)
+
+    assert result["new_count"] == 3

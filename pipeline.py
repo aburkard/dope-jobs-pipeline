@@ -100,7 +100,7 @@ def should_mark_removed(fetched_count: int, max_per_company: int | None) -> bool
     return max_per_company is None or fetched_count < max_per_company
 
 
-def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 50,
+def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | None = None,
                 jobvite_refetch_existing_detail: bool = False):
     """Scrape all companies and detect changes via content hashing."""
     print(f"\n--- SCRAPE ({len(companies)} companies) ---")
@@ -134,15 +134,14 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
                     for short_id, raw in existing_jobs_by_short_id.items()
                     if raw.get("description")
                 }
-                jobs = list(itertools.islice(
-                    scraper.fetch_jobs(
-                        existing_descriptions=existing_descriptions,
-                        refetch_existing_detail=jobvite_refetch_existing_detail,
-                    ),
-                    max_per_company,
-                ))
+                job_iter = scraper.fetch_jobs(
+                    existing_descriptions=existing_descriptions,
+                    refetch_existing_detail=jobvite_refetch_existing_detail,
+                )
+                jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
             else:
-                jobs = list(itertools.islice(scraper.fetch_jobs(), max_per_company))
+                job_iter = scraper.fetch_jobs()
+                jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
 
             # Detect changes against DB
             result = upsert_scraped_jobs(conn, jobs)
@@ -526,7 +525,8 @@ def main():
     parser.add_argument("--parse-pending", action="store_true", help="Only parse jobs with needs_parse=True")
     parser.add_argument("--base-url", default="https://api.openai.com/v1", help="LLM API base URL")
     parser.add_argument("--model", default="gemini-3.1-flash-lite-preview", help="LLM model name (gemini-* uses Gemini API, others use OpenAI API)")
-    parser.add_argument("--max-per-company", type=int, default=50, help="Max jobs per company")
+    parser.add_argument("--max-per-company", type=int, default=None,
+                        help="Optional max jobs fetched per company (default: no cap)")
     parser.add_argument("--parse-limit", type=int, default=None, help="Max jobs to parse per run")
     parser.add_argument("--allow-full-parse", action="store_true",
                         help="Allow parse step without a parse limit when using --companies-from-db")

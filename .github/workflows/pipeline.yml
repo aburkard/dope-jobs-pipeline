@@ -8,9 +8,9 @@ on:
         required: false
         default: ""
       max_per_company:
-        description: "Max jobs fetched per company for this run"
-        required: true
-        default: "50"
+        description: "Optional max jobs fetched per company for this run"
+        required: false
+        default: ""
       total_shards:
         description: "Total shard count for this rollout"
         required: true
@@ -53,13 +53,16 @@ jobs:
             --companies-from-db
             --shard-index "${{ matrix.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
-            --max-per-company "${{ inputs.max_per_company }}"
             --skip-parse
             --skip-load
           )
 
           if [ -n "${{ inputs.db_company_limit }}" ]; then
             ARGS+=(--db-company-limit "${{ inputs.db_company_limit }}")
+          fi
+
+          if [ -n "${{ inputs.max_per_company }}" ]; then
+            ARGS+=(--max-per-company "${{ inputs.max_per_company }}")
           fi
 
           uv run python pipeline.py "${ARGS[@]}"
