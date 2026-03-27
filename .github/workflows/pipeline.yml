@@ -56,17 +56,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Decrypt companies list
-        env:
-          COMPANIES_PASSPHRASE: ${{ secrets.COMPANIES_PASSPHRASE }}
-        run: |
-          gpg --quiet --batch --yes \
-            --pinentry-mode loopback \
-            --decrypt \
-            --passphrase="$COMPANIES_PASSPHRASE" \
-            --output "$RUNNER_TEMP/companies.txt" \
-            companies.txt.gpg
-
       - name: Run sharded pipeline
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -75,7 +64,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           ARGS=(
-            --companies "$RUNNER_TEMP/companies.txt"
+            --companies "companies.smoke.txt"
             --shard-index "${{ inputs.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
             --max-per-company "${{ inputs.max_per_company }}"

@@ -43,7 +43,6 @@ Set these in your environment locally, or as GitHub Actions repository secrets:
 - `MEILISEARCH_HOST`
 - `MEILISEARCH_MASTER_KEY`
 - `GEMINI_API_KEY`
-- `COMPANIES_PASSPHRASE`
 
 Depending on your parser/backend choices, you may also need:
 
@@ -59,25 +58,19 @@ Create a `.env` file or export the required environment variables.
 
 ## Local Usage
 
-Run the full pipeline on the default company list:
+Run the full pipeline on the smoke-test company list:
 
 ```bash
-gpg --quiet --batch --yes --decrypt \
-  --pinentry-mode loopback \
-  --passphrase="$COMPANIES_PASSPHRASE" \
-  --output /tmp/companies.txt \
-  companies.txt.gpg
-
-uv run python pipeline.py --companies /tmp/companies.txt
+uv run python pipeline.py --companies companies.smoke.txt
 ```
 
 Useful variants:
 
 ```bash
-uv run python pipeline.py --companies /tmp/companies.txt --skip-load
-uv run python pipeline.py --companies /tmp/companies.txt --skip-scrape
-uv run python pipeline.py --companies /tmp/companies.txt --skip-parse
-uv run python pipeline.py --companies /tmp/companies.txt --full-load
+uv run python pipeline.py --companies companies.smoke.txt --skip-load
+uv run python pipeline.py --companies companies.smoke.txt --skip-scrape
+uv run python pipeline.py --companies companies.smoke.txt --skip-parse
+uv run python pipeline.py --companies companies.smoke.txt --full-load
 ```
 
 ## Sharding
@@ -94,7 +87,7 @@ Example:
 
 ```bash
 uv run python pipeline.py \
-  --companies /tmp/companies.txt \
+  --companies companies.smoke.txt \
   --shard-index 0 \
   --total-shards 4
 ```
@@ -114,7 +107,7 @@ The repository currently uses a bounded manual workflow so the first GitHub run 
 The workflow:
 
 - runs on `workflow_dispatch`
-- decrypts `companies.txt.gpg` at runtime
+- uses the committed `companies.smoke.txt` test set
 - passes shard and limit flags directly to `pipeline.py`
 - supports `skip-scrape`, `skip-parse`, and `skip-load`
 
@@ -126,7 +119,9 @@ Recommended first run:
 - `parse_limit=5`
 - `skip_load=true`
 
-After that succeeds, expand the shard count, raise the limits, and add the daily `schedule` trigger back to the workflow.
+This smoke set includes active Greenhouse, Lever, Ashby, and Jobvite boards, plus two intentionally empty boards to validate inactive-board handling.
+
+After that succeeds, the next step is to stop using a committed file and have scheduled runs select boards from Postgres directly.
 
 ## Tests
 
