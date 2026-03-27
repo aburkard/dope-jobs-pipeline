@@ -1,0 +1,55 @@
+name: Scheduled Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * *"
+
+concurrency:
+  group: dopejobs-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard_index: [0, 1, 2, 3]
+        total_shards: [4]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Decrypt companies list
+        env:
+          COMPANIES_PASSPHRASE: ${{ secrets.COMPANIES_PASSPHRASE }}
+        run: |
+          gpg --quiet --batch --yes \
+            --decrypt \
+            --passphrase="$COMPANIES_PASSPHRASE" \
+            --output "$RUNNER_TEMP/companies.txt" \
+            companies.txt.gpg
+
+      - name: Run sharded pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
+          MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: >
+          uv run python pipeline.py
+          --companies $RUNNER_TEMP/companies.txt
+          --shard-index ${{ matrix.shard_index }}
+          --total-shards ${{ matrix.total_shards }}
