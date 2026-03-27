@@ -570,6 +570,74 @@ def get_parse_batch_job_rows(conn, batch_id: str) -> list[dict]:
     ]
 
 
+def apply_parse_batch_chunk(conn, batch_id: str, success_rows: list[tuple[str, str, dict]],
+                            error_rows: list[tuple[str, str, str]]) -> dict:
+    """Apply a chunk of batch parse results with a single transaction."""
+    attempted_ids = [row[0] for row in success_rows] + [row[0] for row in error_rows]
+    if not attempted_ids:
+        return {"applied_success_ids": [], "applied_failure_count": 0, "stale_count": 0}
+    applied_success_ids: list[str] = []
+    applied_failure_count = 0
+
+    with conn.cursor() as cur:
+        if success_rows:
+            updated = execute_values(
+                cur,
+                """
+                WITH incoming(job_id, expected_hash, parsed_json) AS (VALUES %s)
+                UPDATE pipeline_jobs AS pj
+                SET parsed_json = incoming.parsed_json,
+                    last_parsed_at = NOW(),
+                    needs_parse = FALSE,
+                    parse_error_count = 0,
+                    last_parse_error = NULL
+                FROM incoming
+                WHERE pj.id = incoming.job_id
+                  AND pj.removed_at IS NULL
+                  AND pj.content_hash = incoming.expected_hash
+                RETURNING pj.id
+                """,
+                [(job_id, expected_hash, Json(parsed_json)) for job_id, expected_hash, parsed_json in success_rows],
+                template="(%s, %s, %s)",
+                fetch=True,
+            )
+            applied_success_ids = [row[0] for row in updated]
+
+        if error_rows:
+            updated = execute_values(
+                cur,
+                """
+                WITH incoming(job_id, expected_hash, error_text) AS (VALUES %s)
+                UPDATE pipeline_jobs AS pj
+                SET parse_error_count = COALESCE(pj.parse_error_count, 0) + 1,
+                    last_parse_error = LEFT(incoming.error_text, 500),
+                    needs_parse = (COALESCE(pj.parse_error_count, 0) + 1) < 3
+                FROM incoming
+                WHERE pj.id = incoming.job_id
+                  AND pj.removed_at IS NULL
+                  AND pj.content_hash = incoming.expected_hash
+                RETURNING pj.id
+                """,
+                error_rows,
+                template="(%s, %s, %s)",
+                fetch=True,
+            )
+            applied_failure_count = len(updated)
+
+        cur.execute(
+            "DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s AND job_id = ANY(%s)",
+            (batch_id, attempted_ids),
+        )
+
+    conn.commit()
+    stale_count = len(attempted_ids) - len(applied_success_ids) - applied_failure_count
+    return {
+        "applied_success_ids": applied_success_ids,
+        "applied_failure_count": applied_failure_count,
+        "stale_count": stale_count,
+    }
+
+
 def save_parsed_batch_result(conn, batch_id: str, job_id: str, expected_hash: str, parsed_json: dict) -> bool:
     """Save a batch parse result if the job content has not changed since submission."""
     now = datetime.now(timezone.utc)

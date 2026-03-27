@@ -1,6 +1,6 @@
 import json
 
-from batch_parse import build_batch_request_entry, extract_batch_output_entry
+from batch_parse import build_batch_request_entry, extract_batch_output_entry, normalize_batch_resource
 from parse import GeminiBackend
 
 
@@ -35,6 +35,14 @@ def test_extract_batch_output_entry_handles_bare_generate_content_response():
     response, error = extract_batch_output_entry(payload)
     assert error is None
     assert response == payload
+
+
+def test_normalize_batch_resource_prefers_metadata_wrapper():
+    payload = {
+        "name": "operations/abc",
+        "metadata": {"name": "batches/xyz", "state": "BATCH_STATE_PENDING"},
+    }
+    assert normalize_batch_resource(payload) == payload["metadata"]
 
 
 

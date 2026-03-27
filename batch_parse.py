@@ -16,23 +16,22 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from dotenv import load_dotenv
 
 from db import (
+    apply_parse_batch_chunk,
     claim_jobs_for_parse_batch,
     delete_parse_batch,
     delete_parse_batch_jobs,
     get_connection,
-    get_parse_batch,
     get_parse_batch_job_rows,
     init_schema,
     list_parse_batches,
-    record_parse_batch_error,
     rename_parse_batch,
     save_parse_batch,
-    save_parsed_batch_result,
     update_parse_batch,
 )
 from parse import GeminiBackend, merge_api_data, prepare_job_text
@@ -52,6 +51,11 @@ def normalize_batch_resource(data: dict) -> dict:
     return data
 
 
+def _redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
 class GeminiBatchClient:
     def __init__(self, model: str, api_key: str | None = None):
         self._session = requests.Session()
@@ -60,9 +64,40 @@ class GeminiBatchClient:
         if not self._api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
+    def _request(self, method: str, url: str, *, retries: int = 5, **kwargs) -> requests.Response:
+        delay = 2.0
+        last_response = None
+        for attempt in range(retries):
+            resp = self._session.request(method, url, **kwargs)
+            if resp.status_code not in {429, 500, 502, 503, 504}:
+                if resp.ok:
+                    return resp
+                message = (
+                    f"Gemini API {resp.status_code} for {_redact_url(url)}: "
+                    f"{(resp.text or '')[:500]}"
+                )
+                raise RuntimeError(message)
+            last_response = resp
+            if attempt == retries - 1:
+                break
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                sleep_for = float(retry_after) if retry_after else delay
+            except ValueError:
+                sleep_for = delay
+            time.sleep(sleep_for)
+            delay = min(delay * 2, 60.0)
+
+        message = (
+            f"Gemini API {last_response.status_code} for {_redact_url(url)}: "
+            f"{(last_response.text or '')[:500]}"
+        )
+        raise RuntimeError(message)
+
     def upload_jsonl(self, path: Path, display_name: str) -> dict:
         size = path.stat().st_size
-        start_resp = self._session.post(
+        start_resp = self._request(
+            "POST",
             f"{GEMINI_API_BASE}/upload/v1beta/files",
             params={"key": self._api_key},
             headers={
@@ -80,7 +115,8 @@ class GeminiBatchClient:
         if not upload_url:
             raise RuntimeError("Gemini upload response missing resumable upload URL")
 
-        upload_resp = self._session.post(
+        upload_resp = self._request(
+            "POST",
             upload_url,
             headers={
                 "Content-Length": str(size),
@@ -98,7 +134,8 @@ class GeminiBatchClient:
         return file_info
 
     def create_batch(self, requests_file_name: str, display_name: str) -> str:
-        resp = self._session.post(
+        resp = self._request(
+            "POST",
             f"{GEMINI_API_BASE}/v1beta/models/{self._model}:batchGenerateContent",
             params={"key": self._api_key},
             json={
@@ -109,7 +146,6 @@ class GeminiBatchClient:
             },
             timeout=60,
         )
-        resp.raise_for_status()
         data = resp.json()
         batch = normalize_batch_resource(data)
         for candidate in (
@@ -123,21 +159,21 @@ class GeminiBatchClient:
         raise RuntimeError(f"Could not determine Gemini batch name from response: {data}")
 
     def get_batch(self, batch_name: str) -> dict:
-        resp = self._session.get(
+        resp = self._request(
+            "GET",
             f"{GEMINI_API_BASE}/v1beta/{batch_name}",
             params={"key": self._api_key},
             timeout=60,
         )
-        resp.raise_for_status()
         return normalize_batch_resource(resp.json())
 
     def get_file_metadata(self, file_name: str) -> dict:
-        resp = self._session.get(
+        resp = self._request(
+            "GET",
             f"{GEMINI_API_BASE}/v1beta/{file_name}",
             params={"key": self._api_key},
             timeout=60,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def download_file_text(self, file_name: str) -> str:
@@ -147,20 +183,19 @@ class GeminiBatchClient:
             raise RuntimeError(f"Gemini file metadata missing downloadUri: {metadata}")
 
         attempts = [
-            {"url": download_url, "kwargs": {"timeout": 300}},
             {"url": download_url, "kwargs": {"params": {"key": self._api_key}, "timeout": 300}},
             {"url": download_url, "kwargs": {"headers": {"x-goog-api-key": self._api_key}, "timeout": 300}},
             {
                 "url": f"{GEMINI_API_BASE}/v1beta/{file_name}:download",
                 "kwargs": {"params": {"key": self._api_key}, "timeout": 300},
             },
+            {"url": download_url, "kwargs": {"timeout": 300}},
         ]
 
         last_error = None
         for attempt in attempts:
             try:
-                resp = self._session.get(attempt["url"], **attempt["kwargs"])
-                resp.raise_for_status()
+                resp = self._request("GET", attempt["url"], **attempt["kwargs"])
                 return resp.text
             except Exception as exc:  # pragma: no cover - fallback path
                 last_error = exc
@@ -298,59 +333,62 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
     failures = 0
     stale = 0
     mismatch_error = None
+    chunk_success_rows: list[tuple[str, str, dict]] = []
+    chunk_error_rows: list[tuple[str, str, str]] = []
+    chunk_size = 200
 
     if len(lines) != len(reserved_jobs):
         mismatch_error = (
             f"Batch output line count mismatch: got {len(lines)} lines for {len(reserved_jobs)} reserved jobs"
         )
 
+    def flush_chunk():
+        nonlocal successes, failures, stale, chunk_success_rows, chunk_error_rows, parsed_ids
+        if not chunk_success_rows and not chunk_error_rows:
+            return
+        result = apply_parse_batch_chunk(conn, batch_name, chunk_success_rows, chunk_error_rows)
+        successes += len(result["applied_success_ids"])
+        failures += result["applied_failure_count"]
+        stale += result["stale_count"]
+        parsed_ids.extend(result["applied_success_ids"])
+        chunk_success_rows = []
+        chunk_error_rows = []
+
     for job_row, line in zip(reserved_jobs, lines):
         payload = json.loads(line)
         response_payload, response_error = extract_batch_output_entry(payload)
         if response_error:
-            applied = record_parse_batch_error(
-                conn,
-                batch_name,
-                job_row["job_id"],
-                job_row["submitted_content_hash"],
-                response_error,
+            chunk_error_rows.append(
+                (job_row["job_id"], job_row["submitted_content_hash"], response_error)
             )
-            if applied:
-                failures += 1
-            else:
-                stale += 1
+            if len(chunk_success_rows) + len(chunk_error_rows) >= chunk_size:
+                flush_chunk()
             continue
 
         parsed, parse_error = backend.parse_response_payload(response_payload or {})
         if parse_error or parsed is None:
-            applied = record_parse_batch_error(
-                conn,
-                batch_name,
-                job_row["job_id"],
-                job_row["submitted_content_hash"],
-                parse_error or "Gemini batch returned no parsed content",
+            chunk_error_rows.append(
+                (
+                    job_row["job_id"],
+                    job_row["submitted_content_hash"],
+                    parse_error or "Gemini batch returned no parsed content",
+                )
             )
-            if applied:
-                failures += 1
-            else:
-                stale += 1
+            if len(chunk_success_rows) + len(chunk_error_rows) >= chunk_size:
+                flush_chunk()
             continue
 
         merged = merge_api_data(job_row["raw_json"] or {}, parsed.model_dump(mode="json"))
-        applied = save_parsed_batch_result(
-            conn,
-            batch_name,
-            job_row["job_id"],
-            job_row["submitted_content_hash"],
-            merged,
+        chunk_success_rows.append(
+            (job_row["job_id"], job_row["submitted_content_hash"], merged)
         )
-        if applied:
-            successes += 1
-            parsed_ids.append(job_row["job_id"])
-        else:
-            stale += 1
+        if len(chunk_success_rows) + len(chunk_error_rows) >= chunk_size:
+            flush_chunk()
+
+    flush_chunk()
 
     if len(lines) != len(reserved_jobs):
+        stale += abs(len(lines) - len(reserved_jobs))
         delete_parse_batch_jobs(conn, batch_name)
 
     update_parse_batch(
