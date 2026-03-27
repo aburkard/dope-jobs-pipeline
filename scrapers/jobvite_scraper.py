@@ -35,26 +35,35 @@ class JobviteScraper(BaseScraper):
         # Job listings have the css class table.jv-job-list tr, ul.jv-job-list li
         job_listings = soup.select(
             'table.jv-job-list tr, ul.jv-job-list li, div.jv-job-list li')
-        for job_listing in job_listings:
-            job = {}
-            job['board_token'] = self.board_token
-            job['title'] = utils.squish(
-                job_listing.select_one(
-                    'td.jv-job-list-name, span.jv-job-list-name, div.jv-job-list-name'
-                ).text)
-            job['location'] = utils.squish(
-                job_listing.select_one(
-                    'td.jv-job-list-location, span.jv-job-list-location, div.jv-job-list-location'
-                ).text)
-
-            href = utils.squish(
-                job_listing.select_one('td.jv-job-list-name a, a')['href'])
-            job['url'] = f'{self.base_url}{href}'
-            job['id'] = href.split('/')[-1]
-
-            company_name = soup.select_one('title').text
+        company_name = None
+        title_el = soup.select_one('title')
+        if title_el:
+            company_name = title_el.text
             if company_name.endswith(' Careers'):
                 company_name = company_name[:-8]
+        for job_listing in job_listings:
+            title_node = job_listing.select_one(
+                'td.jv-job-list-name, span.jv-job-list-name, div.jv-job-list-name'
+            )
+            location_node = job_listing.select_one(
+                'td.jv-job-list-location, span.jv-job-list-location, div.jv-job-list-location'
+            )
+            link_node = job_listing.select_one('td.jv-job-list-name a, a')
+
+            # Some Jobvite tables include header or spacer rows that match the broad selector.
+            if title_node is None or location_node is None or link_node is None:
+                continue
+
+            job = {}
+            job['board_token'] = self.board_token
+            job['title'] = utils.squish(title_node.text)
+            job['location'] = utils.squish(location_node.text)
+
+            href = utils.squish(link_node.get('href', ''))
+            if not href:
+                continue
+            job['url'] = f'{self.base_url}{href}'
+            job['id'] = href.split('/')[-1]
             job['company_name'] = company_name
 
             if content:
@@ -82,9 +91,9 @@ class JobviteScraper(BaseScraper):
         soup = BeautifulSoup(response.text, 'html.parser')
         job = {}
         job['id'] = job_id
-        description_html = soup.select_one('div.jv-job-detail-description p')
+        description_html = soup.select_one('div.jv-job-detail-description')
         job['description'] = self.html2text.handle(
-            str(description_html)).strip()
+            str(description_html or "")).strip()
         return job
 
     def normalize_job(self, job):
@@ -103,4 +112,4 @@ class JobviteScraper(BaseScraper):
 
     def clean_description(self, job):
         # TODO: Do I need to do more here?
-        return job['description']
+        return job.get('description', '')
