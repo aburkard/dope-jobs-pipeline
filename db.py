@@ -307,6 +307,17 @@ def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, dict]:
+    """Get existing raw jobs for a board keyed by compound job ID."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, raw_json
+            FROM pipeline_jobs
+            WHERE ats = %s AND board_token = %s
+        """, (ats, board_token))
+        return {row[0]: (row[1] or {}) for row in cur.fetchall()}
+
+
 def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
     """Select a bounded set of active companies for scraping.
 

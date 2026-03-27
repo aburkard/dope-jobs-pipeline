@@ -32,6 +32,7 @@ from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
     record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
+    get_existing_jobs_for_board,
 )
 
 
@@ -99,7 +100,8 @@ def should_mark_removed(fetched_count: int, max_per_company: int | None) -> bool
     return max_per_company is None or fetched_count < max_per_company
 
 
-def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 50):
+def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 50,
+                jobvite_refetch_existing_detail: bool = False):
     """Scrape all companies and detect changes via content hashing."""
     print(f"\n--- SCRAPE ({len(companies)} companies) ---")
 
@@ -120,7 +122,27 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
 
         try:
             scraper = scraper_cls(token)
-            jobs = list(itertools.islice(scraper.fetch_jobs(), max_per_company))
+            existing_jobs = get_existing_jobs_for_board(conn, ats, token)
+            existing_jobs_by_short_id = {
+                jid.split("__")[-1]: raw
+                for jid, raw in existing_jobs.items()
+            }
+
+            if ats == "jobvite":
+                existing_descriptions = {
+                    short_id: raw.get("description", "")
+                    for short_id, raw in existing_jobs_by_short_id.items()
+                    if raw.get("description")
+                }
+                jobs = list(itertools.islice(
+                    scraper.fetch_jobs(
+                        existing_descriptions=existing_descriptions,
+                        refetch_existing_detail=jobvite_refetch_existing_detail,
+                    ),
+                    max_per_company,
+                ))
+            else:
+                jobs = list(itertools.islice(scraper.fetch_jobs(), max_per_company))
 
             # Detect changes against DB
             result = upsert_scraped_jobs(conn, jobs)
@@ -132,13 +154,18 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
             # Fetch per-job detail data for jobs that need it (e.g. Greenhouse pay transparency)
             n_detail = 0
             if ats == "greenhouse" and needs_detail:
+                changed_or_new_ids = {job_id(raw) for raw in result["new"]}
+                changed_or_new_ids.update(job_id(raw) for raw in result["changed"])
                 for raw in needs_detail:
+                    jid = job_id(raw)
+                    existing_raw = existing_jobs.get(jid, {})
+                    if jid not in changed_or_new_ids and existing_raw.get("pay_input_ranges"):
+                        continue
                     raw_id = str(raw.get("id", "")).split("__")[-1]
                     try:
                         pay_ranges = scraper.fetch_job_pay(raw_id)
                         if pay_ranges:
                             # Update raw_json in DB with pay data
-                            jid = job_id(raw)
                             with conn.cursor() as cur:
                                 cur.execute("""
                                     UPDATE pipeline_jobs
@@ -510,6 +537,8 @@ def main():
                         help="Allow MeiliSearch load step when using --companies-from-db")
     parser.add_argument("--shard-index", type=int, default=None, help="0-based shard index for company selection")
     parser.add_argument("--total-shards", type=int, default=None, help="Total number of shards for company selection")
+    parser.add_argument("--jobvite-refetch-existing-detail", action="store_true",
+                        help="Force Jobvite detail HTML refetch for existing jobs")
     args = parser.parse_args()
 
     if (args.shard_index is None) != (args.total_shards is None):
@@ -553,7 +582,12 @@ def main():
 
     # Step 1: Scrape + detect changes
     if not args.skip_scrape:
-        scrape_result = step_scrape(conn, selected_companies, max_per_company=args.max_per_company)
+        scrape_result = step_scrape(
+            conn,
+            selected_companies,
+            max_per_company=args.max_per_company,
+            jobvite_refetch_existing_detail=args.jobvite_refetch_existing_detail,
+        )
     else:
         print("Skipping scrape")
 
