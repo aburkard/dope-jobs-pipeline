@@ -648,6 +648,19 @@ class GeminiBackend:
                           "visa_sponsorship", "benefits_categories", "salary_transparency"],
         }
 
+    def _extract_text(self, data: dict) -> str | None:
+        """Best-effort extraction of text from Gemini generateContent responses."""
+        candidates = data.get("candidates")
+        if not candidates:
+            return None
+
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        texts = [part.get("text", "") for part in parts if isinstance(part, dict) and part.get("text")]
+        if not texts:
+            return None
+        return "".join(texts)
+
     def extract_batch(self, job_texts: list[str], max_tokens: int = 2000) -> list[JobMetadata | None]:
         results = []
         for text in job_texts:
@@ -665,8 +678,25 @@ class GeminiBackend:
                     },
                     timeout=60,
                 )
+                if not resp.ok:
+                    print(f"  Gemini HTTP {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+                    results.append(None)
+                    continue
                 data = resp.json()
-                content = data["candidates"][0]["content"]["parts"][0]["text"]
+                content = self._extract_text(data)
+                if not content:
+                    error = data.get("error")
+                    prompt_feedback = data.get("promptFeedback")
+                    finish_reason = None
+                    candidates = data.get("candidates") or []
+                    if candidates:
+                        finish_reason = candidates[0].get("finishReason")
+                    print(
+                        f"  Gemini response missing text: error={error!r} prompt_feedback={prompt_feedback!r} finish_reason={finish_reason!r}",
+                        file=sys.stderr,
+                    )
+                    results.append(None)
+                    continue
                 parsed = _parse_response(content, use_flat=True)
                 if parsed is None:
                     parsed = _parse_response(content, use_flat=False)
