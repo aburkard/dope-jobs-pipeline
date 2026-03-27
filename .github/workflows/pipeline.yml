@@ -1,9 +1,39 @@
-name: Scheduled Pipeline
+name: Pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 9 * * *"
+    inputs:
+      shard_index:
+        description: "0-based shard index"
+        required: true
+        default: "0"
+      total_shards:
+        description: "Total shard count"
+        required: true
+        default: "1"
+      max_per_company:
+        description: "Max jobs fetched per company for this run"
+        required: true
+        default: "5"
+      parse_limit:
+        description: "Max jobs parsed for this run"
+        required: true
+        default: "5"
+      skip_load:
+        description: "Skip MeiliSearch writes"
+        required: true
+        default: true
+        type: boolean
+      skip_parse:
+        description: "Skip parsing"
+        required: true
+        default: false
+        type: boolean
+      skip_scrape:
+        description: "Skip scraping"
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: dopejobs-pipeline
@@ -13,12 +43,6 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard_index: [0, 1, 2, 3]
-        total_shards: [4]
 
     steps:
       - uses: actions/checkout@v5
@@ -48,8 +72,25 @@ jobs:
           MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
           MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: >
-          uv run python pipeline.py
-          --companies $RUNNER_TEMP/companies.txt
-          --shard-index ${{ matrix.shard_index }}
-          --total-shards ${{ matrix.total_shards }}
+        run: |
+          ARGS=(
+            --companies "$RUNNER_TEMP/companies.txt"
+            --shard-index "${{ inputs.shard_index }}"
+            --total-shards "${{ inputs.total_shards }}"
+            --max-per-company "${{ inputs.max_per_company }}"
+            --parse-limit "${{ inputs.parse_limit }}"
+          )
+
+          if [ "${{ inputs.skip_scrape }}" = "true" ]; then
+            ARGS+=(--skip-scrape)
+          fi
+
+          if [ "${{ inputs.skip_parse }}" = "true" ]; then
+            ARGS+=(--skip-parse)
+          fi
+
+          if [ "${{ inputs.skip_load }}" = "true" ]; then
+            ARGS+=(--skip-load)
+          fi
+
+          uv run python pipeline.py "${ARGS[@]}"

@@ -108,23 +108,24 @@ Run four shards in parallel by invoking shard indices `0` through `3`.
 
 ## GitHub Actions
 
-The intended deployment model is a public repository with scheduled GitHub Actions.
+The repository currently uses a bounded manual workflow so the first GitHub run is cheap and explicit.
 
-Recommended workflow behavior:
+The workflow:
 
-- run on `workflow_dispatch` and `schedule`
-- use a matrix over shard indices
-- set `max-parallel` to a modest value like `4`
-- use workflow-level `concurrency` to prevent overlapping runs
+- runs on `workflow_dispatch`
+- decrypts `companies.txt.gpg` at runtime
+- passes shard and limit flags directly to `pipeline.py`
+- supports `skip-scrape`, `skip-parse`, and `skip-load`
 
-The workflow should use `companies.txt` as the canonical source list and pass:
+Recommended first run:
 
-- `--shard-index`
-- `--total-shards`
+- `shard_index=0`
+- `total_shards=1`
+- `max_per_company=5`
+- `parse_limit=5`
+- `skip_load=true`
 
-to `pipeline.py`.
-
-In the public repo, the canonical company list is stored as `companies.txt.gpg` and decrypted at runtime inside GitHub Actions.
+After that succeeds, expand the shard count, raise the limits, and add the daily `schedule` trigger back to the workflow.
 
 ## Tests
 
