@@ -61,6 +61,7 @@ jobs:
           COMPANIES_PASSPHRASE: ${{ secrets.COMPANIES_PASSPHRASE }}
         run: |
           gpg --quiet --batch --yes \
+            --pinentry-mode loopback \
             --decrypt \
             --passphrase="$COMPANIES_PASSPHRASE" \
             --output "$RUNNER_TEMP/companies.txt" \

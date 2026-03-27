@@ -63,6 +63,7 @@ Run the full pipeline on the default company list:
 
 ```bash
 gpg --quiet --batch --yes --decrypt \
+  --pinentry-mode loopback \
   --passphrase="$COMPANIES_PASSPHRASE" \
   --output /tmp/companies.txt \
   companies.txt.gpg
