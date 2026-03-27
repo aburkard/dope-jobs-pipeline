@@ -483,6 +483,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "hard_skills", "soft_skills", "benefits_highlights",
     ])
     index.update_sortable_attributes(["salary_min", "salary_max"])
+    index.update_settings({"pagination": {"maxTotalHits": 500000}})
 
     # Upsert documents in batches
     BATCH_SIZE = 1000
