@@ -307,9 +307,25 @@ def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
+    """Select a bounded set of active companies for scraping.
+
+    Prioritize companies that have never been scraped, then oldest scrape times.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ats, board_token
+            FROM pipeline_companies
+            WHERE active = TRUE
+            ORDER BY last_scraped_at NULLS FIRST, ats, board_token
+            LIMIT %s
+        """, (limit,))
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+
 def upsert_company(conn, ats: str, board_token: str, company_name: str | None = None,
                     domain: str | None = None, logo_url: str | None = None,
-                    job_count: int = 0):
+                    job_count: int = 0, job_count_exact: bool = True):
     """Upsert a company record."""
     now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
@@ -321,9 +337,18 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                 domain = COALESCE(EXCLUDED.domain, pipeline_companies.domain),
                 logo_url = COALESCE(EXCLUDED.logo_url, pipeline_companies.logo_url),
                 last_scraped_at = EXCLUDED.last_scraped_at,
-                job_count = EXCLUDED.job_count,
-                active = EXCLUDED.job_count > 0
-        """, (ats, board_token, company_name, domain, logo_url, now, job_count, job_count))
+                job_count = CASE
+                    WHEN %s THEN EXCLUDED.job_count
+                    ELSE GREATEST(pipeline_companies.job_count, EXCLUDED.job_count)
+                END,
+                active = CASE
+                    WHEN %s THEN EXCLUDED.job_count > 0
+                    ELSE pipeline_companies.active OR EXCLUDED.job_count > 0
+                END
+        """, (
+            ats, board_token, company_name, domain, logo_url, now, job_count, job_count,
+            job_count_exact, job_count_exact,
+        ))
     conn.commit()
 
 

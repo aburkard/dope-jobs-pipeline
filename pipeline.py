@@ -31,7 +31,7 @@ from scrapers.jobvite_scraper import JobviteScraper
 from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
-    record_parse_error, get_parsed_jobs, get_removed_job_ids,
+    record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
 )
 
 
@@ -57,6 +57,23 @@ def parse_companies_file(path: str) -> list[tuple[str, str]]:
                 ats, token = "greenhouse", line
             companies.append((ats.strip(), token.strip()))
     return companies
+
+
+def resolve_companies(conn, companies_path: str | None = None,
+                      companies_from_db: bool = False,
+                      db_company_limit: int | None = None) -> list[tuple[str, str]]:
+    """Resolve companies from either a file or a bounded DB query."""
+    if companies_from_db:
+        if db_company_limit is None:
+            raise ValueError("--db-company-limit is required with --companies-from-db")
+        if db_company_limit <= 0:
+            raise ValueError("--db-company-limit must be greater than 0")
+        return get_companies_to_scrape(conn, limit=db_company_limit)
+
+    if not companies_path:
+        raise ValueError("--companies is required unless --companies-from-db is used")
+
+    return parse_companies_file(companies_path)
 
 
 def shard_for_company(ats: str, token: str, total_shards: int) -> int:
@@ -134,10 +151,13 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
                     time.sleep(0.1)
                 conn.commit()
 
+            # A bounded scrape only gives a lower bound on board size.
+            complete_scrape = should_mark_removed(len(jobs), max_per_company)
+
             # Mark jobs not seen in this scrape as removed
             seen_ids = {job_id(j) for j in jobs}
             removed_ids = []
-            if should_mark_removed(len(jobs), max_per_company):
+            if complete_scrape:
                 removed_ids = mark_removed(conn, ats, token, seen_ids)
             n_removed = len(removed_ids)
 
@@ -165,6 +185,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
                 domain=company_domain,
                 logo_url=company_logo,
                 job_count=len(jobs),
+                job_count_exact=complete_scrape,
             )
 
             status_parts = []
@@ -466,7 +487,12 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
 def main():
     parser = argparse.ArgumentParser(description="dopejobs pipeline")
-    parser.add_argument("--companies", required=True, help="Companies file (ats:token per line)")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--companies", help="Companies file (ats:token per line)")
+    source_group.add_argument("--companies-from-db", action="store_true",
+                              help="Select companies from pipeline_companies instead of a file")
+    parser.add_argument("--db-company-limit", type=int, default=None,
+                        help="Required safety cap when using --companies-from-db")
     parser.add_argument("--skip-scrape", action="store_true")
     parser.add_argument("--skip-parse", action="store_true")
     parser.add_argument("--skip-load", action="store_true")
@@ -492,7 +518,15 @@ def main():
     conn = get_connection()
     init_schema(conn)
 
-    companies = parse_companies_file(args.companies)
+    try:
+        companies = resolve_companies(
+            conn,
+            companies_path=args.companies,
+            companies_from_db=args.companies_from_db,
+            db_company_limit=args.db_company_limit,
+        )
+    except ValueError as e:
+        parser.error(str(e))
     selected_companies = filter_companies_for_shard(companies, args.shard_index, args.total_shards)
     if args.total_shards is not None:
         print(f"Using shard {args.shard_index}/{args.total_shards}: {len(selected_companies)} of {len(companies)} companies")

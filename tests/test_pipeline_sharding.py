@@ -1,4 +1,5 @@
-from pipeline import filter_companies_for_shard, shard_for_company, should_mark_removed
+import pipeline
+from pipeline import filter_companies_for_shard, shard_for_company, should_mark_removed, resolve_companies
 
 
 def test_shard_for_company_is_stable():
@@ -32,3 +33,71 @@ def test_should_mark_removed_only_for_complete_scrapes():
     assert should_mark_removed(3, None) is True
     assert should_mark_removed(3, 10) is True
     assert should_mark_removed(10, 10) is False
+
+
+def test_step_scrape_does_not_overwrite_company_job_count_for_truncated_scrapes(monkeypatch):
+    class FakeScraper:
+        def __init__(self, token):
+            self.token = token
+
+        def fetch_jobs(self):
+            for i in range(5):
+                yield {
+                    "id": str(i),
+                    "ats_name": "greenhouse",
+                    "board_token": self.token,
+                    "title": f"Job {i}",
+                }
+
+        def get_company_name(self):
+            return "Toast"
+
+        def get_company_domain(self):
+            return "toasttab.com"
+
+        def get_company_logo_url(self):
+            return "https://example.com/logo.png"
+
+    captured = {}
+
+    monkeypatch.setitem(pipeline.ATS_SCRAPERS, "greenhouse", FakeScraper)
+    monkeypatch.setattr(pipeline, "upsert_scraped_jobs", lambda conn, jobs: {
+        "new": jobs,
+        "changed": [],
+        "unchanged": 0,
+        "needs_detail_fetch": [],
+    })
+    monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
+    monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
+
+    def fake_upsert_company(conn, ats, token, **kwargs):
+        captured["ats"] = ats
+        captured["token"] = token
+        captured.update(kwargs)
+
+    monkeypatch.setattr(pipeline, "upsert_company", fake_upsert_company)
+
+    pipeline.step_scrape(object(), [("greenhouse", "toast")], max_per_company=5)
+
+    assert captured["ats"] == "greenhouse"
+    assert captured["token"] == "toast"
+    assert captured["job_count"] == 5
+    assert captured["job_count_exact"] is False
+
+
+def test_resolve_companies_requires_explicit_db_limit():
+    try:
+        resolve_companies(object(), companies_from_db=True, db_company_limit=None)
+    except ValueError as e:
+        assert "--db-company-limit is required" in str(e)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_resolve_companies_uses_bounded_db_selection(monkeypatch):
+    monkeypatch.setattr(pipeline, "get_companies_to_scrape", lambda conn, limit: [
+        ("greenhouse", "figma"),
+        ("ashby", "openai"),
+    ] if limit == 2 else [])
+    companies = resolve_companies(object(), companies_from_db=True, db_company_limit=2)
+    assert companies == [("greenhouse", "figma"), ("ashby", "openai")]
