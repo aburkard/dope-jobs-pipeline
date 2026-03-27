@@ -111,10 +111,11 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
     touched_job_ids = set()
     removed_job_ids = set()
 
-    for ats, token in companies:
+    total_companies = len(companies)
+    for idx, (ats, token) in enumerate(companies, start=1):
         scraper_cls = ATS_SCRAPERS.get(ats)
         if not scraper_cls:
-            print(f"  Unknown ATS '{ats}' for {token}, skipping")
+            print(f"  [{idx}/{total_companies}] {ats}:{token} — unknown ATS, skipping")
             continue
 
         try:
@@ -194,7 +195,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
             if n_removed: status_parts.append(f"{n_removed} removed")
             if n_detail: status_parts.append(f"{n_detail} pay fetched")
             status = ", ".join(status_parts) or "empty"
-            print(f"  {ats}:{token} — {len(jobs)} total → {status}")
+            print(f"  [{idx}/{total_companies}] {ats}:{token} — {len(jobs)} total → {status}")
 
             total_new += n_new
             total_changed += n_changed
@@ -206,7 +207,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int = 5
 
         except Exception as e:
             errors += 1
-            print(f"  {ats}:{token} — ERROR: {e}")
+            print(f"  [{idx}/{total_companies}] {ats}:{token} — ERROR: {e}")
             # Don't update company record on error — avoid marking as inactive
             continue
 
@@ -534,6 +535,15 @@ def main():
         )
     except ValueError as e:
         parser.error(str(e))
+
+    if args.companies_from_db:
+        if args.db_company_limit is None:
+            print(f"Using DB company selection: {len(companies)} companies (no company cap)")
+        else:
+            print(f"Using DB company selection: {len(companies)} companies (cap {args.db_company_limit})")
+    else:
+        print(f"Using file company selection: {len(companies)} companies from {args.companies}")
+
     selected_companies = filter_companies_for_shard(companies, args.shard_index, args.total_shards)
     if args.total_shards is not None:
         print(f"Using shard {args.shard_index}/{args.total_shards}: {len(selected_companies)} of {len(companies)} companies")
