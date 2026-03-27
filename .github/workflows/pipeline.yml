@@ -3,14 +3,6 @@ name: Pipeline
 on:
   workflow_dispatch:
     inputs:
-      shard_index:
-        description: "0-based shard index"
-        required: true
-        default: "0"
-      total_shards:
-        description: "Total shard count"
-        required: true
-        default: "1"
       db_company_limit:
         description: "Optional cap on DB-selected companies for this run"
         required: false
@@ -18,26 +10,11 @@ on:
       max_per_company:
         description: "Max jobs fetched per company for this run"
         required: true
-        default: "5"
-      parse_limit:
-        description: "Max jobs parsed for this run"
+        default: "50"
+      total_shards:
+        description: "Total shard count for this rollout"
         required: true
-        default: "5"
-      skip_load:
-        description: "Skip MeiliSearch writes"
-        required: true
-        default: true
-        type: boolean
-      skip_parse:
-        description: "Skip parsing"
-        required: true
-        default: false
-        type: boolean
-      skip_scrape:
-        description: "Skip scraping"
-        required: true
-        default: false
-        type: boolean
+        default: "8"
 
 concurrency:
   group: dopejobs-pipeline
@@ -47,6 +24,11 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard_index: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - uses: actions/checkout@v5
@@ -69,26 +51,15 @@ jobs:
         run: |
           ARGS=(
             --companies-from-db
-            --shard-index "${{ inputs.shard_index }}"
+            --shard-index "${{ matrix.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
             --max-per-company "${{ inputs.max_per_company }}"
-            --parse-limit "${{ inputs.parse_limit }}"
+            --skip-parse
+            --skip-load
           )
 
           if [ -n "${{ inputs.db_company_limit }}" ]; then
             ARGS+=(--db-company-limit "${{ inputs.db_company_limit }}")
-          fi
-
-          if [ "${{ inputs.skip_scrape }}" = "true" ]; then
-            ARGS+=(--skip-scrape)
-          fi
-
-          if [ "${{ inputs.skip_parse }}" = "true" ]; then
-            ARGS+=(--skip-parse)
-          fi
-
-          if [ "${{ inputs.skip_load }}" = "true" ]; then
-            ARGS+=(--skip-load)
           fi
 
           uv run python pipeline.py "${ARGS[@]}"
