@@ -648,6 +648,19 @@ class GeminiBackend:
                           "visa_sponsorship", "benefits_categories", "salary_transparency"],
         }
 
+    def build_request(self, job_text: str, max_tokens: int = 2000) -> dict:
+        prompt = f"{SYSTEM_PROMPT}\n\nExtract metadata:\n\n{job_text}"
+        return {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json",
+                "responseSchema": self._schema,
+            },
+        }
+
+
     def _extract_text(self, data: dict) -> str | None:
         """Best-effort extraction of text from Gemini generateContent responses."""
         candidates = data.get("candidates")
@@ -661,47 +674,43 @@ class GeminiBackend:
             return None
         return "".join(texts)
 
+    def parse_response_payload(self, data: dict) -> tuple[JobMetadata | None, str | None]:
+        content = self._extract_text(data)
+        if not content:
+            error = data.get("error")
+            prompt_feedback = data.get("promptFeedback")
+            finish_reason = None
+            candidates = data.get("candidates") or []
+            if candidates:
+                finish_reason = candidates[0].get("finishReason")
+            return None, (
+                "Gemini response missing text: "
+                f"error={error!r} prompt_feedback={prompt_feedback!r} finish_reason={finish_reason!r}"
+            )
+
+        parsed = _parse_response(content, use_flat=True)
+        if parsed is None:
+            parsed = _parse_response(content, use_flat=False)
+        if parsed is None:
+            return None, f"Failed to parse Gemini response: {content[:200]}..."
+        return parsed, None
+
     def extract_batch(self, job_texts: list[str], max_tokens: int = 2000) -> list[JobMetadata | None]:
         results = []
         for text in job_texts:
             try:
                 resp = self._session.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}",
-                    json={
-                        "contents": [{"parts": [{"text": f"{SYSTEM_PROMPT}\n\nExtract metadata:\n\n{text}"}]}],
-                        "generationConfig": {
-                            "temperature": 0.1,
-                            "maxOutputTokens": max_tokens,
-                            "responseMimeType": "application/json",
-                            "responseSchema": self._schema,
-                        },
-                    },
+                    json=self.build_request(text, max_tokens=max_tokens),
                     timeout=60,
                 )
                 if not resp.ok:
                     print(f"  Gemini HTTP {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
                     results.append(None)
                     continue
-                data = resp.json()
-                content = self._extract_text(data)
-                if not content:
-                    error = data.get("error")
-                    prompt_feedback = data.get("promptFeedback")
-                    finish_reason = None
-                    candidates = data.get("candidates") or []
-                    if candidates:
-                        finish_reason = candidates[0].get("finishReason")
-                    print(
-                        f"  Gemini response missing text: error={error!r} prompt_feedback={prompt_feedback!r} finish_reason={finish_reason!r}",
-                        file=sys.stderr,
-                    )
-                    results.append(None)
-                    continue
-                parsed = _parse_response(content, use_flat=True)
-                if parsed is None:
-                    parsed = _parse_response(content, use_flat=False)
-                if parsed is None:
-                    print(f"  Failed to parse Gemini response: {content[:200]}...", file=sys.stderr)
+                parsed, error = self.parse_response_payload(resp.json())
+                if error:
+                    print(f"  {error}", file=sys.stderr)
                 results.append(parsed)
             except Exception as e:
                 print(f"  Gemini error: {e}", file=sys.stderr)

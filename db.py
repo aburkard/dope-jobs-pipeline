@@ -56,11 +56,37 @@ def init_schema(conn):
             raw_json JSONB,
             parsed_json JSONB
         )""",
+        """CREATE TABLE IF NOT EXISTS pipeline_parse_batches (
+            batch_id TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            display_name TEXT,
+            state TEXT NOT NULL,
+            input_file_name TEXT,
+            output_file_name TEXT,
+            requested_count INTEGER DEFAULT 0,
+            succeeded_count INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0,
+            stale_count INTEGER DEFAULT 0,
+            submitted_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+            last_error TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS pipeline_parse_batch_jobs (
+            batch_id TEXT NOT NULL,
+            request_index INTEGER NOT NULL,
+            job_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            PRIMARY KEY (batch_id, request_index),
+            UNIQUE (batch_id, job_id)
+        )""",
     ]
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_jobs_needs_parse ON pipeline_jobs (needs_parse) WHERE needs_parse = TRUE",
         "CREATE INDEX IF NOT EXISTS idx_jobs_board ON pipeline_jobs (ats, board_token)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_removed ON pipeline_jobs (removed_at) WHERE removed_at IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_parse_batch_jobs_job_id ON pipeline_parse_batch_jobs (job_id)",
+        "CREATE INDEX IF NOT EXISTS idx_parse_batches_state ON pipeline_parse_batches (state)",
     ]
     with conn.cursor() as cur:
         for stmt in create_statements:
@@ -229,8 +255,18 @@ def mark_removed(conn, ats: str, board_token: str, seen_ids: set[str]) -> list[s
 
 def get_jobs_needing_parse(conn, limit: int | None = None,
                            companies: list[tuple[str, str]] | None = None) -> list[dict]:
-    """Get jobs that need LLM parsing, including raw_json for text preparation."""
-    query = "SELECT id, ats, board_token, title, raw_json FROM pipeline_jobs WHERE needs_parse = TRUE AND removed_at IS NULL"
+    """Get jobs that need LLM parsing, excluding jobs already reserved for batch parsing."""
+    query = """
+        SELECT id, ats, board_token, title, raw_json
+        FROM pipeline_jobs
+        WHERE needs_parse = TRUE
+          AND removed_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_parse_batch_jobs pbj
+              WHERE pbj.job_id = pipeline_jobs.id
+          )
+    """
     params = []
     if companies is not None:
         if not companies:
@@ -316,6 +352,288 @@ def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, d
             WHERE ats = %s AND board_token = %s
         """, (ats, board_token))
         return {row[0]: (row[1] or {}) for row in cur.fetchall()}
+
+
+def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int) -> list[dict]:
+    """Reserve up to ``limit`` jobs for a Gemini batch parse submission."""
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, ats, board_token, title, raw_json, content_hash
+            FROM pipeline_jobs
+            WHERE needs_parse = TRUE
+              AND removed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pipeline_parse_batch_jobs pbj
+                  WHERE pbj.job_id = pipeline_jobs.id
+              )
+            ORDER BY last_seen_at DESC NULLS LAST, id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        if rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO pipeline_parse_batch_jobs (batch_id, request_index, job_id, content_hash)
+                VALUES %s
+                """,
+                [
+                    (batch_id, index, row[0], row[5] or "")
+                    for index, row in enumerate(rows)
+                ],
+            )
+    conn.commit()
+    return [
+        {
+            "id": row[0],
+            "ats": row[1],
+            "board_token": row[2],
+            "title": row[3],
+            "raw_json": row[4],
+            "content_hash": row[5],
+        }
+        for row in rows
+    ]
+
+
+def rename_parse_batch(conn, old_batch_id: str, new_batch_id: str):
+    """Rename reserved batch mappings after the provider returns the final batch ID."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE pipeline_parse_batch_jobs SET batch_id = %s WHERE batch_id = %s",
+            (new_batch_id, old_batch_id),
+        )
+        cur.execute(
+            "UPDATE pipeline_parse_batches SET batch_id = %s WHERE batch_id = %s",
+            (new_batch_id, old_batch_id),
+        )
+    conn.commit()
+
+
+def save_parse_batch(conn, batch_id: str, model: str, state: str, display_name: str | None = None,
+                     input_file_name: str | None = None, output_file_name: str | None = None,
+                     requested_count: int = 0, succeeded_count: int = 0, failed_count: int = 0,
+                     stale_count: int = 0, completed_at=None, last_error: str | None = None):
+    """Insert or update batch metadata."""
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO pipeline_parse_batches (
+                batch_id, model, display_name, state, input_file_name, output_file_name,
+                requested_count, succeeded_count, failed_count, stale_count, submitted_at,
+                updated_at, completed_at, last_error
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (batch_id) DO UPDATE SET
+                model = EXCLUDED.model,
+                display_name = COALESCE(EXCLUDED.display_name, pipeline_parse_batches.display_name),
+                state = EXCLUDED.state,
+                input_file_name = COALESCE(EXCLUDED.input_file_name, pipeline_parse_batches.input_file_name),
+                output_file_name = COALESCE(EXCLUDED.output_file_name, pipeline_parse_batches.output_file_name),
+                requested_count = EXCLUDED.requested_count,
+                succeeded_count = EXCLUDED.succeeded_count,
+                failed_count = EXCLUDED.failed_count,
+                stale_count = EXCLUDED.stale_count,
+                updated_at = EXCLUDED.updated_at,
+                completed_at = COALESCE(EXCLUDED.completed_at, pipeline_parse_batches.completed_at),
+                last_error = COALESCE(EXCLUDED.last_error, pipeline_parse_batches.last_error)
+            """,
+            (
+                batch_id, model, display_name, state, input_file_name, output_file_name,
+                requested_count, succeeded_count, failed_count, stale_count, now, now, completed_at, last_error,
+            ),
+        )
+    conn.commit()
+
+
+def update_parse_batch(conn, batch_id: str, state: str, output_file_name: str | None = None,
+                       succeeded_count: int | None = None, failed_count: int | None = None,
+                       stale_count: int | None = None, completed_at=None, last_error: str | None = None):
+    """Update batch status and aggregate counts."""
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pipeline_parse_batches
+            SET state = %s,
+                output_file_name = COALESCE(%s, output_file_name),
+                succeeded_count = COALESCE(%s, succeeded_count),
+                failed_count = COALESCE(%s, failed_count),
+                stale_count = COALESCE(%s, stale_count),
+                updated_at = %s,
+                completed_at = COALESCE(%s, completed_at),
+                last_error = COALESCE(%s, last_error)
+            WHERE batch_id = %s
+            """,
+            (state, output_file_name, succeeded_count, failed_count, stale_count, now, completed_at, last_error, batch_id),
+        )
+    conn.commit()
+
+
+def get_parse_batch(conn, batch_id: str) -> dict | None:
+    """Return stored metadata for a parse batch."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT batch_id, model, display_name, state, input_file_name, output_file_name,
+                   requested_count, succeeded_count, failed_count, stale_count,
+                   submitted_at, updated_at, completed_at, last_error
+            FROM pipeline_parse_batches
+            WHERE batch_id = %s
+            """,
+            (batch_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "batch_id": row[0],
+        "model": row[1],
+        "display_name": row[2],
+        "state": row[3],
+        "input_file_name": row[4],
+        "output_file_name": row[5],
+        "requested_count": row[6],
+        "succeeded_count": row[7],
+        "failed_count": row[8],
+        "stale_count": row[9],
+        "submitted_at": row[10],
+        "updated_at": row[11],
+        "completed_at": row[12],
+        "last_error": row[13],
+    }
+
+
+def list_parse_batches(conn, limit: int = 20) -> list[dict]:
+    """List recent parse batches."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT batch_id, model, display_name, state, requested_count,
+                   succeeded_count, failed_count, stale_count, submitted_at, updated_at
+            FROM pipeline_parse_batches
+            ORDER BY submitted_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "batch_id": row[0],
+            "model": row[1],
+            "display_name": row[2],
+            "state": row[3],
+            "requested_count": row[4],
+            "succeeded_count": row[5],
+            "failed_count": row[6],
+            "stale_count": row[7],
+            "submitted_at": row[8],
+            "updated_at": row[9],
+        }
+        for row in rows
+    ]
+
+
+def get_parse_batch_job_rows(conn, batch_id: str) -> list[dict]:
+    """Return reserved jobs for a batch in request order."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT pbj.request_index, pbj.job_id, pbj.content_hash, pj.raw_json, pj.content_hash
+            FROM pipeline_parse_batch_jobs pbj
+            LEFT JOIN pipeline_jobs pj ON pj.id = pbj.job_id
+            WHERE pbj.batch_id = %s
+            ORDER BY pbj.request_index
+            """,
+            (batch_id,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "request_index": row[0],
+            "job_id": row[1],
+            "submitted_content_hash": row[2],
+            "raw_json": row[3],
+            "current_content_hash": row[4],
+        }
+        for row in rows
+    ]
+
+
+def save_parsed_batch_result(conn, batch_id: str, job_id: str, expected_hash: str, parsed_json: dict) -> bool:
+    """Save a batch parse result if the job content has not changed since submission."""
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET parsed_json = %s,
+                last_parsed_at = %s,
+                needs_parse = FALSE,
+                parse_error_count = 0,
+                last_parse_error = NULL
+            WHERE id = %s
+              AND removed_at IS NULL
+              AND content_hash = %s
+            """,
+            (Json(parsed_json), now, job_id, expected_hash),
+        )
+        applied = cur.rowcount > 0
+        cur.execute(
+            "DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s AND job_id = %s",
+            (batch_id, job_id),
+        )
+    conn.commit()
+    return applied
+
+
+def record_parse_batch_error(conn, batch_id: str, job_id: str, expected_hash: str, error: str) -> bool:
+    """Record a batch parse failure if the job content is still current, then release its reservation."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET parse_error_count = COALESCE(parse_error_count, 0) + 1,
+                last_parse_error = %s,
+                needs_parse = (COALESCE(parse_error_count, 0) + 1) < 3
+            WHERE id = %s
+              AND removed_at IS NULL
+              AND content_hash = %s
+            """,
+            (error[:500], job_id, expected_hash),
+        )
+        applied = cur.rowcount > 0
+        cur.execute(
+            "DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s AND job_id = %s",
+            (batch_id, job_id),
+        )
+    conn.commit()
+    return applied
+
+
+def delete_parse_batch_jobs(conn, batch_id: str):
+    """Release all reserved jobs for a batch."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s", (batch_id,))
+    conn.commit()
+
+
+def delete_parse_batch(conn, batch_id: str):
+    """Delete local batch metadata and release any reserved jobs."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s", (batch_id,))
+        cur.execute("DELETE FROM pipeline_parse_batches WHERE batch_id = %s", (batch_id,))
+    conn.commit()
 
 
 def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
