@@ -64,11 +64,10 @@ def resolve_companies(conn, companies_path: str | None = None,
                       db_company_limit: int | None = None) -> list[tuple[str, str]]:
     """Resolve companies from either a file or a bounded DB query."""
     if companies_from_db:
-        if db_company_limit is None:
-            raise ValueError("--db-company-limit is required with --companies-from-db")
-        if db_company_limit <= 0:
+        if db_company_limit is not None and db_company_limit <= 0:
             raise ValueError("--db-company-limit must be greater than 0")
-        return get_companies_to_scrape(conn, limit=db_company_limit)
+        limit = db_company_limit if db_company_limit is not None else 10_000_000
+        return get_companies_to_scrape(conn, limit=limit)
 
     if not companies_path:
         raise ValueError("--companies is required unless --companies-from-db is used")
@@ -501,9 +500,13 @@ def main():
     parser.add_argument("--model", default="gemini-3.1-flash-lite-preview", help="LLM model name (gemini-* uses Gemini API, others use OpenAI API)")
     parser.add_argument("--max-per-company", type=int, default=50, help="Max jobs per company")
     parser.add_argument("--parse-limit", type=int, default=None, help="Max jobs to parse per run")
+    parser.add_argument("--allow-full-parse", action="store_true",
+                        help="Allow parse step without a parse limit when using --companies-from-db")
     parser.add_argument("--meili-host", default=None, help="MeiliSearch host (default: MEILISEARCH_HOST env var or localhost)")
     parser.add_argument("--meili-key", default=None, help="MeiliSearch master key (default: MEILISEARCH_MASTER_KEY env var)")
     parser.add_argument("--full-load", action="store_true", help="Rebuild and upsert all parsed jobs into MeiliSearch")
+    parser.add_argument("--allow-load", action="store_true",
+                        help="Allow MeiliSearch load step when using --companies-from-db")
     parser.add_argument("--shard-index", type=int, default=None, help="0-based shard index for company selection")
     parser.add_argument("--total-shards", type=int, default=None, help="Total number of shards for company selection")
     args = parser.parse_args()
@@ -514,6 +517,10 @@ def main():
         parser.error("--total-shards must be greater than 0")
     if args.shard_index is not None and not (0 <= args.shard_index < args.total_shards):
         parser.error("--shard-index must be in [0, total_shards)")
+    if args.companies_from_db and not args.skip_parse and args.parse_limit is None and not args.allow_full_parse:
+        parser.error("--parse-limit is required with --companies-from-db unless --allow-full-parse is set")
+    if args.companies_from_db and not args.skip_load and not args.allow_load:
+        parser.error("--skip-load or --allow-load is required with --companies-from-db")
 
     conn = get_connection()
     init_schema(conn)

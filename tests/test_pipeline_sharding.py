@@ -85,13 +85,14 @@ def test_step_scrape_does_not_overwrite_company_job_count_for_truncated_scrapes(
     assert captured["job_count_exact"] is False
 
 
-def test_resolve_companies_requires_explicit_db_limit():
-    try:
-        resolve_companies(object(), companies_from_db=True, db_company_limit=None)
-    except ValueError as e:
-        assert "--db-company-limit is required" in str(e)
-    else:
-        raise AssertionError("Expected ValueError")
+def test_resolve_companies_allows_unbounded_db_selection(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape",
+        lambda conn, limit: [("greenhouse", "figma")] if limit == 10_000_000 else [],
+    )
+    companies = resolve_companies(object(), companies_from_db=True, db_company_limit=None)
+    assert companies == [("greenhouse", "figma")]
 
 
 def test_resolve_companies_uses_bounded_db_selection(monkeypatch):
