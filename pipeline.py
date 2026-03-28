@@ -209,7 +209,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                 token,
                 company_name=company_name,
                 domain=company_domain,
-                logo_url=company_logo,
+                scraped_logo_url=company_logo,
                 job_count=len(jobs),
                 job_count_exact=complete_scrape,
             )
@@ -362,7 +362,16 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     # Load company metadata for names, domains, logos
     company_lookup = {}
     with conn.cursor() as cur:
-        cur.execute("SELECT ats, board_token, company_name, company_slug, domain, logo_url FROM pipeline_companies")
+        cur.execute("""
+            SELECT
+                ats,
+                board_token,
+                company_name,
+                company_slug,
+                domain,
+                COALESCE(logo_url, scraped_logo_url) AS effective_logo_url
+            FROM pipeline_companies
+        """)
         for r in cur.fetchall():
             company_lookup[(r[0], r[1])] = {"name": r[2], "slug": r[3], "domain": r[4], "logo_url": r[5]}
 

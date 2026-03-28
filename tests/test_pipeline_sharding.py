@@ -82,6 +82,7 @@ def test_step_scrape_does_not_overwrite_company_job_count_for_truncated_scrapes(
 
     assert captured["ats"] == "greenhouse"
     assert captured["token"] == "toast"
+    assert captured["scraped_logo_url"] == "https://example.com/logo.png"
     assert captured["job_count"] == 5
     assert captured["job_count_exact"] is False
 
