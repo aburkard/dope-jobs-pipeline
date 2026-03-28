@@ -238,6 +238,10 @@ class JobMetadata(BaseModel):
     travel_percent: int | None = Field(None, ge=0, le=100, description="Percentage of time traveling if mentioned. Null if not mentioned.")
     salary_transparency: SalaryTransparency = Field("not_disclosed", description="Did the posting actually disclose salary information?")
     interview_stages: int | None = Field(None, description="Number of interview rounds, if mentioned")
+    posting_language: str | None = Field(
+        None,
+        description="ISO 639-1 code for the language the job posting text is written in (e.g. 'en', 'fr', 'de'). This is NOT the candidate's required spoken language.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +335,8 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - certifications (array): required/preferred certifications
 - languages (array): ISO 639-1 codes of required spoken languages
 - travel_percent: 0-100 or null
-- interview_stages: number or null"""
+- interview_stages: number or null
+- posting_language: ISO 639-1 code of the language the POSTING ITSELF is written in, e.g. "en", "fr", "de". This is not the candidate's required language."""
 
 
 def build_user_prompt(job_text: str) -> str:
@@ -430,6 +435,7 @@ FLAT_JSON_SCHEMA: dict = {
         "languages": {"type": "array", "items": {"type": "string"}},
         "travel_percent": {"type": "integer"},
         "interview_stages": {"type": "integer"},
+        "posting_language": {"type": "string"},
     },
     "required": list({
         "tagline", "location_city", "location_state", "location_country",
@@ -444,6 +450,7 @@ FLAT_JSON_SCHEMA: dict = {
         "remote_timezone_earliest", "remote_timezone_latest",
         "years_experience_min", "years_experience_max", "education_level",
         "certifications", "languages", "travel_percent", "interview_stages",
+        "posting_language",
     }),
 }
 
@@ -465,6 +472,93 @@ def _to_float(val) -> float | None:
     if val is None or val == "" or val == 0:
         return None
     return float(val)
+
+
+_LANGUAGE_CODE_ALIASES = {
+    "EN": "en",
+    "ENG": "en",
+    "ENGLISH": "en",
+    "FR": "fr",
+    "FRA": "fr",
+    "FRE": "fr",
+    "FRENCH": "fr",
+    "FRANCAIS": "fr",
+    "FRANÇAIS": "fr",
+    "DE": "de",
+    "DEU": "de",
+    "GER": "de",
+    "GERMAN": "de",
+    "DEUTSCH": "de",
+    "ES": "es",
+    "SPA": "es",
+    "SPANISH": "es",
+    "ESPANOL": "es",
+    "ESPAÑOL": "es",
+    "IT": "it",
+    "ITALIAN": "it",
+    "ITALIANO": "it",
+    "PT": "pt",
+    "POR": "pt",
+    "PORTUGUESE": "pt",
+    "PORTUGUÊS": "pt",
+    "PT-BR": "pt",
+    "PT_BR": "pt",
+    "JA": "ja",
+    "JPN": "ja",
+    "JAPANESE": "ja",
+    "日本語": "ja",
+    "ZH": "zh",
+    "ZHO": "zh",
+    "CHI": "zh",
+    "CHINESE": "zh",
+    "ZH-CN": "zh",
+    "ZH_CN": "zh",
+    "ZH-TW": "zh",
+    "ZH_TW": "zh",
+    "KO": "ko",
+    "KOR": "ko",
+    "KOREAN": "ko",
+    "한국어": "ko",
+    "NL": "nl",
+    "DUTCH": "nl",
+    "NEDERLANDS": "nl",
+    "PL": "pl",
+    "POLISH": "pl",
+    "POLSKI": "pl",
+    "SV": "sv",
+    "SWE": "sv",
+    "SWEDISH": "sv",
+    "SVENSKA": "sv",
+    "DA": "da",
+    "DANISH": "da",
+    "DANSK": "da",
+    "NO": "no",
+    "NORWEGIAN": "no",
+    "NORSK": "no",
+    "FI": "fi",
+    "FINNISH": "fi",
+    "SUOMI": "fi",
+}
+
+
+def _normalize_language_code(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    alias = _LANGUAGE_CODE_ALIASES.get(normalized.upper())
+    if alias:
+        return alias
+    locale_match = re.match(r"^([A-Za-z]{2,3})[-_][A-Za-z0-9]{2,}$", normalized)
+    if locale_match:
+        base = locale_match.group(1)
+        return _normalize_language_code(base)
+    if re.fullmatch(r"[A-Za-z]{2}", normalized):
+        return normalized.lower()
+    if re.fullmatch(r"[A-Za-z]{3}", normalized):
+        return _LANGUAGE_CODE_ALIASES.get(normalized.upper())
+    return None
 
 def _flat_to_job_metadata(data: dict) -> JobMetadata:
     """Convert flat schema output to nested JobMetadata model."""
@@ -559,6 +653,9 @@ def _flat_to_job_metadata(data: dict) -> JobMetadata:
     # hybrid_days (0 = not hybrid)
     if data.get("hybrid_days") == 0:
         data["hybrid_days"] = None
+
+    posting_language = _normalize_language_code(_to_str(data.get("posting_language")))
+    data["posting_language"] = posting_language
 
     return JobMetadata.model_validate(data)
 
@@ -703,10 +800,11 @@ class GeminiBackend:
                 "benefits_highlights": {"type": "ARRAY", "items": {"type": "STRING"}},
                 "education_level": {"type": "STRING", "enum": ["none", "high-school", "bachelors", "masters", "phd", "not_specified"]},
                 "years_experience_min": {"type": "INTEGER"}, "years_experience_max": {"type": "INTEGER"},
+                "posting_language": {"type": "STRING"},
             },
             "required": ["tagline", "office_type", "job_type", "experience_level", "is_manager",
                           "industry", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
-                          "visa_sponsorship", "benefits_categories", "salary_transparency"],
+                          "visa_sponsorship", "benefits_categories", "salary_transparency", "posting_language"],
         }
 
     def build_request(self, job_text: str, max_tokens: int = 2000) -> dict:
@@ -834,6 +932,13 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
     API data wins for fields it provides — more reliable and free."""
 
     merged = dict(llm_metadata)
+
+    # --- Posting language: prefer structured/raw hints when present ---
+    posting_language = _derive_posting_language(raw_job)
+    if posting_language:
+        merged["posting_language"] = posting_language
+    else:
+        merged["posting_language"] = _normalize_language_code(merged.get("posting_language"))
 
     # --- Salary: Greenhouse pay_input_ranges ---
     pay_ranges = raw_job.get("pay_input_ranges", [])
@@ -985,6 +1090,22 @@ _COUNTRY_CODE_ALIASES = {
     "NETHERLANDS": "NL",
     "SPAIN": "ES",
 }
+
+
+def _derive_posting_language(raw_job: dict) -> str | None:
+    candidates = [
+        raw_job.get("postingLanguage"),
+        raw_job.get("inLanguage"),
+        raw_job.get("language"),
+        raw_job.get("lang"),
+        raw_job.get("locale"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            normalized = _normalize_language_code(candidate)
+            if normalized:
+                return normalized
+    return None
 
 
 def _extract_linkedin_workplace_tag(raw_job: dict) -> str | None:

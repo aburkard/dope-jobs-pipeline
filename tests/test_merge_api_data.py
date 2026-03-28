@@ -1,6 +1,6 @@
 """Tests for merge_api_data — overlaying API structured data onto LLM extraction."""
 import pytest
-from parse import merge_api_data
+from parse import _flat_to_job_metadata, merge_api_data
 
 
 class TestGreenhousePayRanges:
@@ -165,6 +165,69 @@ class TestJobType:
         llm = {"job_type": "contract"}
         result = merge_api_data(raw, llm)
         assert result["job_type"] == "contract"
+
+
+class TestPostingLanguage:
+    def test_api_language_overrides_llm_and_normalizes_locale(self):
+        raw = {"inLanguage": "fr-FR"}
+        llm = {"posting_language": "en"}
+        result = merge_api_data(raw, llm)
+        assert result["posting_language"] == "fr"
+
+    def test_keeps_normalized_llm_language_when_api_missing(self):
+        raw = {}
+        llm = {"posting_language": "de-DE"}
+        result = merge_api_data(raw, llm)
+        assert result["posting_language"] == "de"
+
+    def test_flat_schema_normalizes_posting_language(self):
+        metadata = _flat_to_job_metadata({
+            "tagline": "Role",
+            "location_city": "",
+            "location_state": "",
+            "location_country": "",
+            "location_lat": 0,
+            "location_lng": 0,
+            "salary_min": 0,
+            "salary_max": 0,
+            "salary_currency": "",
+            "salary_period": "annually",
+            "salary_transparency": "not_disclosed",
+            "office_type": "remote",
+            "hybrid_days": 0,
+            "job_type": "full-time",
+            "experience_level": "mid",
+            "is_manager": False,
+            "industry": "saas_software",
+            "hard_skills": [],
+            "soft_skills": [],
+            "cool_factor": "standard",
+            "vibe_tags": [],
+            "visa_sponsorship": "unknown",
+            "visa_sponsorship_types": [],
+            "equity_offered": False,
+            "equity_min_pct": 0,
+            "equity_max_pct": 0,
+            "company_stage": "unknown",
+            "company_size_min": 0,
+            "company_size_max": 0,
+            "team_size_min": 0,
+            "team_size_max": 0,
+            "reports_to": "",
+            "benefits_categories": [],
+            "benefits_highlights": [],
+            "remote_timezone_earliest": "",
+            "remote_timezone_latest": "",
+            "years_experience_min": 0,
+            "years_experience_max": 0,
+            "education_level": "not_specified",
+            "certifications": [],
+            "languages": [],
+            "travel_percent": 0,
+            "interview_stages": 0,
+            "posting_language": "es-MX",
+        })
+        assert metadata.posting_language == "es"
 
 
 class TestLocationOverlay:
