@@ -80,6 +80,25 @@ def init_schema(conn):
             PRIMARY KEY (batch_id, request_index),
             UNIQUE (batch_id, job_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS geo_places (
+            geoname_id BIGINT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            ascii_name TEXT,
+            display_name TEXT NOT NULL,
+            country_code TEXT,
+            country_name TEXT,
+            admin1_code TEXT,
+            admin1_name TEXT,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            population BIGINT,
+            timezone TEXT,
+            feature_class TEXT,
+            feature_code TEXT,
+            search_names TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
     ]
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_jobs_needs_parse ON pipeline_jobs (needs_parse) WHERE needs_parse = TRUE",
@@ -87,6 +106,10 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_jobs_removed ON pipeline_jobs (removed_at) WHERE removed_at IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_parse_batch_jobs_job_id ON pipeline_parse_batch_jobs (job_id)",
         "CREATE INDEX IF NOT EXISTS idx_parse_batches_state ON pipeline_parse_batches (state)",
+        "CREATE INDEX IF NOT EXISTS idx_geo_places_kind ON geo_places (kind)",
+        "CREATE INDEX IF NOT EXISTS idx_geo_places_country_admin1 ON geo_places (country_code, admin1_code)",
+        "CREATE INDEX IF NOT EXISTS idx_geo_places_population ON geo_places (population DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_geo_places_search_names ON geo_places USING GIN (search_names)",
     ]
     with conn.cursor() as cur:
         for stmt in create_statements:
@@ -703,6 +726,80 @@ def delete_parse_batch(conn, batch_id: str):
         cur.execute("DELETE FROM pipeline_parse_batches WHERE batch_id = %s", (batch_id,))
     conn.commit()
 
+
+
+
+def upsert_geo_places(conn, places: list[dict], chunk_size: int = 2000) -> int:
+    """Upsert canonical place rows into geo_places."""
+    if not places:
+        return 0
+
+    total = 0
+    with conn.cursor() as cur:
+        for start in range(0, len(places), chunk_size):
+            chunk = places[start:start + chunk_size]
+            execute_values(
+                cur,
+                """
+                INSERT INTO geo_places (
+                    geoname_id, kind, canonical_name, ascii_name, display_name,
+                    country_code, country_name, admin1_code, admin1_name,
+                    latitude, longitude, population, timezone,
+                    feature_class, feature_code, search_names, updated_at
+                )
+                VALUES %s
+                ON CONFLICT (geoname_id) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    canonical_name = EXCLUDED.canonical_name,
+                    ascii_name = EXCLUDED.ascii_name,
+                    display_name = EXCLUDED.display_name,
+                    country_code = EXCLUDED.country_code,
+                    country_name = EXCLUDED.country_name,
+                    admin1_code = EXCLUDED.admin1_code,
+                    admin1_name = EXCLUDED.admin1_name,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    population = EXCLUDED.population,
+                    timezone = EXCLUDED.timezone,
+                    feature_class = EXCLUDED.feature_class,
+                    feature_code = EXCLUDED.feature_code,
+                    search_names = EXCLUDED.search_names,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                [
+                    (
+                        place["geoname_id"],
+                        place["kind"],
+                        place["canonical_name"],
+                        place.get("ascii_name"),
+                        place["display_name"],
+                        place.get("country_code"),
+                        place.get("country_name"),
+                        place.get("admin1_code"),
+                        place.get("admin1_name"),
+                        place.get("latitude"),
+                        place.get("longitude"),
+                        place.get("population"),
+                        place.get("timezone"),
+                        place.get("feature_class"),
+                        place.get("feature_code"),
+                        place.get("search_names") or [],
+                        datetime.now(timezone.utc),
+                    )
+                    for place in chunk
+                ],
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            )
+            total += len(chunk)
+    conn.commit()
+    return total
+
+
+def get_geo_place_counts(conn) -> dict[str, int]:
+    """Return row counts for the canonical geo_places table."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT kind, COUNT(*) FROM geo_places GROUP BY kind ORDER BY kind")
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
     """Select a bounded set of active companies for scraping.
