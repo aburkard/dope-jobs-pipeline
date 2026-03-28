@@ -145,6 +145,7 @@ VisaSponsorship = Literal["yes", "no", "unknown"]
 # ---------------------------------------------------------------------------
 
 class Location(BaseModel):
+    label: str | None = Field(None, description="Raw human-readable location label")
     city: str | None = None
     state: str | None = None
     country_code: str | None = Field(None, description="ISO 3166-1 alpha-2 country code")
@@ -475,10 +476,13 @@ def _flat_to_job_metadata(data: dict) -> JobMetadata:
     # Reconstruct location ("" = unknown)
     l_city = _to_str(data.pop("location_city", ""))
     l_state = _to_str(data.pop("location_state", ""))
-    l_country = _to_str(data.pop("location_country", ""))
+    l_country_raw = _to_str(data.pop("location_country", ""))
+    l_country = _country_code_from_value(l_country_raw) or l_country_raw
     l_lat = _to_float(data.pop("location_lat", 0))
     l_lng = _to_float(data.pop("location_lng", 0))
-    data["locations"] = [Location(city=l_city, state=l_state, country_code=l_country, lat=l_lat, lng=l_lng)] if (l_city or l_state or l_country) else []
+    label_parts = [part for part in (l_city, l_state, l_country) if part]
+    location_label = ", ".join(label_parts) if label_parts else None
+    data["locations"] = [Location(label=location_label, city=l_city, state=l_state, country_code=l_country, lat=l_lat, lng=l_lng)] if (l_city or l_state or l_country) else []
 
     reqs = []
     for req in data.get("applicant_location_requirements", []) or []:
@@ -917,16 +921,6 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         if mapped:
             merged["job_type"] = mapped
 
-    # --- Location: Ashby structured address ---
-    if raw_job.get("locationCity") and not merged.get("locations"):
-        merged["locations"] = [{
-            "city": raw_job.get("locationCity"),
-            "state": raw_job.get("locationRegion"),
-            "country_code": raw_job.get("locationCountry"),
-            "lat": None,
-            "lng": None,
-        }]
-
     # --- Equity: Ashby compensation summary ---
     comp_summary = raw_job.get("compensationTierSummary", "")
     if comp_summary and "equity" in comp_summary.lower():
@@ -939,6 +933,13 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
     ats_requirements = _derive_remote_applicant_location_requirements(raw_job, merged.get("office_type"))
     if ats_requirements:
         merged["applicant_location_requirements"] = ats_requirements
+
+    # --- Work locations ---
+    merged["locations"] = _derive_work_locations(
+        raw_job,
+        merged.get("office_type"),
+        merged.get("locations"),
+    )
 
     return merged
 
@@ -974,6 +975,9 @@ _COUNTRY_CODE_ALIASES = {
     "GB": "GB",
     "UK": "GB",
     "UNITED KINGDOM": "GB",
+    "JAPAN": "JP",
+    "INDIA": "IN",
+    "SWEDEN": "SE",
     "FRANCE": "FR",
     "GERMANY": "DE",
     "NETHERLANDS": "NL",
@@ -1019,16 +1023,58 @@ def _dedupe_requirements(requirements: list[dict]) -> list[dict]:
     seen = set()
     deduped = []
     for req in requirements:
-        key = (
-            req.get("scope"),
-            req.get("name"),
-            req.get("country_code"),
-            req.get("region"),
-        )
+        scope = req.get("scope")
+        if scope == "country" and req.get("country_code"):
+            key = ("country", req.get("country_code"))
+        elif scope == "region_group":
+            key = ("region_group", (req.get("name") or "").upper())
+        else:
+            key = (
+                scope,
+                req.get("name"),
+                req.get("country_code"),
+                req.get("region"),
+            )
         if key in seen:
             continue
         seen.add(key)
         deduped.append(req)
+    return deduped
+
+
+def _make_location(label: str | None = None, city: str | None = None, state: str | None = None,
+                   country_code: str | None = None, lat: float | None = None,
+                   lng: float | None = None) -> dict:
+    if not label:
+        label_parts = [part for part in (city, state, country_code) if part]
+        label = ", ".join(label_parts) if label_parts else None
+    return {
+        "label": label,
+        "city": city,
+        "state": state,
+        "country_code": country_code,
+        "lat": lat,
+        "lng": lng,
+    }
+
+
+def _dedupe_locations(locations: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for loc in locations:
+        if loc.get("city") or loc.get("state") or loc.get("country_code"):
+            key = (
+                "structured",
+                loc.get("city"),
+                loc.get("state"),
+                loc.get("country_code"),
+            )
+        else:
+            key = ("label", (loc.get("label") or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(loc)
     return deduped
 
 
@@ -1039,6 +1085,46 @@ def _clean_remote_location_token(token: str) -> str:
     token = re.sub(r"[()]", "", token)
     token = re.sub(r"\s+", " ", token).strip(" ,-;/")
     return token
+
+
+def _clean_location_token(token: str) -> str:
+    token = token.strip()
+    token = re.sub(r"\([^)]*\)", "", token)
+    token = re.sub(r"\s+", " ", token).strip(" ,-;/")
+    return token
+
+
+def _parse_generic_location_label(label: str | None) -> dict | None:
+    if not label:
+        return None
+    cleaned = _clean_location_token(label)
+    if not cleaned:
+        return None
+    upper = cleaned.upper()
+    if upper in {"REMOTE", "HYBRID", "ONSITE", "ON-SITE", "IN-OFFICE", "IN OFFICE"}:
+        return None
+    if re.match(r"^\d+\s+LOCATIONS?$", upper):
+        return None
+
+    country_code = _country_code_from_value(cleaned)
+    if country_code:
+        return _make_location(label=cleaned, country_code=country_code)
+
+    if "," in cleaned:
+        parts = [part.strip() for part in cleaned.split(",") if part.strip()]
+        if len(parts) == 2:
+            city, region = parts
+            maybe_country = _country_code_from_value(region)
+            if maybe_country:
+                return _make_location(label=cleaned, city=city, country_code=maybe_country)
+            return _make_location(label=cleaned, city=city, state=region)
+        if len(parts) >= 3:
+            city = parts[0]
+            state = parts[1]
+            country_code = _country_code_from_value(parts[-1]) or parts[-1]
+            return _make_location(label=cleaned, city=city, state=state, country_code=country_code)
+
+    return _make_location(label=cleaned)
 
 
 def _derive_remote_requirements_from_text(text: str) -> list[dict]:
@@ -1127,6 +1213,82 @@ def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: s
             reqs.extend(_derive_remote_requirements_from_text(title))
 
     return _dedupe_requirements(reqs)
+
+
+def _derive_work_locations(raw_job: dict, office_type: str | None, existing_locations: list[dict] | None) -> list[dict]:
+    locations = []
+
+    for loc in existing_locations or []:
+        if not isinstance(loc, dict):
+            continue
+        locations.append(_make_location(
+            label=_to_str(loc.get("label")),
+            city=_to_str(loc.get("city")),
+            state=_to_str(loc.get("state")),
+            country_code=_country_code_from_value(_to_str(loc.get("country_code"))) or _to_str(loc.get("country_code")),
+            lat=loc.get("lat"),
+            lng=loc.get("lng"),
+        ))
+
+    # For fully remote roles, ATS location strings usually describe applicant geography,
+    # not a physical work location. Keep only explicit parsed locations.
+    if office_type == "remote":
+        return _dedupe_locations(locations)
+
+    primary_city = _to_str(raw_job.get("locationCity"))
+    primary_state = _to_str(raw_job.get("locationRegion"))
+    primary_country = _country_code_from_value(_to_str(raw_job.get("locationCountry"))) or _to_str(raw_job.get("locationCountry"))
+    primary_label = _to_str(raw_job.get("locationName")) or _to_str(raw_job.get("location"))
+    if primary_city or primary_state or primary_country:
+        locations.append(_make_location(
+            label=primary_label,
+            city=primary_city,
+            state=primary_state,
+            country_code=primary_country,
+        ))
+    else:
+        parsed_primary = _parse_generic_location_label(primary_label)
+        if parsed_primary:
+            locations.append(parsed_primary)
+
+    for secondary in raw_job.get("secondaryLocations") or []:
+        if not isinstance(secondary, dict):
+            continue
+        sec_city = _to_str(secondary.get("city"))
+        sec_state = _to_str(secondary.get("region"))
+        sec_country = _country_code_from_value(_to_str(secondary.get("country"))) or _to_str(secondary.get("country"))
+        sec_label = _to_str(secondary.get("location"))
+        if sec_city or sec_state or sec_country:
+            locations.append(_make_location(
+                label=sec_label,
+                city=sec_city,
+                state=sec_state,
+                country_code=sec_country,
+            ))
+        else:
+            parsed_secondary = _parse_generic_location_label(sec_label)
+            if parsed_secondary:
+                locations.append(parsed_secondary)
+
+    for office in raw_job.get("offices") or []:
+        if not isinstance(office, dict):
+            continue
+        parsed = _parse_generic_location_label(_to_str(office.get("location")) or _to_str(office.get("name")))
+        if parsed:
+            locations.append(parsed)
+
+    if isinstance(raw_job.get("allLocations"), list):
+        for label in raw_job["allLocations"]:
+            parsed = _parse_generic_location_label(label if isinstance(label, str) else None)
+            if parsed:
+                locations.append(parsed)
+
+    if not locations and isinstance(raw_job.get("location"), str):
+        parsed = _parse_generic_location_label(raw_job.get("location"))
+        if parsed:
+            locations.append(parsed)
+
+    return _dedupe_locations(locations)
 
 
 def load_raw_jobs(path: str, limit: int | None = None) -> list[dict]:

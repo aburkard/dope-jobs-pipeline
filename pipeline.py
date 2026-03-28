@@ -385,13 +385,17 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
         # Location string from parsed metadata
         locs = m.get("locations", [])
-        loc_parts = []
+        location_str = ""
         if locs:
             loc = locs[0]
-            if loc.get("city"): loc_parts.append(loc["city"])
-            if loc.get("state"): loc_parts.append(loc["state"])
-            if loc.get("country_code"): loc_parts.append(loc["country_code"])
-        location_str = ", ".join(loc_parts)
+            if loc.get("label"):
+                location_str = loc["label"]
+            else:
+                loc_parts = []
+                if loc.get("city"): loc_parts.append(loc["city"])
+                if loc.get("state"): loc_parts.append(loc["state"])
+                if loc.get("country_code"): loc_parts.append(loc["country_code"])
+                location_str = ", ".join(loc_parts)
 
         # Salary
         sal = m.get("salary")

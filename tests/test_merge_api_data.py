@@ -175,13 +175,60 @@ class TestLocationOverlay:
         assert len(result["locations"]) == 1
         assert result["locations"][0]["city"] == "New York City"
         assert result["locations"][0]["state"] == "NY"
+        assert result["locations"][0]["country_code"] == "US"
+        assert result["locations"][0]["label"] == "New York City, NY, US"
 
     def test_no_overlay_when_llm_has_locations(self):
         raw = {"locationCity": "SF", "locationRegion": "CA", "locationCountry": "US"}
-        llm = {"locations": [{"city": "New York", "state": "NY", "country_code": "US"}]}
+        llm = {"locations": [{"label": "New York, NY, US", "city": "New York", "state": "NY", "country_code": "US"}]}
         result = merge_api_data(raw, llm)
-        # LLM locations preserved when present
+        # Existing parsed location preserved, ATS location merged in
         assert result["locations"][0]["city"] == "New York"
+        assert len(result["locations"]) == 2
+
+    def test_ashby_secondary_locations_merge_for_non_remote(self):
+        raw = {
+            "workplaceType": "Hybrid",
+            "locationName": "New York",
+            "locationCity": "New York",
+            "locationRegion": "NY",
+            "locationCountry": "US",
+            "secondaryLocations": [
+                {"location": "San Francisco", "city": "San Francisco", "region": "CA", "country": "US"},
+                {"location": "London", "city": "London", "region": "", "country": "GB"},
+            ],
+        }
+        llm = {"locations": []}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "hybrid"
+        assert [loc["label"] for loc in result["locations"]] == [
+            "New York",
+            "San Francisco",
+            "London",
+        ]
+
+    def test_greenhouse_offices_merge_for_non_remote(self):
+        raw = {
+            "offices": [
+                {"name": "HQ", "location": "San Francisco, CA"},
+                {"name": "NY Office", "location": "New York, NY"},
+            ],
+        }
+        llm = {"office_type": "onsite", "locations": []}
+        result = merge_api_data(raw, llm)
+        assert [loc["label"] for loc in result["locations"]] == [
+            "San Francisco, CA",
+            "New York, NY",
+        ]
+
+    def test_remote_does_not_promote_candidate_regions_to_work_locations(self):
+        raw = {
+            "workplaceType": "Remote",
+            "location": "France; Germany; Netherlands; Spain; United Kingdom",
+        }
+        llm = {"locations": []}
+        result = merge_api_data(raw, llm)
+        assert result["locations"] == []
 
     def test_remote_requirements_from_ashby_country(self):
         raw = {
