@@ -389,6 +389,26 @@ class TestLocationOverlay:
         result = merge_api_data(raw, llm)
         assert result["locations"] == []
 
+    def test_hybrid_remote_country_label_becomes_broad_work_location(self):
+        raw = {
+            "workplaceType": "Hybrid",
+            "location": "Remote - United States",
+            "offices": [{"name": "AMER", "location": "Remote - AMER"}],
+        }
+        llm = {"locations": []}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "hybrid"
+        assert result["locations"] == [
+            {
+                "label": "United States",
+                "city": None,
+                "state": None,
+                "country_code": "US",
+                "lat": None,
+                "lng": None,
+            }
+        ]
+
     def test_remote_requirements_from_ashby_country(self):
         raw = {
             "workplaceType": "Remote",

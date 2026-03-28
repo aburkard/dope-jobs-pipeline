@@ -1459,6 +1459,18 @@ def _parse_generic_location_labels(label: str | None) -> list[dict]:
     return parsed
 
 
+def _parse_broad_remoteish_work_location(label: str | None) -> list[dict]:
+    if not label or "remote" not in label.lower():
+        return []
+    cleaned = _clean_remote_location_token(label)
+    if not cleaned:
+        return []
+    location = _parse_generic_location_label(cleaned)
+    if location:
+        return [location]
+    return [_make_location(label=cleaned)]
+
+
 def _derive_remote_requirements_from_text(text: str) -> list[dict]:
     if not text:
         return []
@@ -1586,6 +1598,8 @@ def _derive_work_locations(raw_job: dict, office_type: str | None, existing_loca
             state=primary_state,
             country_code=primary_country,
         ))
+    elif office_type != "remote":
+        locations.extend(_parse_broad_remoteish_work_location(primary_label))
     else:
         locations.extend(_parse_generic_location_labels(primary_label))
 
@@ -1609,14 +1623,20 @@ def _derive_work_locations(raw_job: dict, office_type: str | None, existing_loca
     for office in raw_job.get("offices") or []:
         if not isinstance(office, dict):
             continue
-        locations.extend(_parse_generic_location_labels(_to_str(office.get("location")) or _to_str(office.get("name"))))
+        office_label = _to_str(office.get("location")) or _to_str(office.get("name"))
+        if office_label and "remote" in office_label.lower():
+            continue
+        locations.extend(_parse_generic_location_labels(office_label))
 
     if isinstance(raw_job.get("allLocations"), list):
         for label in raw_job["allLocations"]:
             locations.extend(_parse_generic_location_labels(label if isinstance(label, str) else None))
 
     if not locations and isinstance(raw_job.get("location"), str):
-        locations.extend(_parse_generic_location_labels(raw_job.get("location")))
+        if office_type != "remote":
+            locations.extend(_parse_broad_remoteish_work_location(raw_job.get("location")))
+        if not locations:
+            locations.extend(_parse_generic_location_labels(raw_job.get("location")))
 
     return _dedupe_locations(locations)
 
