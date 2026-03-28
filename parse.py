@@ -1011,6 +1011,9 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         if li_tag:
             merged["office_type"] = li_tag
 
+    if merged.get("office_type") != "remote":
+        merged["applicant_location_requirements"] = []
+
     # --- Job type: Ashby employmentType, Lever commitment ---
     emp_type = raw_job.get("employmentType", "")
     commitment = raw_job.get("commitment", "")
@@ -1105,6 +1108,60 @@ def _derive_posting_language(raw_job: dict) -> str | None:
             normalized = _normalize_language_code(candidate)
             if normalized:
                 return normalized
+    title = raw_job.get("title")
+    content = (
+        raw_job.get("content")
+        or raw_job.get("description")
+        or raw_job.get("descriptionPlain")
+        or raw_job.get("descriptionHtml")
+        or ""
+    )
+    text = "\n".join(
+        part for part in (
+            title if isinstance(title, str) else "",
+            remove_html_markup(content, double_unescape=True) if isinstance(content, str) else "",
+        )
+        if part
+    )
+    return _guess_posting_language_from_text(text)
+
+
+_LANGUAGE_STOPWORDS = {
+    "en": {"the", "and", "for", "with", "you", "your", "will", "our", "this", "that", "team", "role"},
+    "fr": {"nous", "vous", "notre", "votre", "avec", "dans", "pour", "une", "des", "les", "est", "grâce", "chez", "rejoins", "poste"},
+    "de": {"und", "der", "die", "das", "mit", "für", "ein", "eine", "unser", "unsere", "rolle", "team"},
+    "es": {"con", "para", "una", "las", "los", "nuestro", "nuestra", "equipo", "puesto", "trabajo"},
+    "pt": {"com", "para", "uma", "das", "dos", "nosso", "nossa", "equipe", "vaga", "trabalho"},
+    "it": {"con", "per", "una", "della", "delle", "nostro", "nostra", "team", "ruolo", "posizione"},
+    "nl": {"met", "voor", "een", "ons", "onze", "team", "rol", "functie", "je", "jij"},
+}
+
+
+def _guess_posting_language_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "ko"
+
+    lowered = text.lower()
+    tokens = re.findall(r"[a-zà-ÿ]+", lowered)
+    if len(tokens) < 8:
+        return None
+
+    best_lang = None
+    best_score = 0
+    for lang, stopwords in _LANGUAGE_STOPWORDS.items():
+        score = sum(1 for token in tokens if token in stopwords)
+        if score > best_score:
+            best_lang = lang
+            best_score = score
+
+    if best_score >= 4:
+        return best_lang
+
     return None
 
 

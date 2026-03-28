@@ -229,6 +229,28 @@ class TestPostingLanguage:
         })
         assert metadata.posting_language == "es"
 
+    def test_heuristic_detects_french_posting_language(self):
+        raw = {
+            "title": "Delivery Operations Intern",
+            "description": (
+                "Rejoins notre équipe avec une mission claire. "
+                "Nous travaillons avec des partenaires en France et en Belgique. "
+                "Le poste est basé à Paris et vous aurez une forte exposition aux opérations."
+            ),
+        }
+        llm = {"posting_language": "en"}
+        result = merge_api_data(raw, llm)
+        assert result["posting_language"] == "fr"
+
+    def test_heuristic_detects_japanese_posting_language(self):
+        raw = {
+            "title": "デリバリーソリューションアーキテクト",
+            "description": "お客様の成功を支援し、技術的なリーダーとして複雑な課題を解決します。",
+        }
+        llm = {"posting_language": "en"}
+        result = merge_api_data(raw, llm)
+        assert result["posting_language"] == "ja"
+
 
 class TestLocationOverlay:
     def test_ashby_location(self):
@@ -305,6 +327,18 @@ class TestLocationOverlay:
         assert result["applicant_location_requirements"] == [
             {"scope": "country", "name": "Canada", "country_code": "CA", "region": None}
         ]
+
+    def test_non_remote_clears_llm_applicant_requirements(self):
+        raw = {"workplaceType": "OnSite"}
+        llm = {
+            "office_type": "remote",
+            "applicant_location_requirements": [
+                {"scope": "city", "name": "Paris", "country_code": "FR", "region": None}
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "onsite"
+        assert result["applicant_location_requirements"] == []
 
     def test_remote_requirements_from_lever_location_text(self):
         raw = {
