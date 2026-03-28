@@ -1,4 +1,6 @@
 import html
+import json
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -92,9 +94,11 @@ class GreenhouseScraper(BaseScraper):
                     timeout=5,
                     headers=headers)
                 self._cached_html = response.text
+                self._cached_html_url = response.url
             except Exception as e:
                 print(e)
                 self._cached_html = ""
+                self._cached_html_url = f"https://boards.greenhouse.io/{self.board_token}"
         return self._cached_html
 
     def get_company_name(self):
@@ -105,13 +109,72 @@ class GreenhouseScraper(BaseScraper):
     def get_company_domain(self):
         raise NotImplementedError
 
+    def _extract_logo_from_json_ld(self, soup):
+        def walk(node):
+            if isinstance(node, dict):
+                node_type = node.get('@type')
+                if node_type == 'Organization' or (
+                    isinstance(node_type, list) and 'Organization' in node_type
+                ):
+                    logo = node.get('logo')
+                    if isinstance(logo, dict):
+                        for key in ('url', 'contentUrl'):
+                            value = logo.get(key)
+                            if isinstance(value, str) and value.strip():
+                                return html.unescape(value.strip())
+                    if isinstance(logo, str) and logo.strip():
+                        return html.unescape(logo.strip())
+                for value in node.values():
+                    found = walk(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = walk(value)
+                    if found:
+                        return found
+            return None
+
+        for script in soup.find_all('script', type='application/ld+json'):
+            raw = script.string or script.get_text(strip=True)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            found = walk(data)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _is_native_greenhouse_logo(url):
+        return 'external_greenhouse_job_boards/logos/' in url.lower()
+
+    def _extract_favicon_url(self, soup):
+        base_url = getattr(self, '_cached_html_url', f"https://boards.greenhouse.io/{self.board_token}")
+        for link in soup.find_all('link', href=True):
+            rels = [rel.lower() for rel in (link.get('rel') or [])]
+            if any(rel in {'icon', 'shortcut icon', 'apple-touch-icon', 'mask-icon'} for rel in rels):
+                href = link.get('href')
+                if href:
+                    return urljoin(base_url, html.unescape(href.strip()))
+        return None
+
     def get_company_logo_url(self):
         if not hasattr(self, '_cached_company_logo_url'):
             raw_html = self._fetch_html()
             soup = BeautifulSoup(raw_html, 'html.parser')
+            json_ld_logo = self._extract_logo_from_json_ld(soup)
+            if json_ld_logo:
+                self._cached_company_logo_url = json_ld_logo
+                return self._cached_company_logo_url
             og_image = soup.find('meta', property='og:image')
-            if og_image:
-                self._cached_company_logo_url = og_image.get('content')
-            else:
-                self._cached_company_logo_url = None
+            if og_image and og_image.get('content'):
+                candidate = html.unescape(og_image.get('content').strip())
+                if self._is_native_greenhouse_logo(candidate):
+                    self._cached_company_logo_url = candidate
+                    return self._cached_company_logo_url
+            self._cached_company_logo_url = self._extract_favicon_url(soup)
         return self._cached_company_logo_url
