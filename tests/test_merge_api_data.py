@@ -318,6 +318,68 @@ class TestLocationOverlay:
             "New York, NY",
         ]
 
+    def test_existing_composite_location_is_split_into_distinct_locations(self):
+        raw = {
+            "allLocations": ["San Francisco, CA", "Austin, TX", "New York, NY"],
+        }
+        llm = {
+            "office_type": "hybrid",
+            "locations": [
+                {
+                    "label": "San Francisco, CA; Austin, TX; New York, NY",
+                    "city": "San Francisco",
+                    "state": "CA; Austin",
+                    "country_code": "NY",
+                }
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert [loc["label"] for loc in result["locations"]] == [
+            "San Francisco, CA",
+            "Austin, TX",
+            "New York, NY",
+        ]
+
+    def test_city_state_abbreviation_is_not_treated_as_country(self):
+        raw = {"location": "Mountain View, CA"}
+        llm = {"office_type": "onsite", "locations": []}
+        result = merge_api_data(raw, llm)
+        assert result["locations"] == [
+            {
+                "label": "Mountain View, CA",
+                "city": "Mountain View",
+                "state": "CA",
+                "country_code": None,
+                "lat": None,
+                "lng": None,
+            }
+        ]
+
+    def test_existing_malformed_city_state_location_is_recovered(self):
+        raw = {}
+        llm = {
+            "office_type": "onsite",
+            "locations": [
+                {
+                    "label": "Mountain View, CA",
+                    "city": "Mountain View",
+                    "state": None,
+                    "country_code": "CA",
+                }
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["locations"] == [
+            {
+                "label": "Mountain View, CA",
+                "city": "Mountain View",
+                "state": "CA",
+                "country_code": None,
+                "lat": None,
+                "lng": None,
+            }
+        ]
+
     def test_remote_does_not_promote_candidate_regions_to_work_locations(self):
         raw = {
             "workplaceType": "Remote",

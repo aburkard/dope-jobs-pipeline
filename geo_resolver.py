@@ -26,6 +26,33 @@ def _normalize_country_code(value) -> str | None:
     return _country_code_from_value(cleaned) or cleaned
 
 
+def _location_identity(location: dict) -> tuple:
+    geoname_id = location.get("geoname_id")
+    if geoname_id:
+        return ("geoname", geoname_id)
+
+    city = normalize_geo_text(_clean_str(location.get("city")) or "")
+    state = normalize_geo_text(_clean_str(location.get("state")) or "")
+    country_code = _normalize_country_code(location.get("country_code"))
+    if city or state or country_code:
+        return ("structured", city, state, country_code)
+
+    label = normalize_geo_text(_clean_str(location.get("label")) or "")
+    return ("label", label)
+
+
+def _dedupe_resolved_locations(locations: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for location in locations:
+        key = _location_identity(location)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(location)
+    return deduped
+
+
 class GeoResolver:
     def __init__(self, conn):
         self.conn = conn
@@ -235,7 +262,7 @@ class GeoResolver:
             resolved = self.resolve_work_location(location, office_type=office_type)
             if resolved:
                 locations.append(resolved)
-        parsed["locations"] = locations
+        parsed["locations"] = _dedupe_resolved_locations(locations)
 
         requirements = []
         for requirement in parsed.get("applicant_location_requirements", []) or []:

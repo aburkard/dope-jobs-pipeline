@@ -63,6 +63,7 @@ def test_build_city_row_uses_admin1_and_country_context():
 
 def test_build_search_names_adds_common_country_aliases():
     search_names = build_search_names('Mountain View', 'Mountain View', 'Mountain View, California, United States', country_code='US', country_name='United States', admin1_code='CA', admin1_name='California')
+    assert 'mountain view ca' in search_names
     assert 'mountain view ca usa' in search_names
 
 

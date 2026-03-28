@@ -1070,6 +1070,21 @@ _REGION_GROUPS = {
     "UKI",
 }
 
+_SUBNATIONAL_ABBREVIATIONS = {
+    # United States
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+    # Canada
+    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE",
+    "QC", "SK", "YT",
+    # Australia
+    "ACT", "NSW", "NT", "QLD", "SA", "TAS", "VIC", "WA",
+}
+
 _COUNTRY_CODE_ALIASES = {
     "US": "US",
     "USA": "US",
@@ -1367,6 +1382,41 @@ def _clean_location_token(token: str) -> str:
     return token
 
 
+def _looks_like_multi_location_label(label: str | None) -> bool:
+    if not label:
+        return False
+    return bool(re.search(r"[;|\n]", label))
+
+
+def _split_location_label(label: str | None) -> list[str]:
+    if not label:
+        return []
+    if not _looks_like_multi_location_label(label):
+        cleaned = _clean_location_token(label)
+        return [cleaned] if cleaned else []
+    parts = [
+        _clean_location_token(part)
+        for part in re.split(r"\s*(?:;|\||\n)+\s*", label)
+    ]
+    return [part for part in parts if part]
+
+
+def _region_should_be_treated_as_admin1(region: str | None) -> bool:
+    if not region:
+        return False
+    normalized = region.strip().upper()
+    return normalized in _SUBNATIONAL_ABBREVIATIONS
+
+
+def _normalize_existing_location_fields(label: str | None, city: str | None, state: str | None,
+                                        country_code: str | None) -> tuple[str | None, str | None, str | None, str | None]:
+    if label and city and not state and country_code and _region_should_be_treated_as_admin1(country_code):
+        parsed = _parse_generic_location_label(label)
+        if parsed and parsed.get("city") == city and parsed.get("state") and not parsed.get("country_code"):
+            return label, city, parsed.get("state"), None
+    return label, city, state, country_code
+
+
 def _parse_generic_location_label(label: str | None) -> dict | None:
     if not label:
         return None
@@ -1387,7 +1437,7 @@ def _parse_generic_location_label(label: str | None) -> dict | None:
         parts = [part.strip() for part in cleaned.split(",") if part.strip()]
         if len(parts) == 2:
             city, region = parts
-            maybe_country = _country_code_from_value(region)
+            maybe_country = None if _region_should_be_treated_as_admin1(region) else _country_code_from_value(region)
             if maybe_country:
                 return _make_location(label=cleaned, city=city, country_code=maybe_country)
             return _make_location(label=cleaned, city=city, state=region)
@@ -1398,6 +1448,15 @@ def _parse_generic_location_label(label: str | None) -> dict | None:
             return _make_location(label=cleaned, city=city, state=state, country_code=country_code)
 
     return _make_location(label=cleaned)
+
+
+def _parse_generic_location_labels(label: str | None) -> list[dict]:
+    parsed = []
+    for part in _split_location_label(label):
+        location = _parse_generic_location_label(part)
+        if location:
+            parsed.append(location)
+    return parsed
 
 
 def _derive_remote_requirements_from_text(text: str) -> list[dict]:
@@ -1494,11 +1553,19 @@ def _derive_work_locations(raw_job: dict, office_type: str | None, existing_loca
     for loc in existing_locations or []:
         if not isinstance(loc, dict):
             continue
+        label = _to_str(loc.get("label"))
+        if label and _looks_like_multi_location_label(label):
+            locations.extend(_parse_generic_location_labels(label))
+            continue
+        city = _to_str(loc.get("city"))
+        state = _to_str(loc.get("state"))
+        country_code = _country_code_from_value(_to_str(loc.get("country_code"))) or _to_str(loc.get("country_code"))
+        label, city, state, country_code = _normalize_existing_location_fields(label, city, state, country_code)
         locations.append(_make_location(
-            label=_to_str(loc.get("label")),
-            city=_to_str(loc.get("city")),
-            state=_to_str(loc.get("state")),
-            country_code=_country_code_from_value(_to_str(loc.get("country_code"))) or _to_str(loc.get("country_code")),
+            label=label,
+            city=city,
+            state=state,
+            country_code=country_code,
             lat=loc.get("lat"),
             lng=loc.get("lng"),
         ))
@@ -1520,9 +1587,7 @@ def _derive_work_locations(raw_job: dict, office_type: str | None, existing_loca
             country_code=primary_country,
         ))
     else:
-        parsed_primary = _parse_generic_location_label(primary_label)
-        if parsed_primary:
-            locations.append(parsed_primary)
+        locations.extend(_parse_generic_location_labels(primary_label))
 
     for secondary in raw_job.get("secondaryLocations") or []:
         if not isinstance(secondary, dict):
@@ -1539,27 +1604,19 @@ def _derive_work_locations(raw_job: dict, office_type: str | None, existing_loca
                 country_code=sec_country,
             ))
         else:
-            parsed_secondary = _parse_generic_location_label(sec_label)
-            if parsed_secondary:
-                locations.append(parsed_secondary)
+            locations.extend(_parse_generic_location_labels(sec_label))
 
     for office in raw_job.get("offices") or []:
         if not isinstance(office, dict):
             continue
-        parsed = _parse_generic_location_label(_to_str(office.get("location")) or _to_str(office.get("name")))
-        if parsed:
-            locations.append(parsed)
+        locations.extend(_parse_generic_location_labels(_to_str(office.get("location")) or _to_str(office.get("name"))))
 
     if isinstance(raw_job.get("allLocations"), list):
         for label in raw_job["allLocations"]:
-            parsed = _parse_generic_location_label(label if isinstance(label, str) else None)
-            if parsed:
-                locations.append(parsed)
+            locations.extend(_parse_generic_location_labels(label if isinstance(label, str) else None))
 
     if not locations and isinstance(raw_job.get("location"), str):
-        parsed = _parse_generic_location_label(raw_job.get("location"))
-        if parsed:
-            locations.append(parsed)
+        locations.extend(_parse_generic_location_labels(raw_job.get("location")))
 
     return _dedupe_locations(locations)
 
