@@ -122,6 +122,27 @@ class TestWorkplaceType:
         result = merge_api_data(raw, llm)
         assert result["office_type"] == "hybrid"
 
+    def test_is_remote_flag_sets_remote(self):
+        raw = {"isRemote": True}
+        llm = {"office_type": "onsite"}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "remote"
+
+    def test_linkedin_remote_tag_used_when_no_api_workplace(self):
+        raw = {"description": "Join us from anywhere. #LI-REMOTE"}
+        llm = {"office_type": "onsite"}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "remote"
+
+    def test_api_workplace_beats_linkedin_tag(self):
+        raw = {
+            "workplaceType": "Hybrid",
+            "description": "This posting is wrapped for LinkedIn. #LI-REMOTE",
+        }
+        llm = {"office_type": "onsite"}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "hybrid"
+
 
 class TestJobType:
     @pytest.mark.parametrize("api_field,api_value,expected", [
@@ -161,6 +182,60 @@ class TestLocationOverlay:
         result = merge_api_data(raw, llm)
         # LLM locations preserved when present
         assert result["locations"][0]["city"] == "New York"
+
+    def test_remote_requirements_from_ashby_country(self):
+        raw = {
+            "workplaceType": "Remote",
+            "locationCountry": "Canada",
+            "secondaryLocations": [{"country": "Canada", "location": "Canada - Remote"}],
+        }
+        llm = {"office_type": "onsite", "applicant_location_requirements": []}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "remote"
+        assert result["applicant_location_requirements"] == [
+            {"scope": "country", "name": "Canada", "country_code": "CA", "region": None}
+        ]
+
+    def test_remote_requirements_from_lever_location_text(self):
+        raw = {
+            "workplaceType": "remote",
+            "allLocations": ["Australia & New Zealand"],
+        }
+        llm = {"office_type": "onsite", "applicant_location_requirements": []}
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == [
+            {"scope": "country", "name": "Australia", "country_code": "AU", "region": None},
+            {"scope": "country", "name": "New Zealand", "country_code": "NZ", "region": None},
+        ]
+
+    def test_remote_requirements_from_greenhouse_location_list(self):
+        raw = {
+            "title": "Boomi Platform Architect- Remote Setup (EMEA Based)",
+            "location": "France; Germany; Netherlands; Spain; United Kingdom",
+        }
+        llm = {"office_type": "remote", "applicant_location_requirements": []}
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == [
+            {"scope": "country", "name": "France", "country_code": "FR", "region": None},
+            {"scope": "country", "name": "Germany", "country_code": "DE", "region": None},
+            {"scope": "country", "name": "Netherlands", "country_code": "NL", "region": None},
+            {"scope": "country", "name": "Spain", "country_code": "ES", "region": None},
+            {"scope": "country", "name": "United Kingdom", "country_code": "GB", "region": None},
+        ]
+
+    def test_remote_requirements_keep_llm_when_ats_has_no_strong_signal(self):
+        raw = {
+            "workplaceType": "remote",
+            "location": "Ankeny, IA",
+        }
+        llm = {
+            "office_type": "remote",
+            "applicant_location_requirements": [
+                {"scope": "country", "name": "United States", "country_code": "US", "region": None}
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == llm["applicant_location_requirements"]
 
 
 class TestNoMutation:

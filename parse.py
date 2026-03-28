@@ -16,6 +16,7 @@ import argparse
 import bz2
 import json
 import os
+import re
 import sys
 import time
 from enum import Enum
@@ -151,6 +152,13 @@ class Location(BaseModel):
     lng: float | None = Field(None, description="Approximate longitude, best-effort")
 
 
+class ApplicantLocationRequirement(BaseModel):
+    scope: Literal["country", "state", "city", "region_group"]
+    name: str
+    country_code: str | None = Field(None, description="ISO 3166-1 alpha-2 country code when known")
+    region: str | None = Field(None, description="Administrative region/state/province when known")
+
+
 class Salary(BaseModel):
     min: float | None = None
     max: float | None = None
@@ -184,6 +192,10 @@ class JobMetadata(BaseModel):
     # Tier 1: Core
     tagline: str = Field(description="One catchy sentence describing what makes this job interesting. Must be extracted or derived from the posting, not generic.")
     locations: list[Location] = Field(default_factory=list, description="Job locations. For remote jobs with no specific location, use an empty list.")
+    applicant_location_requirements: list[ApplicantLocationRequirement] = Field(
+        default_factory=list,
+        description="For remote jobs, geographic restrictions on where the applicant may be based. Leave empty if unrestricted or unknown.",
+    )
     salary: Salary | None = Field(None, description="Compensation range if mentioned. Set to null if not disclosed.")
     office_type: OfficeType = Field(description="Whether the job is remote, hybrid, or onsite")
     hybrid_days: int | None = Field(None, description="Days per week in office if hybrid. Null otherwise.")
@@ -286,6 +298,7 @@ LANGUAGE: ALL output MUST be in English, regardless of posting language. Transla
 COMPACT_SCHEMA = """Extract these fields as JSON:
 - tagline: catchy one-sentence summary (NOT the title)
 - location_city, location_state, location_country (ISO alpha-2), location_lat, location_lng: from ATS metadata or text. "" if remote/unknown. Geocode lat/lng from city.
+- applicant_location_requirements (array): ONLY for remote jobs with explicit applicant geography restrictions. Each item is {scope: "country"|"state"|"city"|"region_group", name: string, country_code: string, region: string}. Use [] when unrestricted or unknown.
 - salary_min, salary_max: numbers, 0 if not disclosed. Can be decimal for hourly rates (e.g. 18.50).
 - salary_currency: ISO 4217 code. "" if not disclosed.
 - salary_period: "hourly"|"weekly"|"monthly"|"annually". Match the period from the posting.
@@ -335,6 +348,19 @@ FLAT_JSON_SCHEMA: dict = {
         "location_country": {"type": "string"},
         "location_lat": {"type": "number"},
         "location_lng": {"type": "number"},
+        "applicant_location_requirements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["country", "state", "city", "region_group"]},
+                    "name": {"type": "string"},
+                    "country_code": {"type": "string"},
+                    "region": {"type": "string"},
+                },
+                "required": ["scope", "name"],
+            },
+        },
         "salary_min": {"type": "number"},
         "salary_max": {"type": "number"},
         "salary_currency": {"type": "string"},
@@ -453,6 +479,22 @@ def _flat_to_job_metadata(data: dict) -> JobMetadata:
     l_lat = _to_float(data.pop("location_lat", 0))
     l_lng = _to_float(data.pop("location_lng", 0))
     data["locations"] = [Location(city=l_city, state=l_state, country_code=l_country, lat=l_lat, lng=l_lng)] if (l_city or l_state or l_country) else []
+
+    reqs = []
+    for req in data.get("applicant_location_requirements", []) or []:
+        if not isinstance(req, dict):
+            continue
+        scope = _to_str(req.get("scope"))
+        name = _to_str(req.get("name"))
+        if not scope or not name:
+            continue
+        reqs.append({
+            "scope": scope,
+            "name": name,
+            "country_code": _to_str(req.get("country_code")),
+            "region": _to_str(req.get("region")),
+        })
+    data["applicant_location_requirements"] = reqs
 
     # Reconstruct equity
     data["equity"] = Equity(
@@ -616,6 +658,19 @@ class GeminiBackend:
                 "tagline": {"type": "STRING", "description": "One sentence that makes a job seeker stop scrolling"},
                 "location_city": {"type": "STRING"}, "location_state": {"type": "STRING"},
                 "location_country": {"type": "STRING"}, "location_lat": {"type": "NUMBER"}, "location_lng": {"type": "NUMBER"},
+                "applicant_location_requirements": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "scope": {"type": "STRING", "enum": ["country", "state", "city", "region_group"]},
+                            "name": {"type": "STRING"},
+                            "country_code": {"type": "STRING"},
+                            "region": {"type": "STRING"},
+                        },
+                        "required": ["scope", "name"],
+                    },
+                },
                 "salary_min": {"type": "NUMBER"}, "salary_max": {"type": "NUMBER"},
                 "salary_currency": {"type": "STRING"},
                 "salary_period": {"type": "STRING", "enum": ["hourly", "weekly", "monthly", "annually"]},
@@ -838,6 +893,12 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
             merged["office_type"] = "hybrid"
         elif wp_lower in ("onsite", "on-site", "in-office"):
             merged["office_type"] = "onsite"
+    elif raw_job.get("isRemote") is True:
+        merged["office_type"] = "remote"
+    else:
+        li_tag = _extract_linkedin_workplace_tag(raw_job)
+        if li_tag:
+            merged["office_type"] = li_tag
 
     # --- Job type: Ashby employmentType, Lever commitment ---
     emp_type = raw_job.get("employmentType", "")
@@ -874,7 +935,198 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         else:
             merged["equity"] = {"offered": True, "min_pct": None, "max_pct": None}
 
+    # --- Applicant geography for remote roles ---
+    ats_requirements = _derive_remote_applicant_location_requirements(raw_job, merged.get("office_type"))
+    if ats_requirements:
+        merged["applicant_location_requirements"] = ats_requirements
+
     return merged
+
+
+_LINKEDIN_WORKPLACE_TAGS = {
+    "#LI-REMOTE": "remote",
+    "#LI-HYBRID": "hybrid",
+    "#LI-ONSITE": "onsite",
+}
+
+_REGION_GROUPS = {
+    "EMEA",
+    "APAC",
+    "LATAM",
+    "ANZ",
+    "EU",
+    "UKI",
+}
+
+_COUNTRY_CODE_ALIASES = {
+    "US": "US",
+    "USA": "US",
+    "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US",
+    "CA": "CA",
+    "CANADA": "CA",
+    "MX": "MX",
+    "MEXICO": "MX",
+    "AU": "AU",
+    "AUSTRALIA": "AU",
+    "NZ": "NZ",
+    "NEW ZEALAND": "NZ",
+    "GB": "GB",
+    "UK": "GB",
+    "UNITED KINGDOM": "GB",
+    "FRANCE": "FR",
+    "GERMANY": "DE",
+    "NETHERLANDS": "NL",
+    "SPAIN": "ES",
+}
+
+
+def _extract_linkedin_workplace_tag(raw_job: dict) -> str | None:
+    fields = [
+        raw_job.get("description"),
+        raw_job.get("content"),
+        raw_job.get("descriptionPlain"),
+    ]
+    haystack = "\n".join(field for field in fields if isinstance(field, str)).upper()
+    for tag, office_type in _LINKEDIN_WORKPLACE_TAGS.items():
+        if tag in haystack:
+            return office_type
+    return None
+
+
+def _country_code_from_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) == 2 and value.isalpha():
+        return value.upper()
+    return _COUNTRY_CODE_ALIASES.get(value.upper())
+
+
+def _make_applicant_requirement(scope: str, name: str, country_code: str | None = None,
+                                region: str | None = None) -> dict:
+    return {
+        "scope": scope,
+        "name": name,
+        "country_code": country_code,
+        "region": region,
+    }
+
+
+def _dedupe_requirements(requirements: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for req in requirements:
+        key = (
+            req.get("scope"),
+            req.get("name"),
+            req.get("country_code"),
+            req.get("region"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(req)
+    return deduped
+
+
+def _clean_remote_location_token(token: str) -> str:
+    token = token.strip()
+    token = re.sub(r"\bremote\b", "", token, flags=re.IGNORECASE)
+    token = re.sub(r"\bbased\b", "", token, flags=re.IGNORECASE)
+    token = re.sub(r"[()]", "", token)
+    token = re.sub(r"\s+", " ", token).strip(" ,-;/")
+    return token
+
+
+def _derive_remote_requirements_from_text(text: str) -> list[dict]:
+    if not text:
+        return []
+
+    reqs = []
+    upper_text = text.upper()
+    for region_group in _REGION_GROUPS:
+        if region_group in upper_text:
+            reqs.append(_make_applicant_requirement("region_group", region_group))
+
+    normalized = text.replace(";", "|").replace("/", "|")
+    normalized = re.sub(r"\s+&\s+", "|", normalized)
+    parts = [_clean_remote_location_token(part) for part in normalized.split("|")]
+    parts = [part for part in parts if part]
+
+    if len(parts) == 1:
+        part = parts[0]
+        if part.lower().startswith("remote,"):
+            part = _clean_remote_location_token(part.split(",", 1)[1])
+            parts = [part] if part else []
+        elif part.upper().endswith("-REMOTE"):
+            part = _clean_remote_location_token(part.rsplit("-", 1)[0])
+            parts = [part] if part else []
+
+    for part in parts:
+        country_code = _country_code_from_value(part)
+        if country_code:
+            reqs.append(_make_applicant_requirement("country", part, country_code=country_code))
+
+    return _dedupe_requirements(reqs)
+
+
+def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: str | None) -> list[dict]:
+    if office_type != "remote":
+        return []
+
+    reqs = []
+
+    # Ashby structured geography is the strongest signal we have.
+    location_country = raw_job.get("locationCountry")
+    if location_country:
+        reqs.append(
+            _make_applicant_requirement(
+                "country",
+                location_country,
+                country_code=_country_code_from_value(location_country),
+            )
+        )
+
+    secondary_locations = raw_job.get("secondaryLocations") or []
+    secondary_countries = {
+        sl.get("country")
+        for sl in secondary_locations
+        if isinstance(sl, dict) and sl.get("country")
+    }
+    if secondary_countries:
+        reqs.extend(
+            _make_applicant_requirement(
+                "country",
+                country,
+                country_code=_country_code_from_value(country),
+            )
+            for country in sorted(secondary_countries)
+        )
+
+    if reqs:
+        return _dedupe_requirements(reqs)
+
+    # Lever / Greenhouse / fallback location strings.
+    location_texts = []
+    if isinstance(raw_job.get("allLocations"), list):
+        location_texts.extend([loc for loc in raw_job["allLocations"] if isinstance(loc, str)])
+    for key in ("location", "locationName"):
+        value = raw_job.get(key)
+        if isinstance(value, str) and value:
+            location_texts.append(value)
+
+    for text in location_texts:
+        reqs.extend(_derive_remote_requirements_from_text(text))
+
+    if not reqs:
+        title = raw_job.get("title")
+        if isinstance(title, str) and title:
+            reqs.extend(_derive_remote_requirements_from_text(title))
+
+    return _dedupe_requirements(reqs)
 
 
 def load_raw_jobs(path: str, limit: int | None = None) -> list[dict]:
@@ -909,6 +1161,12 @@ def prepare_job_text(raw_job: dict, max_chars: int = 8000) -> str:
         meta_parts.append(f"Location: {loc['name']}")
     elif isinstance(loc, str) and loc:
         meta_parts.append(f"Location: {loc}")
+    if raw_job.get("workplaceType"):
+        meta_parts.append(f"Workplace type: {raw_job['workplaceType']}")
+    if raw_job.get("isRemote") is True:
+        meta_parts.append("Remote flag: true")
+    if raw_job.get("allLocations"):
+        meta_parts.append(f"Allowed locations: {', '.join(raw_job['allLocations'])}")
     # Only pass location context to LLM (helps with geocoding)
     # Salary, office_type, job_type come from API structured data — not LLM
     if raw_job.get("departments"):
