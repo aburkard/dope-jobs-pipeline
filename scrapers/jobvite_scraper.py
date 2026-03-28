@@ -1,5 +1,6 @@
 import html2text
 import json
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base_scraper import BaseScraper
@@ -26,23 +27,82 @@ class JobviteScraper(BaseScraper):
         return self.session.head(
             f'{self.base_url}/{self.board_token}').status_code == 200
 
+    def _board_search_url(self):
+        return f'{self.base_url}/{self.board_token}/search'
+
+    def _get_board_soup(self):
+        if not hasattr(self, '_cached_board_soup'):
+            response = self.session.get(self._board_search_url(), timeout=5)
+            self._cached_board_soup = BeautifulSoup(response.text, 'html.parser')
+        return self._cached_board_soup
+
+    def _absolute_url(self, value):
+        if not value:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if value.startswith('//'):
+            return f'https:{value}'
+        if value.startswith('/'):
+            return f'{self.base_url}{value}'
+        return value
+
+    def get_company_name(self):
+        if not hasattr(self, '_cached_company_name'):
+            soup = self._get_board_soup()
+            title_el = soup.select_one('title')
+            company_name = title_el.text.strip() if title_el else None
+            if company_name and company_name.endswith(' Careers'):
+                company_name = company_name[:-8]
+            self._cached_company_name = company_name
+        return self._cached_company_name
+
+    def get_company_domain(self):
+        if not hasattr(self, '_cached_company_domain'):
+            soup = self._get_board_soup()
+            company_name = (self.get_company_name() or '').strip().lower()
+            domain = None
+            for link in soup.select('a[href]'):
+                href = self._absolute_url(link.get('href'))
+                if not href:
+                    continue
+                parsed = urlparse(href)
+                host = (parsed.netloc or '').lower()
+                if not host or 'jobvite.com' in host:
+                    continue
+                text = ' '.join(link.get_text(' ', strip=True).split()).lower()
+                if company_name and company_name in text:
+                    domain = href
+                    break
+            self._cached_company_domain = domain
+        return self._cached_company_domain
+
+    def get_company_logo_url(self):
+        if not hasattr(self, '_cached_company_logo_url'):
+            soup = self._get_board_soup()
+            logo_url = None
+            for selector in ('link[rel=\"icon\"]', 'link[rel=\"shortcut icon\"]', 'link[rel=\"apple-touch-icon\"]'):
+                el = soup.select_one(selector)
+                href = self._absolute_url(el.get('href')) if el and el.has_attr('href') else None
+                if href:
+                    logo_url = href
+                    break
+            self._cached_company_logo_url = logo_url
+        return self._cached_company_logo_url
+
     def fetch_job_board(self):
         raise NotImplementedError
 
     def _fetch_jobs(self, page=0, content=True, existing_descriptions=None,
                     refetch_existing_detail=False):
-        url = f'{self.base_url}/{self.board_token}/search'
+        url = self._board_search_url()
         response = self.session.get(url, params={'p': page}, timeout=5)
         soup = BeautifulSoup(response.text, 'html.parser')
         # Job listings have the css class table.jv-job-list tr, ul.jv-job-list li
         job_listings = soup.select(
             'table.jv-job-list tr, ul.jv-job-list li, div.jv-job-list li')
-        company_name = None
-        title_el = soup.select_one('title')
-        if title_el:
-            company_name = title_el.text
-            if company_name.endswith(' Careers'):
-                company_name = company_name[:-8]
+        company_name = self.get_company_name()
         for job_listing in job_listings:
             title_node = job_listing.select_one(
                 'td.jv-job-list-name, span.jv-job-list-name, div.jv-job-list-name'
