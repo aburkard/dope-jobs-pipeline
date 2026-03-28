@@ -1,6 +1,11 @@
 import json
 
-from batch_parse import build_batch_request_entry, extract_batch_output_entry, normalize_batch_resource
+from batch_parse import (
+    build_batch_request_entry,
+    extract_batch_output_entry,
+    normalize_batch_resource,
+    parse_companies_file,
+)
 from parse import GeminiBackend
 
 
@@ -13,6 +18,16 @@ def test_build_batch_request_entry_includes_job_metadata_and_schema():
     assert config["maxOutputTokens"] == 321
     assert config["responseMimeType"] == "application/json"
 
+
+def test_parse_companies_file_supports_explicit_and_default_ats(tmp_path):
+    path = tmp_path / "companies.txt"
+    path.write_text("greenhouse:figma\nspotify\n# comment\n\nlever:aeva\n", encoding="utf-8")
+
+    assert parse_companies_file(str(path)) == [
+        ("greenhouse", "figma"),
+        ("greenhouse", "spotify"),
+        ("lever", "aeva"),
+    ]
 
 
 def test_extract_batch_output_entry_handles_wrapped_response():

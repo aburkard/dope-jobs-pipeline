@@ -2,6 +2,7 @@
 
 Usage:
   uv run python batch_parse.py submit --limit 1000
+  uv run python batch_parse.py submit --companies companies.txt --limit 1000
   uv run python batch_parse.py status batches/123
   uv run python batch_parse.py collect batches/123
   uv run python batch_parse.py list
@@ -244,9 +245,26 @@ def _batch_counts(batch: dict) -> tuple[int | None, int | None, int | None]:
     )
 
 
-def submit_batch(conn, limit: int, model: str, max_tokens: int, display_name: str | None = None) -> str | None:
+def parse_companies_file(path: str) -> list[tuple[str, str]]:
+    companies: list[tuple[str, str]] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                ats, token = line.split(":", 1)
+            else:
+                ats, token = "greenhouse", line
+            companies.append((ats.strip(), token.strip()))
+    return companies
+
+
+def submit_batch(conn, limit: int, model: str, max_tokens: int,
+                 display_name: str | None = None,
+                 companies: list[tuple[str, str]] | None = None) -> str | None:
     temp_batch_id = f"pending-{uuid.uuid4()}"
-    jobs = claim_jobs_for_parse_batch(conn, temp_batch_id, limit)
+    jobs = claim_jobs_for_parse_batch(conn, temp_batch_id, limit, companies=companies)
     if not jobs:
         print("No eligible jobs need parsing.")
         return None
@@ -418,6 +436,7 @@ def main():
     submit_parser.add_argument("--limit", type=int, required=True, help="Number of jobs to submit in this batch")
     submit_parser.add_argument("--max-output-tokens", type=int, default=2000, help="Gemini max output tokens")
     submit_parser.add_argument("--display-name", default=None, help="Optional human-readable batch name")
+    submit_parser.add_argument("--companies", default=None, help="Optional companies file to scope the batch")
 
     status_parser = subparsers.add_parser("status", help="Fetch current batch state")
     status_parser.add_argument("batch_name", help="Gemini batch resource name, e.g. batches/123")
@@ -433,12 +452,14 @@ def main():
     init_schema(conn)
     try:
         if args.command == "submit":
+            companies = parse_companies_file(args.companies) if args.companies else None
             submit_batch(
                 conn,
                 limit=args.limit,
                 model=args.model,
                 max_tokens=args.max_output_tokens,
                 display_name=args.display_name,
+                companies=companies,
             )
         elif args.command == "status":
             batch = status_batch(conn, args.batch_name, args.model)

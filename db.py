@@ -420,14 +420,14 @@ def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, d
         return {row[0]: (row[1] or {}) for row in cur.fetchall()}
 
 
-def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int) -> list[dict]:
+def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int,
+                               companies: list[tuple[str, str]] | None = None) -> list[dict]:
     """Reserve up to ``limit`` jobs for a Gemini batch parse submission."""
     if limit <= 0:
         raise ValueError("limit must be greater than 0")
 
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        query = """
             SELECT id, ats, board_token, title, raw_json, content_hash
             FROM pipeline_jobs
             WHERE needs_parse = TRUE
@@ -437,12 +437,23 @@ def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int) -> list[dict]:
                   FROM pipeline_parse_batch_jobs pbj
                   WHERE pbj.job_id = pipeline_jobs.id
               )
+        """
+        params: list[object] = []
+        if companies is not None:
+            if not companies:
+                return []
+            clauses = []
+            for ats, board_token in companies:
+                clauses.append("(ats = %s AND board_token = %s)")
+                params.extend([ats, board_token])
+            query += " AND (" + " OR ".join(clauses) + ")"
+        query += """
             ORDER BY last_seen_at DESC NULLS LAST, id
             LIMIT %s
             FOR UPDATE SKIP LOCKED
-            """,
-            (limit,),
-        )
+        """
+        params.append(limit)
+        cur.execute(query, params)
         rows = cur.fetchall()
         if rows:
             execute_values(
