@@ -45,3 +45,26 @@ def test_dedupe_resolved_locations_by_normalized_structure_without_geoname():
     ]
 
     assert _dedupe_resolved_locations(locations) == [locations[0]]
+
+
+def test_dedupe_resolved_locations_by_identical_label_prefers_richer_entry():
+    richer = {
+        "label": "Kuala Lumpur, Malaysia",
+        "city": "Kuala Lumpur",
+        "state": "Kuala Lumpur",
+        "country_code": "MY",
+        "geoname_id": 1735161,
+        "lat": 3.1412,
+        "lng": 101.68653,
+    }
+    poorer = {
+        "label": "Kuala Lumpur, Malaysia",
+        "city": "Kuala Lumpur",
+        "state": None,
+        "country_code": "Malaysia",
+        "geoname_id": None,
+        "lat": None,
+        "lng": None,
+    }
+
+    assert _dedupe_resolved_locations([poorer, richer]) == [richer]

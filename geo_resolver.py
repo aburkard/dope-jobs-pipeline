@@ -41,15 +41,45 @@ def _location_identity(location: dict) -> tuple:
     return ("label", label)
 
 
+def _location_quality_score(location: dict) -> tuple[int, int, int, int, int]:
+    return (
+        1 if location.get("geoname_id") else 0,
+        1 if location.get("lat") is not None and location.get("lng") is not None else 0,
+        1 if _clean_str(location.get("state")) else 0,
+        1 if _normalize_country_code(location.get("country_code")) else 0,
+        len(_clean_str(location.get("label")) or ""),
+    )
+
+
 def _dedupe_resolved_locations(locations: list[dict]) -> list[dict]:
-    seen = set()
-    deduped = []
+    deduped: list[dict] = []
+    by_label: dict[str, int] = {}
     for location in locations:
-        key = _location_identity(location)
-        if key in seen:
+        label = normalize_geo_text(_clean_str(location.get("label")) or "")
+        if label and label in by_label:
+            existing_idx = by_label[label]
+            existing = deduped[existing_idx]
+            if _location_quality_score(location) > _location_quality_score(existing):
+                deduped[existing_idx] = location
             continue
-        seen.add(key)
+
+        key = _location_identity(location)
+        replaced = False
+        for idx, existing in enumerate(deduped):
+            if _location_identity(existing) == key:
+                if _location_quality_score(location) > _location_quality_score(existing):
+                    deduped[idx] = location
+                    if label:
+                        by_label[label] = idx
+                replaced = True
+                break
+        if replaced:
+            continue
+
         deduped.append(location)
+        idx = len(deduped) - 1
+        if label:
+            by_label[label] = idx
     return deduped
 
 
