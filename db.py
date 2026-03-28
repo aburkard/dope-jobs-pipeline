@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values, Json
 
+from public_ids import derive_company_slug_map, short_public_job_id
 from utils.html_utils import remove_html_markup
 
 
@@ -31,6 +32,7 @@ def init_schema(conn):
             ats TEXT NOT NULL,
             board_token TEXT NOT NULL,
             company_name TEXT,
+            company_slug TEXT,
             domain TEXT,
             logo_url TEXT,
             boilerplate_hashes JSONB,
@@ -41,6 +43,7 @@ def init_schema(conn):
         )""",
         """CREATE TABLE IF NOT EXISTS pipeline_jobs (
             id TEXT PRIMARY KEY,
+            public_job_id TEXT,
             ats TEXT NOT NULL,
             board_token TEXT NOT NULL,
             title TEXT,
@@ -104,6 +107,8 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_jobs_needs_parse ON pipeline_jobs (needs_parse) WHERE needs_parse = TRUE",
         "CREATE INDEX IF NOT EXISTS idx_jobs_board ON pipeline_jobs (ats, board_token)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_removed ON pipeline_jobs (removed_at) WHERE removed_at IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_public_job_id ON pipeline_jobs (public_job_id) WHERE public_job_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_companies_company_slug ON pipeline_companies (company_slug)",
         "CREATE INDEX IF NOT EXISTS idx_parse_batch_jobs_job_id ON pipeline_parse_batch_jobs (job_id)",
         "CREATE INDEX IF NOT EXISTS idx_parse_batches_state ON pipeline_parse_batches (state)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_kind ON geo_places (kind)",
@@ -125,10 +130,14 @@ def init_schema(conn):
         alter_statements = []
         if ("pipeline_companies", "logo_url") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN logo_url TEXT")
+        if ("pipeline_companies", "company_slug") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN company_slug TEXT")
         if ("pipeline_companies", "boilerplate_hashes") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN boilerplate_hashes JSONB")
         if ("pipeline_jobs", "job_group") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN job_group TEXT")
+        if ("pipeline_jobs", "public_job_id") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN public_job_id TEXT")
 
         for stmt in alter_statements:
             cur.execute(stmt)
@@ -182,11 +191,12 @@ def upsert_scraped_jobs(conn, scraped_jobs: list[dict]) -> dict:
     job_data = []
     for raw in scraped_jobs:
         jid = job_id(raw)
+        public_id = short_public_job_id(jid)
         h = content_hash(raw)
         ats = raw.get("ats_name", "")
         board = raw.get("board_token", "")
         title = raw.get("title", "")
-        job_data.append((jid, ats, board, title, h, raw))
+        job_data.append((jid, public_id, ats, board, title, h, raw))
 
     # Fetch existing hashes + last_seen_at from DB
     ids = [jd[0] for jd in job_data]
@@ -202,22 +212,23 @@ def upsert_scraped_jobs(conn, scraped_jobs: list[dict]) -> dict:
     needs_detail = []
     unchanged = 0
 
-    for jid, ats, board, title, h, raw in job_data:
+    for jid, public_id, ats, board, title, h, raw in job_data:
         if jid not in existing:
             # New job — always needs detail fetch
             new_jobs.append(raw)
             needs_detail.append(raw)
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO pipeline_jobs (id, ats, board_token, title, content_hash, first_seen_at, last_seen_at, needs_parse, raw_json)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                    INSERT INTO pipeline_jobs (id, public_job_id, ats, board_token, title, content_hash, first_seen_at, last_seen_at, needs_parse, raw_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
                     ON CONFLICT (id) DO UPDATE SET
+                        public_job_id = COALESCE(pipeline_jobs.public_job_id, EXCLUDED.public_job_id),
                         last_seen_at = EXCLUDED.last_seen_at,
                         content_hash = EXCLUDED.content_hash,
                         needs_parse = TRUE,
                         removed_at = NULL,
                         raw_json = EXCLUDED.raw_json
-                """, (jid, ats, board, title, h, now, now, Json(raw)))
+                """, (jid, public_id, ats, board, title, h, now, now, Json(raw)))
         elif existing[jid]["hash"] != h:
             # Content changed — needs detail fetch
             changed_jobs.append(raw)
@@ -225,6 +236,7 @@ def upsert_scraped_jobs(conn, scraped_jobs: list[dict]) -> dict:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE pipeline_jobs SET
+                        public_job_id = COALESCE(public_job_id, %s),
                         content_hash = %s,
                         title = %s,
                         last_seen_at = %s,
@@ -232,7 +244,7 @@ def upsert_scraped_jobs(conn, scraped_jobs: list[dict]) -> dict:
                         removed_at = NULL,
                         raw_json = %s
                     WHERE id = %s
-                """, (h, title, now, Json(raw), jid))
+                """, (public_id, h, title, now, Json(raw), jid))
         else:
             # Content unchanged — still update raw_json (metadata may have changed)
             # and check if source updated since our last scrape
@@ -252,8 +264,8 @@ def upsert_scraped_jobs(conn, scraped_jobs: list[dict]) -> dict:
 
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE pipeline_jobs SET last_seen_at = %s, removed_at = NULL, raw_json = %s WHERE id = %s",
-                    (now, Json(raw), jid)
+                    "UPDATE pipeline_jobs SET public_job_id = COALESCE(public_job_id, %s), last_seen_at = %s, removed_at = NULL, raw_json = %s WHERE id = %s",
+                    (public_id, now, Json(raw), jid)
                 )
 
     conn.commit()
@@ -366,7 +378,7 @@ def record_parse_error(conn, job_id: str, error: str):
 
 def get_parsed_jobs(conn, include_removed: bool = False, job_ids: list[str] | None = None) -> list[dict]:
     """Get all parsed jobs for loading into MeiliSearch."""
-    query = "SELECT id, ats, board_token, title, parsed_json, job_group, raw_json FROM pipeline_jobs WHERE parsed_json IS NOT NULL"
+    query = "SELECT id, public_job_id, ats, board_token, title, parsed_json, job_group, raw_json FROM pipeline_jobs WHERE parsed_json IS NOT NULL"
     params = []
     if not include_removed:
         query += " AND removed_at IS NULL"
@@ -378,7 +390,7 @@ def get_parsed_jobs(conn, include_removed: bool = False, job_ids: list[str] | No
     with conn.cursor() as cur:
         cur.execute(query, params)
         return [
-            {"id": r[0], "ats": r[1], "board_token": r[2], "title": r[3], "parsed_json": r[4], "job_group": r[5], "raw_json": r[6]}
+            {"id": r[0], "public_job_id": r[1], "ats": r[2], "board_token": r[3], "title": r[4], "parsed_json": r[5], "job_group": r[6], "raw_json": r[7]}
             for r in cur.fetchall()
         ]
 
@@ -848,17 +860,130 @@ def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
+def backfill_company_slugs(conn, only_missing: bool = True, chunk_size: int = 1000) -> int:
+    """Backfill deterministic public company slugs."""
+    query = """
+        SELECT ats, board_token, company_name, domain, company_slug
+        FROM pipeline_companies
+    """
+    if only_missing:
+        query += " WHERE company_slug IS NULL OR company_slug = ''"
+
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = [
+            {
+                "ats": row[0],
+                "board_token": row[1],
+                "company_name": row[2],
+                "domain": row[3],
+                "company_slug": row[4],
+            }
+            for row in cur.fetchall()
+        ]
+
+    if not rows:
+        return 0
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT ats, board_token, company_name, domain FROM pipeline_companies")
+        all_rows = [
+            {
+                "ats": row[0],
+                "board_token": row[1],
+                "company_name": row[2],
+                "domain": row[3],
+            }
+            for row in cur.fetchall()
+        ]
+
+    slug_map = derive_company_slug_map(all_rows)
+    updates = [
+        (row["ats"], row["board_token"], slug_map[(row["ats"], row["board_token"])])
+        for row in rows
+        if slug_map.get((row["ats"], row["board_token"]))
+    ]
+    if not updates:
+        return 0
+
+    total_updated = 0
+    for i in range(0, len(updates), chunk_size):
+        chunk = updates[i:i + chunk_size]
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                WITH incoming(ats, board_token, company_slug) AS (VALUES %s)
+                UPDATE pipeline_companies AS pc
+                SET company_slug = incoming.company_slug
+                FROM incoming
+                WHERE pc.ats = incoming.ats
+                  AND pc.board_token = incoming.board_token
+                  AND COALESCE(pc.company_slug, '') <> incoming.company_slug
+                """,
+                chunk,
+                template="(%s, %s, %s)",
+            )
+            total_updated += max(cur.rowcount, 0)
+        conn.commit()
+    return total_updated
+
+
+def backfill_public_job_ids(conn, only_missing: bool = True, chunk_size: int = 5000) -> int:
+    """Backfill stable public IDs for jobs."""
+    query = "SELECT id FROM pipeline_jobs"
+    if only_missing:
+        query += " WHERE public_job_id IS NULL OR public_job_id = ''"
+
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = [row[0] for row in cur.fetchall()]
+
+    if not rows:
+        return 0
+
+    total_updated = 0
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i:i + chunk_size]
+        updates = [(jid, short_public_job_id(jid)) for jid in chunk]
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                WITH incoming(job_id, public_job_id) AS (VALUES %s)
+                UPDATE pipeline_jobs AS pj
+                SET public_job_id = incoming.public_job_id
+                FROM incoming
+                WHERE pj.id = incoming.job_id
+                  AND COALESCE(pj.public_job_id, '') <> incoming.public_job_id
+                """,
+                updates,
+                template="(%s, %s)",
+            )
+            total_updated += max(cur.rowcount, 0)
+        conn.commit()
+    return total_updated
+
+
 def upsert_company(conn, ats: str, board_token: str, company_name: str | None = None,
                     domain: str | None = None, logo_url: str | None = None,
                     job_count: int = 0, job_count_exact: bool = True):
     """Upsert a company record."""
     now = datetime.now(timezone.utc)
+    slug_map = derive_company_slug_map([{
+        "ats": ats,
+        "board_token": board_token,
+        "company_name": company_name,
+        "domain": domain,
+    }])
+    company_slug = slug_map[(ats, board_token)]
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO pipeline_companies (ats, board_token, company_name, domain, logo_url, last_scraped_at, job_count, active)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s > 0)
+            INSERT INTO pipeline_companies (ats, board_token, company_name, company_slug, domain, logo_url, last_scraped_at, job_count, active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s > 0)
             ON CONFLICT (ats, board_token) DO UPDATE SET
                 company_name = COALESCE(EXCLUDED.company_name, pipeline_companies.company_name),
+                company_slug = COALESCE(EXCLUDED.company_slug, pipeline_companies.company_slug),
                 domain = COALESCE(EXCLUDED.domain, pipeline_companies.domain),
                 logo_url = COALESCE(EXCLUDED.logo_url, pipeline_companies.logo_url),
                 last_scraped_at = EXCLUDED.last_scraped_at,
@@ -871,7 +996,7 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                     ELSE pipeline_companies.active OR EXCLUDED.job_count > 0
                 END
         """, (
-            ats, board_token, company_name, domain, logo_url, now, job_count, job_count,
+            ats, board_token, company_name, company_slug, domain, logo_url, now, job_count, job_count,
             job_count_exact, job_count_exact,
         ))
     conn.commit()

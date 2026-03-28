@@ -362,9 +362,9 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     # Load company metadata for names, domains, logos
     company_lookup = {}
     with conn.cursor() as cur:
-        cur.execute("SELECT ats, board_token, company_name, domain, logo_url FROM pipeline_companies")
+        cur.execute("SELECT ats, board_token, company_name, company_slug, domain, logo_url FROM pipeline_companies")
         for r in cur.fetchall():
-            company_lookup[(r[0], r[1])] = {"name": r[2], "domain": r[3], "logo_url": r[4]}
+            company_lookup[(r[0], r[1])] = {"name": r[2], "slug": r[3], "domain": r[4], "logo_url": r[5]}
 
     # Count locations per job_group for "Also in N locations" display
     group_counts = {}
@@ -383,6 +383,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         board = row["board_token"]
         co = company_lookup.get((row["ats"], board), {})
         company = co.get("name") or board.replace("-", " ").replace("_", " ").title()
+        company_slug = co.get("slug") or board
         company_domain = co.get("domain", "")
         company_logo = co.get("logo_url", "")
 
@@ -438,10 +439,11 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
         docs.append({
             "id": row["id"],
+            "public_job_id": row.get("public_job_id"),
             "title": row["title"],
             "tagline": m.get("tagline", ""),
             "company": company,
-            "company_slug": board,
+            "company_slug": company_slug,
             "company_domain": company_domain,
             "company_logo": company_logo,
             "description": description[:3000],
