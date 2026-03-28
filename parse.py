@@ -146,6 +146,7 @@ VisaSponsorship = Literal["yes", "no", "unknown"]
 
 class Location(BaseModel):
     label: str | None = Field(None, description="Raw human-readable location label")
+    geoname_id: int | None = Field(None, description="Canonical GeoNames place ID when resolved")
     city: str | None = None
     state: str | None = None
     country_code: str | None = Field(None, description="ISO 3166-1 alpha-2 country code")
@@ -156,6 +157,7 @@ class Location(BaseModel):
 class ApplicantLocationRequirement(BaseModel):
     scope: Literal["country", "state", "city", "region_group"]
     name: str
+    geoname_id: int | None = Field(None, description="Canonical GeoNames place ID when resolved")
     country_code: str | None = Field(None, description="ISO 3166-1 alpha-2 country code when known")
     region: str | None = Field(None, description="Administrative region/state/province when known")
 

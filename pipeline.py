@@ -258,6 +258,7 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
     import os
     import concurrent.futures
     from parse import OpenAIBackend, GeminiBackend, prepare_job_text, merge_api_data
+    from geo_resolver import GeoResolver
 
     pending = get_jobs_needing_parse(conn, limit=limit, companies=companies)
     if not pending:
@@ -277,6 +278,7 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
     failures = 0
     t0 = time.time()
     parsed_job_ids = []
+    geo_resolver = GeoResolver(conn)
 
     def parse_one(job_row):
         """Parse a single job. Returns (jid, parsed_dict, raw) or (jid, None, raw)."""
@@ -292,6 +294,7 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
             if result is not None:
                 parsed = result.model_dump(mode="json")
                 parsed = merge_api_data(raw, parsed)
+                parsed = geo_resolver.resolve_parsed_geo(parsed)
                 return jid, parsed, raw
         except Exception as e:
             return jid, None, raw, str(e)

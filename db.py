@@ -320,6 +320,37 @@ def save_parsed_result(conn, job_id: str, parsed_json: dict):
     conn.commit()
 
 
+def update_parsed_json(conn, job_id: str, parsed_json: dict):
+    """Update parsed_json without mutating parse bookkeeping fields."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE pipeline_jobs
+            SET parsed_json = %s
+            WHERE id = %s
+        """, (Json(parsed_json), job_id))
+    conn.commit()
+
+
+def update_parsed_json_bulk(conn, rows: list[tuple[str, dict]]):
+    """Bulk update parsed_json for many jobs in one transaction."""
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            WITH incoming(job_id, parsed_json) AS (VALUES %s)
+            UPDATE pipeline_jobs AS pj
+            SET parsed_json = incoming.parsed_json::jsonb
+            FROM incoming
+            WHERE pj.id = incoming.job_id
+            """,
+            [(job_id, Json(parsed_json)) for job_id, parsed_json in rows],
+            template="(%s, %s)",
+        )
+    conn.commit()
+
+
 def record_parse_error(conn, job_id: str, error: str):
     """Record a parse failure. After 3 failures, stop retrying."""
     with conn.cursor() as cur:

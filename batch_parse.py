@@ -34,6 +34,7 @@ from db import (
     save_parse_batch,
     update_parse_batch,
 )
+from geo_resolver import GeoResolver
 from parse import GeminiBackend, merge_api_data, prepare_job_text
 
 load_dotenv()
@@ -251,6 +252,7 @@ def submit_batch(conn, limit: int, model: str, max_tokens: int, display_name: st
         return None
 
     backend = GeminiBackend(model=model)
+    geo_resolver = GeoResolver(conn)
     client = GeminiBatchClient(model=model)
     display_name = display_name or f"parse-{int(time.time())}-{len(jobs)}"
 
@@ -379,6 +381,7 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
             continue
 
         merged = merge_api_data(job_row["raw_json"] or {}, parsed.model_dump(mode="json"))
+        merged = geo_resolver.resolve_parsed_geo(merged)
         chunk_success_rows.append(
             (job_row["job_id"], job_row["submitted_content_hash"], merged)
         )
