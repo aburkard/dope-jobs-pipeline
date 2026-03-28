@@ -7,6 +7,7 @@ dependencies = [
     "beautifulsoup4>=4.14.3",
     "cdx-toolkit>=0.9.38",
     "html2text>=2025.4.15",
+    "lingua-language-detector>=2.2.0",
     "lxml>=6.0.2",
     "meilisearch>=0.40.0",
     "mlx-lm>=0.31.1",

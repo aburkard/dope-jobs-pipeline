@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+from functools import lru_cache
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -1108,6 +1109,9 @@ def _derive_posting_language(raw_job: dict) -> str | None:
             normalized = _normalize_language_code(candidate)
             if normalized:
                 return normalized
+    detector_guess = _detect_posting_language_with_lingua(raw_job)
+    if detector_guess:
+        return detector_guess
     title = raw_job.get("title")
     content = (
         raw_job.get("content")
@@ -1124,6 +1128,95 @@ def _derive_posting_language(raw_job: dict) -> str | None:
         if part
     )
     return _guess_posting_language_from_text(text)
+
+
+def prepare_language_detection_text(raw_job: dict, max_chars: int = 5000) -> str:
+    """Prepare text for language identification.
+
+    Unlike prepare_job_text(), this intentionally excludes English ATS metadata
+    prefixes like "Location:" and "Department:" because they skew language ID.
+    """
+    title = raw_job.get("title", "") or ""
+    content = (
+        raw_job.get("content")
+        or raw_job.get("descriptionPlain")
+        or raw_job.get("descriptionHtml")
+        or raw_job.get("description")
+        or ""
+    )
+    if content:
+        content = remove_html_markup(content, double_unescape=True)
+
+    parts = []
+    if isinstance(title, str) and title.strip():
+        parts.append(title.strip())
+    if isinstance(content, str) and content.strip():
+        parts.append(content.strip())
+
+    text = "\n\n".join(parts)
+    text = re.sub(r"\b[A-Z]{2,}\d+[A-Z0-9]*\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+@lru_cache(maxsize=1)
+def _get_lingua_detector():
+    from lingua import Language, LanguageDetectorBuilder
+
+    languages = [
+        Language.ENGLISH,
+        Language.FRENCH,
+        Language.GERMAN,
+        Language.SPANISH,
+        Language.PORTUGUESE,
+        Language.ITALIAN,
+        Language.DUTCH,
+        Language.POLISH,
+        Language.SWEDISH,
+        Language.DANISH,
+        Language.FINNISH,
+        Language.NORWEGIAN_BOKMAL,
+        Language.CZECH,
+        Language.HUNGARIAN,
+        Language.ROMANIAN,
+        Language.GREEK,
+        Language.TURKISH,
+        Language.UKRAINIAN,
+        Language.RUSSIAN,
+        Language.JAPANESE,
+        Language.KOREAN,
+        Language.CHINESE,
+    ]
+    return LanguageDetectorBuilder.from_languages(*languages).build()
+
+
+def _detect_posting_language_with_lingua(raw_job: dict) -> str | None:
+    text = prepare_language_detection_text(raw_job)
+    if len(text) < 20:
+        return None
+
+    try:
+        detector = _get_lingua_detector()
+    except Exception:
+        return None
+
+    try:
+        values = detector.compute_language_confidence_values(text)
+    except Exception:
+        return None
+    if not values:
+        return None
+
+    top = values[0]
+    if getattr(top, "value", 0.0) < 0.6:
+        return None
+
+    language = getattr(top, "language", None)
+    iso = getattr(language, "iso_code_639_1", None)
+    name = getattr(iso, "name", None)
+    if not name:
+        return None
+    return name.lower()
 
 
 _LANGUAGE_STOPWORDS = {

@@ -1,6 +1,6 @@
 """Tests for merge_api_data — overlaying API structured data onto LLM extraction."""
 import pytest
-from parse import _flat_to_job_metadata, merge_api_data
+from parse import _flat_to_job_metadata, merge_api_data, prepare_language_detection_text
 
 
 class TestGreenhousePayRanges:
@@ -250,6 +250,18 @@ class TestPostingLanguage:
         llm = {"posting_language": "en"}
         result = merge_api_data(raw, llm)
         assert result["posting_language"] == "ja"
+
+    def test_language_detection_text_excludes_english_metadata_prefixes(self):
+        raw = {
+            "title": "Développeur logiciel",
+            "description": "Rejoins notre équipe avec une mission claire en France.",
+            "location": "Paris, France",
+            "department": "Engineering",
+        }
+        text = prepare_language_detection_text(raw)
+        assert "Location:" not in text
+        assert "Department:" not in text
+        assert "Rejoins notre équipe" in text
 
 
 class TestLocationOverlay:
