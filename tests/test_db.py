@@ -170,3 +170,36 @@ class TestScraperNormalization:
         assert normalized["descriptionHtml"].startswith("<div")
         assert normalized["datePosted"] == "2026-03-01"
         assert normalized["validThrough"] == "2026-04-01T00:00"
+
+    def test_jobvite_fetch_job_falls_back_to_json_ld_description(self, monkeypatch):
+        from scrapers.jobvite_scraper import JobviteScraper
+
+        html = """
+        <html>
+          <body>
+            <script type="application/ld+json">
+              {
+                "@context": "https://schema.org",
+                "@type": "JobPosting",
+                "datePosted": "2026-03-01",
+                "validThrough": "2026-04-01T00:00",
+                "description": "<div><h3>About the role</h3><ul><li>Build pipelines</li></ul></div>"
+              }
+            </script>
+          </body>
+        </html>
+        """
+
+        class Response:
+            def __init__(self, text):
+                self.text = text
+
+        scraper = JobviteScraper("test")
+        monkeypatch.setattr(scraper.session, "get", lambda *args, **kwargs: Response(html))
+
+        fetched = scraper.fetch_job("abc123")
+
+        assert fetched["descriptionHtml"].startswith("<div>")
+        assert "Build pipelines" in fetched["description"]
+        assert fetched["datePosted"] == "2026-03-01"
+        assert fetched["validThrough"] == "2026-04-01T00:00"

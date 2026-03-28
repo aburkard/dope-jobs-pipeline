@@ -106,10 +106,13 @@ class JobviteScraper(BaseScraper):
         job = {}
         job['id'] = job_id
         description_html = soup.select_one('div.jv-job-detail-description')
-        job['descriptionHtml'] = str(description_html or "")
-        job['description'] = self.html2text.handle(
-            str(description_html or "")).strip()
         metadata = self.extract_job_metadata(soup)
+        description_html_string = str(description_html or "").strip()
+        json_ld_description = metadata.get("descriptionHtml")
+        if not description_html_string and json_ld_description:
+            description_html_string = json_ld_description
+        job['descriptionHtml'] = description_html_string
+        job['description'] = self.html2text.handle(description_html_string).strip()
         if metadata.get("datePosted"):
             job["datePosted"] = metadata["datePosted"]
         if metadata.get("validThrough"):
@@ -155,6 +158,9 @@ class JobviteScraper(BaseScraper):
                     metadata["datePosted"] = item["datePosted"]
                 if item.get("validThrough"):
                     metadata["validThrough"] = item["validThrough"]
+                description_html = item.get("description")
+                if isinstance(description_html, str) and description_html.strip():
+                    metadata["descriptionHtml"] = description_html.strip()
                 return metadata
         return metadata
 
