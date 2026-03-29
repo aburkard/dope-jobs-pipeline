@@ -256,3 +256,34 @@ def test_build_meili_location_uses_remote_applicant_geography():
         ],
     }
     assert pipeline._build_meili_location(parsed) == "United States • Canada"
+
+
+def test_build_meili_locations_all_uses_all_work_locations():
+    parsed = {
+        "office_type": "hybrid",
+        "locations": [
+            {"label": "San Francisco, California, United States"},
+            {"city": "New York City", "state": "New York", "country_code": "US"},
+            {"label": "San Francisco, California, United States"},
+        ],
+        "applicant_location_requirements": [
+            {"scope": "country", "name": "United States", "country_code": "US"},
+        ],
+    }
+    assert pipeline._build_meili_locations_all(parsed) == [
+        "San Francisco, California, United States",
+        "New York City, New York, US",
+    ]
+
+
+def test_build_meili_locations_all_falls_back_to_remote_requirements():
+    parsed = {
+        "office_type": "remote",
+        "locations": [],
+        "applicant_location_requirements": [
+            {"scope": "country", "name": "United States", "country_code": "US"},
+            {"scope": "country", "name": "Canada", "country_code": "CA"},
+            {"scope": "country", "name": "United States", "country_code": "US"},
+        ],
+    }
+    assert pipeline._build_meili_locations_all(parsed) == ["United States", "Canada"]

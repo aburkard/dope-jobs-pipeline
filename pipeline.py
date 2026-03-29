@@ -379,30 +379,52 @@ def _applicant_requirement_label(requirement: dict) -> str | None:
     return requirement.get("name")
 
 
-def _build_meili_location(parsed_json: dict) -> str:
-    locs = parsed_json.get("locations", []) or []
-    if locs:
-        loc = locs[0]
-        if loc.get("label"):
-            return loc["label"]
-        loc_parts = []
-        if loc.get("city"):
-            loc_parts.append(loc["city"])
-        if loc.get("state"):
-            loc_parts.append(loc["state"])
-        if loc.get("country_code"):
-            loc_parts.append(loc["country_code"])
-        return ", ".join(loc_parts)
+def _work_location_label(location: dict) -> str | None:
+    if not isinstance(location, dict):
+        return None
+    if location.get("label"):
+        return location["label"]
+    loc_parts = []
+    if location.get("city"):
+        loc_parts.append(location["city"])
+    if location.get("state"):
+        loc_parts.append(location["state"])
+    if location.get("country_code"):
+        loc_parts.append(location["country_code"])
+    return ", ".join(loc_parts) or None
+
+
+def _build_meili_locations_all(parsed_json: dict) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    for location in parsed_json.get("locations", []) or []:
+        label = _work_location_label(location)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+
+    if labels:
+        return labels
 
     if parsed_json.get("office_type") == "remote":
-        labels = []
-        seen = set()
         for requirement in parsed_json.get("applicant_location_requirements", []) or []:
             label = _applicant_requirement_label(requirement)
             if not label or label in seen:
                 continue
             seen.add(label)
             labels.append(label)
+
+    return labels
+
+
+def _build_meili_location(parsed_json: dict) -> str:
+    labels = _build_meili_locations_all(parsed_json)
+    if parsed_json.get("locations"):
+        return labels[0] if labels else ""
+
+    if parsed_json.get("office_type") == "remote":
         if labels:
             if len(labels) <= 2:
                 return " • ".join(labels)
@@ -514,6 +536,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "company_logo": company_logo,
             "description": description[:3000],
             "location": location_str,
+            "locations_all": _build_meili_locations_all(m),
             "_geo": geo,
             "office_type": m.get("office_type", ""),
             "job_type": m.get("job_type", ""),
@@ -554,7 +577,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "job_group", "location_count",
     ])
     index.update_searchable_attributes([
-        "title", "tagline", "company", "description", "location",
+        "title", "tagline", "company", "description", "location", "locations_all",
         "hard_skills", "soft_skills", "benefits_highlights",
     ])
     index.update_sortable_attributes(["salary_min", "salary_max"])
