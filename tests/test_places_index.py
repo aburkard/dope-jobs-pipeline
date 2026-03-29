@@ -48,3 +48,24 @@ def test_build_place_doc_country():
     assert doc["admin1_key"] is None
     assert doc["supports_radius"] is False
     assert "_geo" not in doc
+
+
+def test_build_place_doc_admin1_prioritizes_before_locality():
+    row = (
+        6093943,
+        "admin1",
+        "Ontario",
+        "Ontario",
+        "Ontario, Canada",
+        "CA",
+        "Canada",
+        "08",
+        "Ontario",
+        None,
+        None,
+        None,
+        "ADM1",
+        ["ontario", "ontario canada"],
+    )
+    doc = build_place_doc(row)
+    assert doc["kind_priority"] == 1
