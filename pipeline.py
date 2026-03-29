@@ -19,6 +19,7 @@ import os
 import time
 import sys
 from collections import defaultdict
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -129,13 +130,18 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
             }
 
             if ats == "jobvite":
-                existing_descriptions = {
-                    short_id: raw.get("description", "")
+                existing_details = {
+                    short_id: {
+                        "description": raw.get("description", ""),
+                        "descriptionHtml": raw.get("descriptionHtml", ""),
+                        "datePosted": raw.get("datePosted"),
+                        "validThrough": raw.get("validThrough"),
+                    }
                     for short_id, raw in existing_jobs_by_short_id.items()
-                    if raw.get("description")
+                    if raw.get("description") or raw.get("descriptionHtml") or raw.get("datePosted")
                 }
                 job_iter = scraper.fetch_jobs(
-                    existing_descriptions=existing_descriptions,
+                    existing_details=existing_details,
                     refetch_existing_detail=jobvite_refetch_existing_detail,
                 )
                 jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
@@ -344,6 +350,67 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
     return parsed_job_ids
 
 
+def _normalize_company_domain_for_favicon(domain: str | None) -> str | None:
+    if not domain:
+        return None
+    value = domain.strip()
+    if not value:
+        return None
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    return parsed.netloc or parsed.path or None
+
+
+def _fallback_company_logo(company_domain: str | None, company_slug: str | None) -> str:
+    domain = _normalize_company_domain_for_favicon(company_domain) or (f"{company_slug}.com" if company_slug else None)
+    if not domain:
+        return ""
+    return f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+
+
+def _applicant_requirement_label(requirement: dict) -> str | None:
+    if not isinstance(requirement, dict):
+        return None
+    if requirement.get("scope") == "country":
+        return requirement.get("name") or requirement.get("country_code")
+    if requirement.get("scope") in {"state", "city"}:
+        return requirement.get("name") or requirement.get("region")
+    if requirement.get("scope") == "region_group":
+        return requirement.get("name")
+    return requirement.get("name")
+
+
+def _build_meili_location(parsed_json: dict) -> str:
+    locs = parsed_json.get("locations", []) or []
+    if locs:
+        loc = locs[0]
+        if loc.get("label"):
+            return loc["label"]
+        loc_parts = []
+        if loc.get("city"):
+            loc_parts.append(loc["city"])
+        if loc.get("state"):
+            loc_parts.append(loc["state"])
+        if loc.get("country_code"):
+            loc_parts.append(loc["country_code"])
+        return ", ".join(loc_parts)
+
+    if parsed_json.get("office_type") == "remote":
+        labels = []
+        seen = set()
+        for requirement in parsed_json.get("applicant_location_requirements", []) or []:
+            label = _applicant_requirement_label(requirement)
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+        if labels:
+            if len(labels) <= 2:
+                return " • ".join(labels)
+            return f"{' • '.join(labels[:2])} +{len(labels) - 2} more"
+
+    return ""
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False):
@@ -394,21 +461,11 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         company = co.get("name") or board.replace("-", " ").replace("_", " ").title()
         company_slug = co.get("slug") or board
         company_domain = co.get("domain", "")
-        company_logo = co.get("logo_url", "")
+        company_logo = co.get("logo_url", "") or _fallback_company_logo(company_domain, company_slug)
 
-        # Location string from parsed metadata
+        # Location string from parsed metadata / remote applicant geography
         locs = m.get("locations", [])
-        location_str = ""
-        if locs:
-            loc = locs[0]
-            if loc.get("label"):
-                location_str = loc["label"]
-            else:
-                loc_parts = []
-                if loc.get("city"): loc_parts.append(loc["city"])
-                if loc.get("state"): loc_parts.append(loc["state"])
-                if loc.get("country_code"): loc_parts.append(loc["country_code"])
-                location_str = ", ".join(loc_parts)
+        location_str = _build_meili_location(m)
 
         # Salary
         sal = m.get("salary")

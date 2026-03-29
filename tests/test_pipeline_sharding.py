@@ -111,9 +111,16 @@ def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
         def __init__(self, token):
             self.token = token
 
-        def fetch_jobs(self, existing_descriptions=None, refetch_existing_detail=False):
+        def fetch_jobs(self, existing_details=None, refetch_existing_detail=False):
             assert refetch_existing_detail is False
-            assert existing_descriptions == {"123": "Stored description"}
+            assert existing_details == {
+                "123": {
+                    "description": "Stored description",
+                    "descriptionHtml": "<p>Stored description</p>",
+                    "datePosted": "2026-01-30",
+                    "validThrough": None,
+                }
+            }
             yield {
                 "id": "jobvite__ninjaone__123",
                 "ats_name": "jobvite",
@@ -133,7 +140,11 @@ def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
 
     monkeypatch.setitem(pipeline.ATS_SCRAPERS, "jobvite", FakeScraper)
     monkeypatch.setattr(pipeline, "get_existing_jobs_for_board", lambda conn, ats, token: {
-        "jobvite__ninjaone__123": {"description": "Stored description"},
+        "jobvite__ninjaone__123": {
+            "description": "Stored description",
+            "descriptionHtml": "<p>Stored description</p>",
+            "datePosted": "2026-01-30",
+        },
     })
     monkeypatch.setattr(pipeline, "upsert_scraped_jobs", lambda conn, jobs: {
         "new": jobs,
@@ -233,3 +244,15 @@ def test_step_scrape_without_cap_fetches_all_jobs(monkeypatch):
     result = pipeline.step_scrape(object(), [("greenhouse", "figma")], max_per_company=None)
 
     assert result["new_count"] == 3
+
+
+def test_build_meili_location_uses_remote_applicant_geography():
+    parsed = {
+        "office_type": "remote",
+        "locations": [],
+        "applicant_location_requirements": [
+            {"scope": "country", "name": "United States", "country_code": "US"},
+            {"scope": "country", "name": "Canada", "country_code": "CA"},
+        ],
+    }
+    assert pipeline._build_meili_location(parsed) == "United States • Canada"

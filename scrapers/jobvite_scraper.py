@@ -94,7 +94,7 @@ class JobviteScraper(BaseScraper):
     def fetch_job_board(self):
         raise NotImplementedError
 
-    def _fetch_jobs(self, page=0, content=True, existing_descriptions=None,
+    def _fetch_jobs(self, page=0, content=True, existing_details=None,
                     refetch_existing_detail=False):
         url = self._board_search_url()
         response = self.session.get(url, params={'p': page}, timeout=5)
@@ -129,28 +129,38 @@ class JobviteScraper(BaseScraper):
             job['company_name'] = company_name
 
             if content:
-                existing_description = None
-                if existing_descriptions:
-                    existing_description = existing_descriptions.get(job['id'])
-                if existing_description and not refetch_existing_detail:
-                    job['description'] = existing_description
+                existing_detail = None
+                if existing_details:
+                    existing_detail = existing_details.get(job['id'])
+                can_reuse_existing = (
+                    existing_detail
+                    and not refetch_existing_detail
+                    and existing_detail.get("description")
+                    and existing_detail.get("descriptionHtml")
+                    and existing_detail.get("datePosted")
+                )
+                if can_reuse_existing:
+                    job['description'] = existing_detail["description"]
+                    job['descriptionHtml'] = existing_detail["descriptionHtml"]
+                    job['datePosted'] = existing_detail.get("datePosted")
+                    job['validThrough'] = existing_detail.get("validThrough")
                 else:
                     job_data = self.fetch_job(job['id'])
                     job = {**job, **job_data}
 
             yield job
 
-    def fetch_jobs(self, normalize=True, content=True, existing_descriptions=None,
+    def fetch_jobs(self, normalize=True, content=True, existing_details=None,
                    refetch_existing_detail=False):
         # Keep going until we get an empty page
         for page in range(100):
             found_jobs = False
             for job in self._fetch_jobs(
-                page=page,
-                content=content,
-                existing_descriptions=existing_descriptions,
-                refetch_existing_detail=refetch_existing_detail,
-            ):
+                    page=page,
+                    content=content,
+                    existing_details=existing_details,
+                    refetch_existing_detail=refetch_existing_detail,
+                ):
                 if normalize:
                     job = self.normalize_job(job)
                     job = self.add_default_fields(job)

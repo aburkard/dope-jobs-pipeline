@@ -1052,6 +1052,11 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         merged.get("locations"),
     )
 
+    if merged.get("office_type") == "remote" and not merged.get("applicant_location_requirements"):
+        merged["applicant_location_requirements"] = _derive_remote_requirements_from_locations(
+            merged.get("locations"),
+        )
+
     return merged
 
 
@@ -1556,6 +1561,27 @@ def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: s
         if isinstance(title, str) and title:
             reqs.extend(_derive_remote_requirements_from_text(title))
 
+    return _dedupe_requirements(reqs)
+
+
+def _derive_remote_requirements_from_locations(locations: list[dict] | None) -> list[dict]:
+    reqs = []
+    for location in locations or []:
+        if not isinstance(location, dict):
+            continue
+        country_code = _country_code_from_value(_to_str(location.get("country_code"))) or _to_str(location.get("country_code"))
+        label = _to_str(location.get("label"))
+        if country_code:
+            reqs.append(
+                _make_applicant_requirement(
+                    "country",
+                    label or country_code,
+                    country_code=country_code,
+                )
+            )
+            continue
+        if label:
+            reqs.extend(_derive_remote_requirements_from_text(label))
     return _dedupe_requirements(reqs)
 
 

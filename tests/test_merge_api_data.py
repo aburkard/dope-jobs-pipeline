@@ -143,6 +143,30 @@ class TestWorkplaceType:
         result = merge_api_data(raw, llm)
         assert result["office_type"] == "hybrid"
 
+    def test_remote_locations_backfill_applicant_geography_from_existing_locations(self):
+        raw = {}
+        llm = {
+            "office_type": "remote",
+            "locations": [
+                {
+                    "label": "Toronto, Ontario, Canada",
+                    "city": "Toronto",
+                    "state": "Ontario",
+                    "country_code": "CA",
+                }
+            ],
+            "applicant_location_requirements": [],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == [
+            {
+                "scope": "country",
+                "name": "Toronto, Ontario, Canada",
+                "country_code": "CA",
+                "region": None,
+            }
+        ]
+
 
 class TestJobType:
     @pytest.mark.parametrize("api_field,api_value,expected", [
