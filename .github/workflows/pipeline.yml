@@ -15,6 +15,11 @@ on:
         description: "Total shard count for this rollout"
         required: true
         default: "8"
+      jobvite_refetch_existing_detail:
+        description: "Force Jobvite detail HTML/date refetch for existing jobs"
+        type: boolean
+        required: false
+        default: "false"
 
 concurrency:
   group: dopejobs-pipeline
@@ -64,6 +69,10 @@ jobs:
 
           if [ -n "${{ inputs.max_per_company }}" ]; then
             ARGS+=(--max-per-company "${{ inputs.max_per_company }}")
+          fi
+
+          if [ "${{ inputs.jobvite_refetch_existing_detail }}" = "true" ]; then
+            ARGS+=(--jobvite-refetch-existing-detail)
           fi
 
           uv run python pipeline.py "${ARGS[@]}"
