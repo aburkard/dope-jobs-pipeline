@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import os
 import time
 import sys
@@ -460,6 +461,57 @@ def _dedupe_nonempty(values: list[str | int | None]) -> list[str | int]:
     return ordered
 
 
+def _location_point(location: dict) -> dict[str, float] | None:
+    if not isinstance(location, dict):
+        return None
+    lat = location.get("lat")
+    lng = location.get("lng")
+    if lat in (None, "") or lng in (None, ""):
+        return None
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(lat_f) or not math.isfinite(lng_f):
+        return None
+    return {"lat": lat_f, "lng": lng_f}
+
+
+def _build_primary_geo(parsed_json: dict) -> dict[str, float] | None:
+    for location in parsed_json.get("locations", []) or []:
+        point = _location_point(location)
+        if point:
+            return point
+    return None
+
+
+def _build_job_geojson(parsed_json: dict) -> dict | None:
+    coordinates: list[list[float]] = []
+    seen: set[tuple[float, float]] = set()
+
+    for location in parsed_json.get("locations", []) or []:
+        point = _location_point(location)
+        if not point:
+            continue
+        coord = (point["lng"], point["lat"])
+        if coord in seen:
+            continue
+        seen.add(coord)
+        coordinates.append([point["lng"], point["lat"]])
+
+    if not coordinates:
+        return None
+
+    return {
+        "type": "Feature",
+        "geometry": {
+            "type": "MultiPoint",
+            "coordinates": coordinates,
+        },
+    }
+
+
 def _build_job_geo_fields(parsed_json: dict, geo_lookup: dict[int, dict]) -> dict[str, list]:
     work_geoname_ids: list[int] = []
     work_country_codes: list[str] = []
@@ -585,9 +637,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         sal = m.get("salary")
 
         # Geo
-        geo = None
-        if locs and locs[0].get("lat") and locs[0].get("lng"):
-            geo = {"lat": locs[0]["lat"], "lng": locs[0]["lng"]}
+        geo = _build_primary_geo(m)
+        geojson = _build_job_geojson(m)
         geo_fields = _build_job_geo_fields(m, geo_lookup)
 
         # Build description from raw_json — raw content only, no metadata injection
@@ -618,7 +669,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
                 sal_text += f"-${sal['max']:,.0f}"
             sal_text += f" {sal.get('period', 'annually')}"
 
-        docs.append({
+        doc = {
             "id": row["id"],
             "public_job_id": row.get("public_job_id"),
             "title": row["title"],
@@ -630,7 +681,6 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "description": description[:3000],
             "location": location_str,
             "locations_all": _build_meili_locations_all(m),
-            "_geo": geo,
             **geo_fields,
             "office_type": m.get("office_type", ""),
             "job_type": m.get("job_type", ""),
@@ -655,7 +705,12 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "ats_type": row["ats"],
             "job_group": row.get("job_group") or row["id"],  # ungrouped jobs use their own ID
             "location_count": group_counts.get(row.get("job_group"), 1),
-        })
+        }
+        if geo is not None:
+            doc["_geo"] = geo
+        if geojson is not None:
+            doc["_geojson"] = geojson
+        docs.append(doc)
 
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
     client = meilisearch.Client(meili_host, key)
@@ -671,7 +726,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "work_geoname_ids", "work_country_codes", "work_admin1_keys",
         "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
-        "_geo",
+        "_geo", "_geojson",
     ])
     index.update_searchable_attributes([
         "title", "tagline", "company", "description", "location", "locations_all",

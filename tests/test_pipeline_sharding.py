@@ -315,3 +315,35 @@ def test_build_job_geo_fields_uses_country_scoped_admin1_keys():
         "applicant_country_codes": ["US", "CA"],
         "applicant_admin1_keys": ["US-CA", "CA-ON"],
     }
+
+
+def test_build_primary_geo_uses_first_valid_point():
+    parsed = {
+        "locations": [
+            {"label": "United States"},
+            {"label": "New York, New York, United States", "lat": 40.7128, "lng": -74.0060},
+            {"label": "San Francisco, California, United States", "lat": 37.7749, "lng": -122.4194},
+        ],
+    }
+    assert pipeline._build_primary_geo(parsed) == {"lat": 40.7128, "lng": -74.006}
+
+
+def test_build_job_geojson_includes_all_unique_points():
+    parsed = {
+        "locations": [
+            {"label": "New York, New York, United States", "lat": 40.7128, "lng": -74.0060},
+            {"label": "San Francisco, California, United States", "lat": 37.7749, "lng": -122.4194},
+            {"label": "San Francisco duplicate", "lat": 37.7749, "lng": -122.4194},
+            {"label": "Broad United States"},
+        ],
+    }
+    assert pipeline._build_job_geojson(parsed) == {
+        "type": "Feature",
+        "geometry": {
+            "type": "MultiPoint",
+            "coordinates": [
+                [-74.006, 40.7128],
+                [-122.4194, 37.7749],
+            ],
+        },
+    }

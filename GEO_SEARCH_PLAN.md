@@ -33,6 +33,7 @@ The `jobs` Meili index must expose normalized geo fields beyond:
 - `location`
 - `locations_all`
 - `_geo`
+- `_geojson`
 
 We also need exact-matchable fields:
 
@@ -43,6 +44,19 @@ We also need exact-matchable fields:
 - `applicant_admin1_keys`
 
 These fields support deterministic filters for non-point places.
+
+### 2b. Jobs should use both `_geo` and `_geojson`
+
+We will index both:
+
+- `_geo` for the primary point-like work location
+- `_geojson` as a GeoJSON `MultiPoint` covering all point-like work locations
+
+Reason:
+
+- Meili geosearch filters can match `_geojson`
+- sorting still only uses `_geo`
+- this lets city-radius search match secondary offices without duplicating job docs
 
 ### 3. `admin1_code` is not globally unique
 
@@ -182,16 +196,18 @@ A job can have:
 
 - one primary `location`
 - many `locations_all`
+- one primary `_geo`
+- one `_geojson` multipoint for all point-like work locations
 
 For v1 exact state/country filtering:
 
 - match any stored work/admin/country key
 
-For v1 radius search:
+For city-radius search:
 
-- use the primary `_geo` only
-
-This is approximate for multi-location jobs and acceptable for v1.
+- use `_geoRadius(...)`
+- let Meili match any point in `_geojson`
+- keep `_geo` as the primary point for sortability and display
 
 ### Remote applicant geography
 
@@ -232,7 +248,6 @@ should be treated as broad geography, not a fake point.
 
 ## Phase 2
 
-- Improve radius handling for multi-location jobs
 - Add `metro` support
 - Consider `region_group` support
 - Consider browser geolocation / “near me”
