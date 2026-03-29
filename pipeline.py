@@ -367,6 +367,12 @@ def _fallback_company_logo(company_domain: str | None, company_slug: str | None)
     return f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
 
 
+def _admin1_key(country_code: str | None, admin1_code: str | None) -> str | None:
+    if not country_code or not admin1_code:
+        return None
+    return f"{country_code}-{admin1_code}"
+
+
 def _applicant_requirement_label(requirement: dict) -> str | None:
     if not isinstance(requirement, dict):
         return None
@@ -419,6 +425,79 @@ def _build_meili_locations_all(parsed_json: dict) -> list[str]:
     return labels
 
 
+def _load_geo_place_lookup(conn, geoname_ids: set[int]) -> dict[int, dict]:
+    if not geoname_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT geoname_id, kind, country_code, admin1_code
+            FROM geo_places
+            WHERE geoname_id = ANY(%s)
+            """,
+            (list(geoname_ids),),
+        )
+        return {
+            row[0]: {
+                "kind": row[1],
+                "country_code": row[2],
+                "admin1_code": row[3],
+            }
+            for row in cur.fetchall()
+        }
+
+
+def _dedupe_nonempty(values: list[str | int | None]) -> list[str | int]:
+    ordered = []
+    seen = set()
+    for value in values:
+        if value in (None, ""):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _build_job_geo_fields(parsed_json: dict, geo_lookup: dict[int, dict]) -> dict[str, list]:
+    work_geoname_ids: list[int] = []
+    work_country_codes: list[str] = []
+    work_admin1_keys: list[str] = []
+    applicant_country_codes: list[str] = []
+    applicant_admin1_keys: list[str] = []
+
+    for location in parsed_json.get("locations", []) or []:
+        geoname_id = location.get("geoname_id")
+        place = geo_lookup.get(geoname_id) if geoname_id else None
+        country_code = (place or {}).get("country_code") or location.get("country_code")
+        admin1_code = (place or {}).get("admin1_code")
+        work_geoname_ids.append(geoname_id)
+        work_country_codes.append(country_code)
+        work_admin1_keys.append(_admin1_key(country_code, admin1_code))
+
+    for requirement in parsed_json.get("applicant_location_requirements", []) or []:
+        geoname_id = requirement.get("geoname_id")
+        place = geo_lookup.get(geoname_id) if geoname_id else None
+        scope = requirement.get("scope")
+        country_code = (place or {}).get("country_code") or requirement.get("country_code")
+        admin1_code = (place or {}).get("admin1_code")
+
+        if scope == "country":
+            applicant_country_codes.append(country_code)
+        elif scope in {"state", "city"}:
+            applicant_country_codes.append(country_code)
+            applicant_admin1_keys.append(_admin1_key(country_code, admin1_code))
+
+    return {
+        "work_geoname_ids": _dedupe_nonempty(work_geoname_ids),
+        "work_country_codes": _dedupe_nonempty(work_country_codes),
+        "work_admin1_keys": _dedupe_nonempty(work_admin1_keys),
+        "applicant_country_codes": _dedupe_nonempty(applicant_country_codes),
+        "applicant_admin1_keys": _dedupe_nonempty(applicant_admin1_keys),
+    }
+
+
 def _build_meili_location(parsed_json: dict) -> str:
     labels = _build_meili_locations_all(parsed_json)
     if parsed_json.get("locations"):
@@ -464,6 +543,19 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         for r in cur.fetchall():
             company_lookup[(r[0], r[1])] = {"name": r[2], "slug": r[3], "domain": r[4], "logo_url": r[5]}
 
+    geoname_ids: set[int] = set()
+    for row in parsed_rows:
+        parsed = row.get("parsed_json") or {}
+        for location in parsed.get("locations", []) or []:
+            geoname_id = location.get("geoname_id")
+            if isinstance(geoname_id, int):
+                geoname_ids.add(geoname_id)
+        for requirement in parsed.get("applicant_location_requirements", []) or []:
+            geoname_id = requirement.get("geoname_id")
+            if isinstance(geoname_id, int):
+                geoname_ids.add(geoname_id)
+    geo_lookup = _load_geo_place_lookup(conn, geoname_ids)
+
     # Count locations per job_group for "Also in N locations" display
     group_counts = {}
     for row in parsed_rows:
@@ -496,6 +588,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         geo = None
         if locs and locs[0].get("lat") and locs[0].get("lng"):
             geo = {"lat": locs[0]["lat"], "lng": locs[0]["lng"]}
+        geo_fields = _build_job_geo_fields(m, geo_lookup)
 
         # Build description from raw_json — raw content only, no metadata injection
         raw = row.get("raw_json") or {}
@@ -538,6 +631,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "location": location_str,
             "locations_all": _build_meili_locations_all(m),
             "_geo": geo,
+            **geo_fields,
             "office_type": m.get("office_type", ""),
             "job_type": m.get("job_type", ""),
             "experience_level": m.get("experience_level", ""),
@@ -574,13 +668,16 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
         "company_stage", "benefits_categories", "salary_transparency",
         "salary_min", "salary_max",
+        "work_geoname_ids", "work_country_codes", "work_admin1_keys",
+        "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
+        "_geo",
     ])
     index.update_searchable_attributes([
         "title", "tagline", "company", "description", "location", "locations_all",
         "hard_skills", "soft_skills", "benefits_highlights",
     ])
-    index.update_sortable_attributes(["salary_min", "salary_max"])
+    index.update_sortable_attributes(["salary_min", "salary_max", "_geo"])
     index.update_settings({"pagination": {"maxTotalHits": 500000}})
 
     # Upsert documents in batches

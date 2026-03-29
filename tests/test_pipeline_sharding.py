@@ -287,3 +287,31 @@ def test_build_meili_locations_all_falls_back_to_remote_requirements():
         ],
     }
     assert pipeline._build_meili_locations_all(parsed) == ["United States", "Canada"]
+
+
+def test_build_job_geo_fields_uses_country_scoped_admin1_keys():
+    parsed = {
+        "locations": [
+            {"geoname_id": 1, "country_code": "US"},
+            {"geoname_id": 2, "country_code": "CA"},
+        ],
+        "applicant_location_requirements": [
+            {"scope": "country", "country_code": "US", "geoname_id": 10},
+            {"scope": "state", "country_code": "US", "geoname_id": 11},
+            {"scope": "city", "country_code": "CA", "geoname_id": 12},
+        ],
+    }
+    geo_lookup = {
+        1: {"country_code": "US", "admin1_code": "CA", "kind": "locality"},
+        2: {"country_code": "CA", "admin1_code": "ON", "kind": "locality"},
+        10: {"country_code": "US", "admin1_code": None, "kind": "country"},
+        11: {"country_code": "US", "admin1_code": "CA", "kind": "admin1"},
+        12: {"country_code": "CA", "admin1_code": "ON", "kind": "locality"},
+    }
+    assert pipeline._build_job_geo_fields(parsed, geo_lookup) == {
+        "work_geoname_ids": [1, 2],
+        "work_country_codes": ["US", "CA"],
+        "work_admin1_keys": ["US-CA", "CA-ON"],
+        "applicant_country_codes": ["US", "CA"],
+        "applicant_admin1_keys": ["US-CA", "CA-ON"],
+    }
