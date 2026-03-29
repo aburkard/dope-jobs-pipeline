@@ -31,9 +31,9 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 25
       matrix:
-        shard_index: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
     steps:
       - uses: actions/checkout@v5
@@ -55,6 +55,11 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
+          if [ "${{ matrix.shard_index }}" -ge "${{ inputs.total_shards }}" ]; then
+            echo "Skipping shard ${{ matrix.shard_index }} because total_shards=${{ inputs.total_shards }}"
+            exit 0
+          fi
+
           ARGS=(
             --companies-from-db
             --shard-index "${{ matrix.shard_index }}"
