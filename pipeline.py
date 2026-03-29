@@ -34,8 +34,9 @@ from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
     record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
-    get_existing_jobs_for_board,
+    get_existing_jobs_for_board, get_latest_fx_rates,
 )
+from salary_normalization import normalize_salary_annual_usd
 
 
 ATS_SCRAPERS = {
@@ -578,6 +579,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         return
 
     print(f"\n--- LOAD ({len(parsed_rows)} active, {len(removed_ids)} removed) ---")
+    fx_rates, fx_as_of_date = get_latest_fx_rates(conn)
+    fx_as_of = fx_as_of_date.isoformat() if fx_as_of_date else None
 
     # Load company metadata for names, domains, logos
     company_lookup = {}
@@ -635,6 +638,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
         # Salary
         sal = m.get("salary")
+        normalized_salary = normalize_salary_annual_usd(sal, fx_rates)
 
         # Geo
         geo = _build_primary_geo(m)
@@ -691,6 +695,11 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "salary_max": sal["max"] if sal else None,
             "salary_currency": sal["currency"] if sal else None,
             "salary_period": sal["period"] if sal else None,
+            "salary_annual_min_usd": normalized_salary["salary_annual_min_usd"] if normalized_salary else None,
+            "salary_annual_max_usd": normalized_salary["salary_annual_max_usd"] if normalized_salary else None,
+            "salary_fx_currency": normalized_salary["salary_fx_currency"] if normalized_salary else None,
+            "salary_fx_usd_per_unit": normalized_salary["salary_fx_usd_per_unit"] if normalized_salary else None,
+            "salary_fx_as_of": fx_as_of,
             "salary_transparency": m.get("salary_transparency", "not_disclosed"),
             "hard_skills": m.get("hard_skills", []),
             "soft_skills": m.get("soft_skills", []),
@@ -723,6 +732,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
         "company_stage", "benefits_categories", "salary_transparency",
         "salary_min", "salary_max",
+        "salary_annual_min_usd", "salary_annual_max_usd",
         "work_geoname_ids", "work_country_codes", "work_admin1_keys",
         "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
@@ -732,7 +742,11 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "title", "tagline", "company", "description", "location", "locations_all",
         "hard_skills", "soft_skills", "benefits_highlights",
     ])
-    index.update_sortable_attributes(["salary_min", "salary_max", "_geo"])
+    index.update_sortable_attributes([
+        "salary_min", "salary_max",
+        "salary_annual_min_usd", "salary_annual_max_usd",
+        "_geo",
+    ])
     index.update_settings({"pagination": {"maxTotalHits": 500000}})
 
     # Upsert documents in batches

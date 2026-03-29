@@ -8,7 +8,7 @@ Used for incremental pipeline runs — only re-parse jobs that actually changed.
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import psycopg2
 from psycopg2.extras import execute_values, Json
@@ -103,6 +103,14 @@ def init_schema(conn):
             search_names TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )""",
+        """CREATE TABLE IF NOT EXISTS fx_rates (
+            currency_code TEXT NOT NULL,
+            usd_per_unit DOUBLE PRECISION NOT NULL,
+            as_of_date DATE NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (currency_code, as_of_date)
+        )""",
     ]
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_jobs_needs_parse ON pipeline_jobs (needs_parse) WHERE needs_parse = TRUE",
@@ -116,6 +124,7 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_geo_places_country_admin1 ON geo_places (country_code, admin1_code)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_population ON geo_places (population DESC)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_search_names ON geo_places USING GIN (search_names)",
+        "CREATE INDEX IF NOT EXISTS idx_fx_rates_as_of_date ON fx_rates (as_of_date DESC)",
     ]
     with conn.cursor() as cur:
         for stmt in create_statements:
@@ -159,6 +168,46 @@ def init_schema(conn):
         for stmt in index_statements:
             cur.execute(stmt)
     conn.commit()
+
+
+def upsert_fx_rates(conn, rows: list[tuple[str, float, date, str]]) -> None:
+    if not rows:
+        return
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO fx_rates (currency_code, usd_per_unit, as_of_date, source)
+            VALUES %s
+            ON CONFLICT (currency_code, as_of_date) DO UPDATE SET
+                usd_per_unit = EXCLUDED.usd_per_unit,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            rows,
+        )
+    conn.commit()
+
+
+def get_latest_fx_rates(conn) -> tuple[dict[str, float], date | None]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(as_of_date) FROM fx_rates")
+        row = cur.fetchone()
+        as_of_date = row[0] if row else None
+        if as_of_date is None:
+            return {}, None
+
+        cur.execute(
+            """
+            SELECT currency_code, usd_per_unit
+            FROM fx_rates
+            WHERE as_of_date = %s
+            """,
+            (as_of_date,),
+        )
+        rates = {currency_code: float(usd_per_unit) for currency_code, usd_per_unit in cur.fetchall()}
+        return rates, as_of_date
 
 
 def content_hash(raw_job: dict) -> str:
