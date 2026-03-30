@@ -282,6 +282,11 @@ A temp/contract role is almost never above "interesting".
 INDUSTRY: Classify by what the company SELLS to end users, not the function of this specific role.
 - Choose ONE primary industry that best describes the company.
 - Use industry_tags for real secondary overlaps from the same enum list.
+- industry_primary should usually be company-level and stable across most roles at that company.
+- Use industry_tags for team-level/product-line overlaps like payments, advertising, AI features, developer tools, or marketplaces inside a broader company.
+- Example: Airbnb payments/ML roles should usually stay travel_hospitality or commerce_marketplaces as primary, with fintech_payments_banking as a tag if relevant.
+- Example: Spotify ads roles should usually stay media_entertainment as primary, with advertising_marketing as a tag if relevant.
+- Example: Sitecore roles should usually stay enterprise_software as primary, not ai_ml, unless the company itself is primarily an AI company.
 - AI labs, model platforms, AI safety orgs → ai_ml
 - Developer tools, cloud infra, databases, observability → developer_tools_infra
 - Business/productivity/collaboration software → enterprise_software
@@ -334,8 +339,8 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - job_type: "full-time"|"part-time"|"contract"|"internship"|"temporary"|"freelance"
 - experience_level: "entry"|"mid"|"senior"|"staff"|"principal"|"executive"
 - is_manager: boolean
-- industry_primary: one of [ai_ml, developer_tools_infra, enterprise_software, cybersecurity_identity, fintech_payments_banking, investing_trading, insurance, crypto_web3, healthcare_services, biotech_pharma_life_sciences, education_edtech, consumer_social, media_entertainment, gaming, advertising_marketing, commerce_marketplaces, consumer_goods_brands, food_beverage, travel_hospitality, climate_energy_utilities, transportation_logistics, manufacturing_industrials, robotics_autonomy, semiconductors_hardware, space_aerospace, defense_public_safety, government_public_sector, real_estate_construction, telecommunications_networking, agriculture, legal, consulting_professional_services, nonprofit_philanthropy, staffing_recruiting_bpo, other]
-- industry_tags (array): zero or more additional applicable values from the SAME industry list. Use [] if no strong secondary industries apply. Prefer not to repeat the primary industry here.
+- industry_primary: one of [ai_ml, developer_tools_infra, enterprise_software, cybersecurity_identity, fintech_payments_banking, investing_trading, insurance, crypto_web3, healthcare_services, biotech_pharma_life_sciences, education_edtech, consumer_social, media_entertainment, gaming, advertising_marketing, commerce_marketplaces, consumer_goods_brands, food_beverage, travel_hospitality, climate_energy_utilities, transportation_logistics, manufacturing_industrials, robotics_autonomy, semiconductors_hardware, space_aerospace, defense_public_safety, government_public_sector, real_estate_construction, telecommunications_networking, agriculture, legal, consulting_professional_services, nonprofit_philanthropy, staffing_recruiting_bpo, other]. This should usually reflect the COMPANY'S core business, not the specific team.
+- industry_tags (array): zero or more additional applicable values from the SAME industry list. Use [] if no strong secondary industries apply. Prefer not to repeat the primary industry here. Use tags for adjacent business lines, monetization models, or product overlaps.
 - industry_other_hint: short freeform string ONLY when industry_primary is "other" and none of the enum values fit. "" otherwise.
 - hard_skills (array): ALL technical/domain skills mentioned
 - soft_skills (array): ALL interpersonal skills mentioned
