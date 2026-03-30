@@ -32,42 +32,45 @@ from utils.html_utils import remove_html_markup
 # Enums & Literals
 # ---------------------------------------------------------------------------
 
-class Industry(str, Enum):
-    agriculture = "agriculture"
-    aerospace_defense = "aerospace_defense"
-    ai_ml = "ai_ml"
-    automotive = "automotive"
-    biotechnology = "biotechnology"
-    construction = "construction"
-    consulting = "consulting"
-    consumer_goods = "consumer_goods"
-    cryptocurrency_web3 = "cryptocurrency_web3"
-    cybersecurity = "cybersecurity"
-    education = "education"
-    energy_utilities = "energy_utilities"
-    entertainment_media = "entertainment_media"
-    fashion_apparel = "fashion_apparel"
-    financial_services = "financial_services"
-    food_beverage = "food_beverage"
-    gaming = "gaming"
-    government = "government"
-    healthcare = "healthcare"
-    hospitality_tourism = "hospitality_tourism"
-    insurance = "insurance"
-    legal = "legal"
-    logistics_supply_chain = "logistics_supply_chain"
-    manufacturing = "manufacturing"
-    marketing_advertising = "marketing_advertising"
-    nonprofit = "nonprofit"
-    pharmaceuticals = "pharmaceuticals"
-    real_estate = "real_estate"
-    retail_ecommerce = "retail_ecommerce"
-    robotics = "robotics"
-    saas_software = "saas_software"
-    semiconductors = "semiconductors"
-    telecommunications = "telecommunications"
-    transportation = "transportation"
-    other = "other"
+INDUSTRY_VALUES = [
+    "ai_ml",
+    "developer_tools_infra",
+    "enterprise_software",
+    "cybersecurity_identity",
+    "fintech_payments_banking",
+    "investing_trading",
+    "insurance",
+    "crypto_web3",
+    "healthcare_services",
+    "biotech_pharma_life_sciences",
+    "education_edtech",
+    "consumer_social",
+    "media_entertainment",
+    "gaming",
+    "advertising_marketing",
+    "commerce_marketplaces",
+    "consumer_goods_brands",
+    "food_beverage",
+    "travel_hospitality",
+    "climate_energy_utilities",
+    "transportation_logistics",
+    "manufacturing_industrials",
+    "robotics_autonomy",
+    "semiconductors_hardware",
+    "space_aerospace",
+    "defense_public_safety",
+    "government_public_sector",
+    "real_estate_construction",
+    "telecommunications_networking",
+    "agriculture",
+    "legal",
+    "consulting_professional_services",
+    "nonprofit_philanthropy",
+    "staffing_recruiting_bpo",
+    "other",
+]
+
+Industry = Enum("Industry", {value: value for value in INDUSTRY_VALUES}, type=str)
 
 
 class VibeTag(str, Enum):
@@ -206,7 +209,15 @@ class JobMetadata(BaseModel):
     job_type: JobType = Field(description="Employment type")
     experience_level: ExperienceLevel = Field(description="Seniority level of the role")
     is_manager: bool = Field(description="Is this a people management role?")
-    industry: Industry = Field(description="Primary industry of the company")
+    industry_primary: Industry = Field(description="Primary industry of the company")
+    industry_tags: list[Industry] = Field(
+        default_factory=list,
+        description="Additional applicable industries from the same enum list, excluding the primary industry when possible.",
+    )
+    industry_other_hint: str | None = Field(
+        None,
+        description="Short freeform hint only when industry_primary is 'other' and none of the enum values fit well.",
+    )
     hard_skills: list[str] = Field(default_factory=list, description="Technical and domain-specific skills required: programming languages, tools, frameworks, domain knowledge")
     soft_skills: list[str] = Field(default_factory=list, description="Interpersonal and transferable skills: communication, leadership, teamwork, problem-solving")
 
@@ -316,7 +327,9 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - job_type: "full-time"|"part-time"|"contract"|"internship"|"temporary"|"freelance"
 - experience_level: "entry"|"mid"|"senior"|"staff"|"principal"|"executive"
 - is_manager: boolean
-- industry: one of [agriculture, aerospace_defense, ai_ml, automotive, biotechnology, construction, consulting, consumer_goods, cryptocurrency_web3, cybersecurity, education, energy_utilities, entertainment_media, fashion_apparel, financial_services, food_beverage, gaming, government, healthcare, hospitality_tourism, insurance, legal, logistics_supply_chain, manufacturing, marketing_advertising, nonprofit, pharmaceuticals, real_estate, retail_ecommerce, robotics, saas_software, semiconductors, telecommunications, transportation, other]
+- industry_primary: one of [ai_ml, developer_tools_infra, enterprise_software, cybersecurity_identity, fintech_payments_banking, investing_trading, insurance, crypto_web3, healthcare_services, biotech_pharma_life_sciences, education_edtech, consumer_social, media_entertainment, gaming, advertising_marketing, commerce_marketplaces, consumer_goods_brands, food_beverage, travel_hospitality, climate_energy_utilities, transportation_logistics, manufacturing_industrials, robotics_autonomy, semiconductors_hardware, space_aerospace, defense_public_safety, government_public_sector, real_estate_construction, telecommunications_networking, agriculture, legal, consulting_professional_services, nonprofit_philanthropy, staffing_recruiting_bpo, other]
+- industry_tags (array): zero or more additional applicable values from the SAME industry list. Use [] if no strong secondary industries apply. Prefer not to repeat the primary industry here.
+- industry_other_hint: short freeform string ONLY when industry_primary is "other" and none of the enum values fit. "" otherwise.
 - hard_skills (array): ALL technical/domain skills mentioned
 - soft_skills (array): ALL interpersonal skills mentioned
 - cool_factor: "boring"|"standard"|"interesting"|"compelling"|"exceptional". Most jobs are standard/interesting.
@@ -380,15 +393,9 @@ FLAT_JSON_SCHEMA: dict = {
         "job_type": {"type": "string", "enum": ["full-time", "part-time", "contract", "internship", "temporary", "freelance"]},
         "experience_level": {"type": "string", "enum": ["entry", "mid", "senior", "staff", "principal", "executive"]},
         "is_manager": {"type": "boolean"},
-        "industry": {"type": "string", "enum": [
-            "agriculture", "aerospace_defense", "ai_ml", "automotive", "biotechnology", "construction",
-            "consulting", "consumer_goods", "cryptocurrency_web3", "cybersecurity", "education",
-            "energy_utilities", "entertainment_media", "fashion_apparel", "financial_services",
-            "food_beverage", "gaming", "government", "healthcare", "hospitality_tourism",
-            "insurance", "legal", "logistics_supply_chain", "manufacturing", "marketing_advertising",
-            "nonprofit", "pharmaceuticals", "real_estate", "retail_ecommerce", "robotics",
-            "saas_software", "semiconductors", "telecommunications", "transportation", "other",
-        ]},
+        "industry_primary": {"type": "string", "enum": INDUSTRY_VALUES},
+        "industry_tags": {"type": "array", "items": {"type": "string", "enum": INDUSTRY_VALUES}},
+        "industry_other_hint": {"type": "string"},
         "hard_skills": {"type": "array", "items": {"type": "string"}},
         "soft_skills": {"type": "array", "items": {"type": "string"}},
         "cool_factor": {"type": "string", "enum": [
@@ -443,7 +450,7 @@ FLAT_JSON_SCHEMA: dict = {
         "location_lat", "location_lng", "salary_min", "salary_max",
         "salary_currency", "salary_period", "salary_transparency",
         "office_type", "hybrid_days", "job_type", "experience_level", "is_manager",
-        "industry", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
+        "industry_primary", "industry_tags", "industry_other_hint", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
         "visa_sponsorship", "visa_sponsorship_types", "equity_offered",
         "equity_min_pct", "equity_max_pct", "company_stage",
         "company_size_min", "company_size_max", "team_size_min", "team_size_max",
@@ -613,6 +620,20 @@ def _flat_to_job_metadata(data: dict) -> JobMetadata:
                 seen.add(tag)
                 deduped.append(tag)
         data["vibe_tags"] = deduped
+
+    primary_industry = _to_str(data.get("industry_primary"))
+    deduped_industry_tags = []
+    seen_industries = set()
+    for tag in data.get("industry_tags", []) or []:
+        tag_value = _to_str(tag)
+        if not tag_value or tag_value == primary_industry or tag_value in seen_industries:
+            continue
+        seen_industries.add(tag_value)
+        deduped_industry_tags.append(tag_value)
+    data["industry_tags"] = deduped_industry_tags
+
+    other_hint = _to_str(data.get("industry_other_hint"))
+    data["industry_other_hint"] = other_hint if primary_industry == "other" else None
 
     # company_stage ("unknown" = not known)
     if data.get("company_stage") == "unknown":
@@ -784,7 +805,9 @@ class GeminiBackend:
                 "job_type": {"type": "STRING", "enum": ["full-time", "part-time", "contract", "internship", "temporary", "freelance"]},
                 "experience_level": {"type": "STRING", "enum": ["entry", "mid", "senior", "staff", "principal", "executive"]},
                 "is_manager": {"type": "BOOLEAN"},
-                "industry": {"type": "STRING", "enum": [e.value for e in Industry]},
+                "industry_primary": {"type": "STRING", "enum": [e.value for e in Industry]},
+                "industry_tags": {"type": "ARRAY", "items": {"type": "STRING", "enum": [e.value for e in Industry]}},
+                "industry_other_hint": {"type": "STRING"},
                 "hard_skills": {"type": "ARRAY", "items": {"type": "STRING"}},
                 "soft_skills": {"type": "ARRAY", "items": {"type": "STRING"}},
                 "cool_factor": {"type": "STRING", "enum": ["boring", "standard", "interesting", "compelling", "exceptional"]},
@@ -804,7 +827,7 @@ class GeminiBackend:
                 "posting_language": {"type": "STRING"},
             },
             "required": ["tagline", "office_type", "job_type", "experience_level", "is_manager",
-                          "industry", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
+                          "industry_primary", "industry_tags", "industry_other_hint", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
                           "visa_sponsorship", "benefits_categories", "salary_transparency", "posting_language"],
         }
 

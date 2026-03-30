@@ -714,6 +714,13 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
                 sal_text += f"-${sal['max']:,.0f}"
             sal_text += f" {sal.get('period', 'annually')}"
 
+        primary_industry = m.get("industry_primary") or m.get("industry", "")
+        secondary_industry_tags = m.get("industry_tags") or []
+        all_industry_tags = []
+        for value in [primary_industry, *secondary_industry_tags]:
+            if isinstance(value, str) and value and value not in all_industry_tags:
+                all_industry_tags.append(value)
+
         doc = {
             "id": row["id"],
             "public_job_id": row.get("public_job_id"),
@@ -731,7 +738,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "job_type": m.get("job_type", ""),
             "experience_level": m.get("experience_level", ""),
             "is_manager": m.get("is_manager", False),
-            "industry": m.get("industry", ""),
+            "industry": primary_industry,
+            "industry_tags": all_industry_tags,
             "salary_min": sal["min"] if sal else None,
             "salary_max": sal["max"] if sal else None,
             "salary_currency": sal["currency"] if sal else None,
@@ -769,7 +777,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     # Configure index settings (idempotent)
     index.update_filterable_attributes([
         "office_type", "job_type", "experience_level", "is_manager",
-        "industry", "company_slug", "ats_type",
+        "industry", "industry_tags", "company_slug", "ats_type",
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
         "company_stage", "benefits_categories", "salary_transparency",
         "salary_min", "salary_max",
