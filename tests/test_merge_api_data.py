@@ -347,14 +347,14 @@ class TestIndustryCanonicalization:
         raw = {}
         llm = {
             "industry_primary": "enterprise_software",
-            "industry_tags": ["ai_ml", "enterprise_software", "developer_tools_infra"],
+            "industry_tags": ["ai_ml", "enterprise_software", "developer_tools"],
             "industry_other_hint": "business software",
         }
         result = merge_api_data(raw, llm)
         assert result["industry_tags"] == [
             "enterprise_software",
             "ai_ml",
-            "developer_tools_infra",
+            "developer_tools",
         ]
         assert result["industry_other_hint"] is None
 

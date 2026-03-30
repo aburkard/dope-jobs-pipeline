@@ -34,15 +34,17 @@ from utils.html_utils import remove_html_markup
 
 INDUSTRY_VALUES = [
     "ai_ml",
-    "developer_tools_infra",
+    "developer_tools",
+    "cloud_data_infra",
     "enterprise_software",
-    "cybersecurity_identity",
-    "fintech_payments_banking",
+    "cybersecurity",
+    "payments_banking",
     "investing_trading",
     "insurance",
     "crypto_web3",
     "healthcare_services",
-    "biotech_pharma_life_sciences",
+    "biotech_life_sciences",
+    "pharma",
     "education_edtech",
     "consumer_social",
     "media_entertainment",
@@ -52,7 +54,8 @@ INDUSTRY_VALUES = [
     "consumer_goods_brands",
     "food_beverage",
     "travel_hospitality",
-    "climate_energy_utilities",
+    "climate_sustainability",
+    "energy_utilities",
     "transportation_logistics",
     "manufacturing_industrials",
     "robotics_autonomy",
@@ -60,13 +63,15 @@ INDUSTRY_VALUES = [
     "space_aerospace",
     "defense_public_safety",
     "government_public_sector",
-    "real_estate_construction",
+    "real_estate_proptech",
+    "construction_built_environment",
     "telecommunications_networking",
     "agriculture",
     "legal",
     "consulting_professional_services",
     "nonprofit_philanthropy",
-    "staffing_recruiting_bpo",
+    "staffing_recruiting",
+    "bpo_outsourcing",
     "other",
 ]
 INDUSTRY_VALUE_SET = set(INDUSTRY_VALUES)
@@ -312,22 +317,35 @@ INDUSTRY: Classify by what the company SELLS to end users, not the function of t
 - Use industry_tags for real secondary overlaps from the same enum list.
 - industry_primary should usually be company-level and stable across most roles at that company.
 - Use industry_tags for team-level/product-line overlaps like payments, advertising, AI features, developer tools, or marketplaces inside a broader company.
-- Example: Airbnb payments/ML roles should usually stay travel_hospitality or commerce_marketplaces as primary, with fintech_payments_banking as a tag if relevant.
+- Example: Airbnb payments/ML roles should usually stay travel_hospitality or commerce_marketplaces as primary, with payments_banking as a tag if relevant.
 - Example: Spotify ads roles should usually stay media_entertainment as primary, with advertising_marketing as a tag if relevant.
 - Example: Sitecore roles should usually stay enterprise_software as primary, not ai_ml, unless the company itself is primarily an AI company.
+- Example: Vercel roles should usually stay developer_tools as primary, with cloud_data_infra or ai_ml as tags if relevant.
+- Example: Datadog, MongoDB, Snowflake, Databricks, and similar platform/database/observability companies should usually be cloud_data_infra as primary, not enterprise_software.
+- Example: Cloudflare and Okta-style security/identity/network-edge companies should usually be cybersecurity or cloud_data_infra as primary, not enterprise_software.
 - AI labs, model platforms, AI safety orgs → ai_ml
-- Developer tools, cloud infra, databases, observability → developer_tools_infra
-- Business/productivity/collaboration software → enterprise_software
-- Fintech, payments, banking, expense management → fintech_payments_banking
+- Developer tools, SDKs, APIs, testing tools, CI/CD, code collaboration → developer_tools
+- Cloud infra, databases, observability, data platforms, networking infrastructure → cloud_data_infra
+- Business/productivity/collaboration/CRM/HR/CMS/DXP software for non-engineering workflows → enterprise_software
+- Do NOT use enterprise_software as a catch-all for every B2B software company. Infra/platform/database/observability/networking products should usually be developer_tools, cloud_data_infra, or cybersecurity instead.
+- Payments, banking, lending, expense management, card/treasury platforms → payments_banking
 - Trading, hedge funds, market infrastructure, investing platforms → investing_trading
-- Security and identity companies → cybersecurity_identity
+- Security companies, IAM, auth, access control, identity platforms → cybersecurity
 - Social networks, forums, consumer communities → consumer_social
 - Music/video/news/publishing/streaming → media_entertainment
+- Biotech tools, diagnostics, research platforms, life sciences → biotech_life_sciences
+- Drug makers, therapeutics, pharma companies → pharma
 - Travel and lodging platforms → travel_hospitality
+- Climate tech, decarbonization, carbon, sustainability software/services → climate_sustainability
+- Utilities, grid, power, traditional energy infrastructure/operators → energy_utilities
 - Robotics, autonomy, drones, AV → robotics_autonomy
 - Chips, compute hardware, electronics → semiconductors_hardware
 - Space companies → space_aerospace
 - Defense, public safety, police/fire tech → defense_public_safety
+- Proptech, real estate platforms, brokerage/property software → real_estate_proptech
+- Builders, contractors, construction operations, built environment tech → construction_built_environment
+- Recruiting and staffing firms → staffing_recruiting
+- BPO, outsourcing, managed back-office/contact center services → bpo_outsourcing
 - Do NOT classify by the job function. An accountant at a gaming company is "gaming". A recruiter at a travel company is "travel_hospitality".
 - Do NOT use biotechnology for AI companies unless the company actually sells biotech/pharma products.
 
@@ -367,7 +385,7 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - job_type: "full-time"|"part-time"|"contract"|"internship"|"temporary"|"freelance"
 - experience_level: "entry"|"mid"|"senior"|"staff"|"principal"|"executive"
 - is_manager: boolean
-- industry_primary: one of [ai_ml, developer_tools_infra, enterprise_software, cybersecurity_identity, fintech_payments_banking, investing_trading, insurance, crypto_web3, healthcare_services, biotech_pharma_life_sciences, education_edtech, consumer_social, media_entertainment, gaming, advertising_marketing, commerce_marketplaces, consumer_goods_brands, food_beverage, travel_hospitality, climate_energy_utilities, transportation_logistics, manufacturing_industrials, robotics_autonomy, semiconductors_hardware, space_aerospace, defense_public_safety, government_public_sector, real_estate_construction, telecommunications_networking, agriculture, legal, consulting_professional_services, nonprofit_philanthropy, staffing_recruiting_bpo, other]. This should usually reflect the COMPANY'S core business, not the specific team.
+- industry_primary: one of [ai_ml, developer_tools, cloud_data_infra, enterprise_software, cybersecurity, payments_banking, investing_trading, insurance, crypto_web3, healthcare_services, biotech_life_sciences, pharma, education_edtech, consumer_social, media_entertainment, gaming, advertising_marketing, commerce_marketplaces, consumer_goods_brands, food_beverage, travel_hospitality, climate_sustainability, energy_utilities, transportation_logistics, manufacturing_industrials, robotics_autonomy, semiconductors_hardware, space_aerospace, defense_public_safety, government_public_sector, real_estate_proptech, construction_built_environment, telecommunications_networking, agriculture, legal, consulting_professional_services, nonprofit_philanthropy, staffing_recruiting, bpo_outsourcing, other]. This should usually reflect the COMPANY'S core business, not the specific team.
 - industry_tags (array): zero or more additional applicable values from the SAME industry list. Use [] if no strong secondary industries apply. Prefer not to repeat the primary industry here. Use tags for adjacent business lines, monetization models, or product overlaps.
 - industry_other_hint: short freeform string ONLY when industry_primary is "other" and none of the enum values fit. "" otherwise.
 - hard_skills (array): ALL technical/domain skills mentioned

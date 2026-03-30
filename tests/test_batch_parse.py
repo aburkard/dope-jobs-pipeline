@@ -28,10 +28,15 @@ def test_gemini_build_request_includes_compact_schema_and_current_industry_label
     prompt = request["contents"][0]["parts"][0]["text"]
 
     assert COMPACT_SCHEMA in prompt
-    assert "developer_tools_infra" in prompt
-    assert "fintech_payments_banking" in prompt
-    assert "saas_software" not in prompt
-    assert "financial_services" not in prompt
+    assert "developer_tools" in prompt
+    assert "cloud_data_infra" in prompt
+    assert "payments_banking" in prompt
+    assert "cybersecurity" in prompt
+    assert "climate_sustainability" in prompt
+    assert "real_estate_proptech" in prompt
+    assert "staffing_recruiting" in prompt
+    assert "developer_tools_infra" not in prompt
+    assert "fintech_payments_banking" not in prompt
 
 
 def test_gemini_schema_matches_flat_schema_field_set_and_required_keys():

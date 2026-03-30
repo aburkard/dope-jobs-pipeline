@@ -2,6 +2,66 @@
 
 Date: 2026-03-29
 
+Update: 2026-03-30
+
+This note was later tightened after prompt testing and live job audits. The current intended enum is:
+
+```python
+[
+  "ai_ml",
+  "developer_tools",
+  "cloud_data_infra",
+  "enterprise_software",
+  "cybersecurity",
+  "payments_banking",
+  "investing_trading",
+  "insurance",
+  "crypto_web3",
+  "healthcare_services",
+  "biotech_life_sciences",
+  "pharma",
+  "education_edtech",
+  "consumer_social",
+  "media_entertainment",
+  "gaming",
+  "advertising_marketing",
+  "commerce_marketplaces",
+  "consumer_goods_brands",
+  "food_beverage",
+  "travel_hospitality",
+  "climate_sustainability",
+  "energy_utilities",
+  "transportation_logistics",
+  "manufacturing_industrials",
+  "robotics_autonomy",
+  "semiconductors_hardware",
+  "space_aerospace",
+  "defense_public_safety",
+  "government_public_sector",
+  "real_estate_proptech",
+  "construction_built_environment",
+  "telecommunications_networking",
+  "agriculture",
+  "legal",
+  "consulting_professional_services",
+  "nonprofit_philanthropy",
+  "staffing_recruiting",
+  "bpo_outsourcing",
+  "other",
+]
+```
+
+Key changes from the first draft:
+
+- split `developer_tools_infra` into `developer_tools` and `cloud_data_infra`
+- simplify `cybersecurity_identity` to `cybersecurity`
+- split `fintech_payments_banking` into `payments_banking` while keeping `investing_trading`, `insurance`, and `crypto_web3`
+- keep `media_entertainment`
+- split `biotech_pharma_life_sciences` into `biotech_life_sciences` and `pharma`
+- split `climate_energy_utilities` into `climate_sustainability` and `energy_utilities`
+- split `real_estate_construction` into `real_estate_proptech` and `construction_built_environment`
+- split `staffing_recruiting_bpo` into `staffing_recruiting` and `bpo_outsourcing`
+
 ## Goal
 
 Make industry filtering feel like something a real job seeker would actually use, not a form taxonomy.
@@ -100,20 +160,22 @@ Some of that drift is legitimate. Some of it is a symptom of the taxonomy not ha
 
 ## Proposed Enum List
 
-This is the proposed combined enum list for both `industry_primary` and `industry_tags`.
+This is the current combined enum list for both `industry_primary` and `industry_tags`.
 
 ```python
 [
   "ai_ml",
-  "developer_tools_infra",
+  "developer_tools",
+  "cloud_data_infra",
   "enterprise_software",
-  "cybersecurity_identity",
-  "fintech_payments_banking",
+  "cybersecurity",
+  "payments_banking",
   "investing_trading",
   "insurance",
   "crypto_web3",
   "healthcare_services",
-  "biotech_pharma_life_sciences",
+  "biotech_life_sciences",
+  "pharma",
   "education_edtech",
   "consumer_social",
   "media_entertainment",
@@ -123,7 +185,8 @@ This is the proposed combined enum list for both `industry_primary` and `industr
   "consumer_goods_brands",
   "food_beverage",
   "travel_hospitality",
-  "climate_energy_utilities",
+  "climate_sustainability",
+  "energy_utilities",
   "transportation_logistics",
   "manufacturing_industrials",
   "robotics_autonomy",
@@ -131,13 +194,15 @@ This is the proposed combined enum list for both `industry_primary` and `industr
   "space_aerospace",
   "defense_public_safety",
   "government_public_sector",
-  "real_estate_construction",
+  "real_estate_proptech",
+  "construction_built_environment",
   "telecommunications_networking",
   "agriculture",
   "legal",
   "consulting_professional_services",
   "nonprofit_philanthropy",
-  "staffing_recruiting_bpo",
+  "staffing_recruiting",
+  "bpo_outsourcing",
   "other",
 ]
 ```
@@ -147,15 +212,16 @@ This is the proposed combined enum list for both `industry_primary` and `industr
 ### Core tech/product buckets
 
 - `ai_ml`
-- `developer_tools_infra`
+- `developer_tools`
+- `cloud_data_infra`
 - `enterprise_software`
-- `cybersecurity_identity`
+- `cybersecurity`
 
-These separate "AI", "devtools/cloud/data infra", general business software, and security/identity in a way users actually care about.
+These separate AI, developer tools, cloud/data infrastructure, general business software, and security in a way users actually care about.
 
 ### Financial buckets
 
-- `fintech_payments_banking`
+- `payments_banking`
 - `investing_trading`
 - `insurance`
 - `crypto_web3`
@@ -165,9 +231,10 @@ These separate "AI", "devtools/cloud/data infra", general business software, and
 ### Healthcare and science
 
 - `healthcare_services`
-- `biotech_pharma_life_sciences`
+- `biotech_life_sciences`
+- `pharma`
 
-This separates care delivery/platforms from research/biotech/pharma.
+This separates care delivery/platforms from biotech/life sciences and pharma.
 
 ### Consumer/media buckets
 
@@ -184,14 +251,16 @@ This is more useful than collapsing everything into `entertainment_media` or `re
 
 ### Industrial/physical world buckets
 
-- `climate_energy_utilities`
+- `climate_sustainability`
+- `energy_utilities`
 - `transportation_logistics`
 - `manufacturing_industrials`
 - `robotics_autonomy`
 - `semiconductors_hardware`
 - `space_aerospace`
 - `defense_public_safety`
-- `real_estate_construction`
+- `real_estate_proptech`
+- `construction_built_environment`
 - `telecommunications_networking`
 - `agriculture`
 
@@ -203,7 +272,8 @@ This gives enough precision for robotics, space, logistics, climate, and hard-te
 - `legal`
 - `consulting_professional_services`
 - `nonprofit_philanthropy`
-- `staffing_recruiting_bpo`
+- `staffing_recruiting`
+- `bpo_outsourcing`
 
 These matter for many non-tech roles and for a general jobs site.
 
@@ -212,24 +282,24 @@ These matter for many non-tech roles and for a general jobs site.
 These are illustrative, not hardcoded.
 
 - `Vercel`
-  - primary: `developer_tools_infra`
+  - primary: `developer_tools`
   - tags: `ai_ml`
 
 - `Datadog`
-  - primary: `developer_tools_infra`
+  - primary: `cloud_data_infra`
   - tags: `ai_ml`
 
 - `Cloudflare`
-  - primary: `cybersecurity_identity`
-  - tags: `developer_tools_infra`
+  - primary: `cybersecurity`
+  - tags: `cloud_data_infra`
 
 - `Stripe`
-  - primary: `fintech_payments_banking`
+  - primary: `payments_banking`
   - tags: `enterprise_software`
 
 - `Robinhood`
   - primary: `investing_trading`
-  - tags: `fintech_payments_banking`
+  - tags: `payments_banking`
 
 - `Airbnb`
   - primary: `travel_hospitality`
@@ -244,12 +314,12 @@ These are illustrative, not hardcoded.
   - tags: `consumer_social`
 
 - `Databricks`
-  - primary: `developer_tools_infra`
+  - primary: `cloud_data_infra`
   - tags: `ai_ml`
 
 - `Anthropic`
   - primary: `ai_ml`
-  - tags: `developer_tools_infra`
+  - tags: `developer_tools`, `cloud_data_infra`
 
 - `Anduril`
   - primary: `defense_public_safety`
