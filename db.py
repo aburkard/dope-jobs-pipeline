@@ -830,10 +830,18 @@ def record_parse_batch_error(conn, batch_id: str, job_id: str, expected_hash: st
     return applied
 
 
-def delete_parse_batch_jobs(conn, batch_id: str):
-    """Release all reserved jobs for a batch."""
+def delete_parse_batch_jobs(conn, batch_id: str, job_ids: list[str] | None = None):
+    """Release reserved jobs for a batch, optionally scoped to specific job IDs."""
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s", (batch_id,))
+        if job_ids is None:
+            cur.execute("DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s", (batch_id,))
+        else:
+            if not job_ids:
+                return
+            cur.execute(
+                "DELETE FROM pipeline_parse_batch_jobs WHERE batch_id = %s AND job_id = ANY(%s)",
+                (batch_id, job_ids),
+            )
     conn.commit()
 
 

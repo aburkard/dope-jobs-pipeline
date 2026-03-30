@@ -233,6 +233,24 @@ def extract_batch_output_entry(payload: dict) -> tuple[dict | None, str | None]:
     return None, f"Unrecognized batch output payload keys: {sorted(payload.keys())}"
 
 
+def extract_batch_output_job_id(payload: dict) -> str | None:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        job_id = metadata.get("job_id")
+        if isinstance(job_id, str) and job_id.strip():
+            return job_id.strip()
+
+    output = payload.get("output")
+    if isinstance(output, dict):
+        metadata = output.get("metadata")
+        if isinstance(metadata, dict):
+            job_id = metadata.get("job_id")
+            if isinstance(job_id, str) and job_id.strip():
+                return job_id.strip()
+
+    return None
+
+
 def _batch_counts(batch: dict) -> tuple[int | None, int | None, int | None]:
     stats = batch.get("batchStats") or {}
     requested = stats.get("requestCount")
@@ -331,6 +349,7 @@ def status_batch(conn, batch_name: str, model: str) -> dict:
 def collect_batch(conn, batch_name: str, model: str) -> list[str]:
     backend = GeminiBackend(model=model)
     client = GeminiBatchClient(model=model)
+    geo_resolver = GeoResolver(conn)
     batch = status_batch(conn, batch_name, model)
     state = batch.get("state", "STATE_UNSPECIFIED")
 
@@ -347,18 +366,20 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
 
     lines = [line for line in client.download_file_text(responses_file).splitlines() if line.strip()]
     reserved_jobs = get_parse_batch_job_rows(conn, batch_name)
+    reserved_jobs_by_id = {row["job_id"]: row for row in reserved_jobs}
 
     parsed_ids: list[str] = []
     successes = 0
     failures = 0
     stale = 0
-    mismatch_error = None
+    mismatch_messages: list[str] = []
     chunk_success_rows: list[tuple[str, str, dict]] = []
     chunk_error_rows: list[tuple[str, str, str]] = []
     chunk_size = 200
+    matched_job_ids: set[str] = set()
 
     if len(lines) != len(reserved_jobs):
-        mismatch_error = (
+        mismatch_messages.append(
             f"Batch output line count mismatch: got {len(lines)} lines for {len(reserved_jobs)} reserved jobs"
         )
 
@@ -374,8 +395,20 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
         chunk_success_rows = []
         chunk_error_rows = []
 
-    for job_row, line in zip(reserved_jobs, lines):
+    for index, line in enumerate(lines):
         payload = json.loads(line)
+        output_job_id = extract_batch_output_job_id(payload)
+        if not output_job_id:
+            mismatch_messages.append(f"Output line {index} missing metadata.job_id")
+            continue
+        if output_job_id in matched_job_ids:
+            mismatch_messages.append(f"Duplicate output for job_id {output_job_id}")
+            continue
+        job_row = reserved_jobs_by_id.get(output_job_id)
+        if job_row is None:
+            mismatch_messages.append(f"Unexpected output for unknown job_id {output_job_id}")
+            continue
+        matched_job_ids.add(output_job_id)
         response_payload, response_error = extract_batch_output_entry(payload)
         if response_error:
             chunk_error_rows.append(
@@ -408,9 +441,16 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
 
     flush_chunk()
 
-    if len(lines) != len(reserved_jobs):
-        stale += abs(len(lines) - len(reserved_jobs))
-        delete_parse_batch_jobs(conn, batch_name)
+    missing_job_ids = [job_id for job_id in reserved_jobs_by_id if job_id not in matched_job_ids]
+    if missing_job_ids:
+        stale += len(missing_job_ids)
+        delete_parse_batch_jobs(conn, batch_name, job_ids=missing_job_ids)
+
+    mismatch_error = None
+    if mismatch_messages:
+        preview = "; ".join(mismatch_messages[:5])
+        extra = len(mismatch_messages) - 5
+        mismatch_error = preview if extra <= 0 else f"{preview}; and {extra} more"
 
     update_parse_batch(
         conn,
