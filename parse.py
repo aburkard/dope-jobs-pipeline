@@ -69,6 +69,8 @@ INDUSTRY_VALUES = [
     "staffing_recruiting_bpo",
     "other",
 ]
+INDUSTRY_VALUE_SET = set(INDUSTRY_VALUES)
+INDUSTRY_ORDER = {value: index for index, value in enumerate(INDUSTRY_VALUES)}
 
 Industry = Enum("Industry", {value: value for value in INDUSTRY_VALUES}, type=str)
 
@@ -254,6 +256,32 @@ class JobMetadata(BaseModel):
         None,
         description="ISO 639-1 code for the language the job posting text is written in (e.g. 'en', 'fr', 'de'). This is NOT the candidate's required spoken language.",
     )
+
+
+def _canonicalize_industry_fields(data: dict) -> None:
+    primary_industry = _to_str(data.get("industry_primary"))
+    tags = data.get("industry_tags") or []
+
+    ordered_tags = []
+    seen = set()
+
+    if primary_industry and primary_industry in INDUSTRY_VALUE_SET:
+        ordered_tags.append(primary_industry)
+        seen.add(primary_industry)
+
+    remaining = []
+    for tag in tags:
+        tag_value = _to_str(tag)
+        if not tag_value or tag_value not in INDUSTRY_VALUE_SET or tag_value in seen:
+            continue
+        seen.add(tag_value)
+        remaining.append(tag_value)
+
+    remaining.sort(key=lambda value: INDUSTRY_ORDER[value])
+    data["industry_tags"] = ordered_tags + remaining
+
+    other_hint = _to_str(data.get("industry_other_hint"))
+    data["industry_other_hint"] = other_hint if primary_industry == "other" else None
 
 
 # ---------------------------------------------------------------------------
@@ -635,19 +663,7 @@ def _flat_to_job_metadata(data: dict) -> JobMetadata:
                 deduped.append(tag)
         data["vibe_tags"] = deduped
 
-    primary_industry = _to_str(data.get("industry_primary"))
-    deduped_industry_tags = []
-    seen_industries = set()
-    for tag in data.get("industry_tags", []) or []:
-        tag_value = _to_str(tag)
-        if not tag_value or tag_value == primary_industry or tag_value in seen_industries:
-            continue
-        seen_industries.add(tag_value)
-        deduped_industry_tags.append(tag_value)
-    data["industry_tags"] = deduped_industry_tags
-
-    other_hint = _to_str(data.get("industry_other_hint"))
-    data["industry_other_hint"] = other_hint if primary_industry == "other" else None
+    _canonicalize_industry_fields(data)
 
     # company_stage ("unknown" = not known)
     if data.get("company_stage") == "unknown":
@@ -1103,6 +1119,7 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
             merged.get("locations"),
         )
 
+    _canonicalize_industry_fields(merged)
     return merged
 
 
