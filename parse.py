@@ -279,17 +279,24 @@ COOL FACTOR: Calibrate carefully. ~10% boring, ~40% standard, ~30% interesting, 
 - exceptional: once-in-a-career. EXTREMELY rare, maybe 1 in 200 jobs.
 A temp/contract role is almost never above "interesting".
 
-INDUSTRY: Classify by what the company SELLS to end users, not the function of this specific role:
-- AI labs, ML platforms, AI safety orgs → ai_ml
-- Design/collaboration tools (Figma, Canva) → saas_software
-- Gaming platforms → gaming
-- Language learning apps → education
-- Fintech/expense management → financial_services
-- Security/cybersecurity companies → cybersecurity
-- Lodging/travel platforms (Airbnb, Booking.com) → hospitality_tourism
-- Music/video streaming → entertainment_media
-- Do NOT classify by the job function. An accountant at a gaming company is "gaming". A sourcing manager at a travel company is "hospitality_tourism".
-- Do NOT use biotechnology for AI companies.
+INDUSTRY: Classify by what the company SELLS to end users, not the function of this specific role.
+- Choose ONE primary industry that best describes the company.
+- Use industry_tags for real secondary overlaps from the same enum list.
+- AI labs, model platforms, AI safety orgs → ai_ml
+- Developer tools, cloud infra, databases, observability → developer_tools_infra
+- Business/productivity/collaboration software → enterprise_software
+- Fintech, payments, banking, expense management → fintech_payments_banking
+- Trading, hedge funds, market infrastructure, investing platforms → investing_trading
+- Security and identity companies → cybersecurity_identity
+- Social networks, forums, consumer communities → consumer_social
+- Music/video/news/publishing/streaming → media_entertainment
+- Travel and lodging platforms → travel_hospitality
+- Robotics, autonomy, drones, AV → robotics_autonomy
+- Chips, compute hardware, electronics → semiconductors_hardware
+- Space companies → space_aerospace
+- Defense, public safety, police/fire tech → defense_public_safety
+- Do NOT classify by the job function. An accountant at a gaming company is "gaming". A recruiter at a travel company is "travel_hospitality".
+- Do NOT use biotechnology for AI companies unless the company actually sells biotech/pharma products.
 
 EXPERIENCE LEVEL:
 - entry: intern, new grad, associate, coordinator, 0-2 years
@@ -323,7 +330,7 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - salary_period: "hourly"|"weekly"|"monthly"|"annually". Match the period from the posting.
 - salary_transparency: "full_range"|"minimum_only"|"not_disclosed"
 - office_type: "remote"|"hybrid"|"onsite"
-- hybrid_days: number or null (only if hybrid)
+- hybrid_days: number, 0 if not hybrid or unknown
 - job_type: "full-time"|"part-time"|"contract"|"internship"|"temporary"|"freelance"
 - experience_level: "entry"|"mid"|"senior"|"staff"|"principal"|"executive"
 - is_manager: boolean
@@ -335,21 +342,22 @@ COMPACT_SCHEMA = """Extract these fields as JSON:
 - cool_factor: "boring"|"standard"|"interesting"|"compelling"|"exceptional". Most jobs are standard/interesting.
 - vibe_tags (array): from [mission_driven, high_growth, small_team, cutting_edge_tech, strong_culture, high_autonomy, work_life_balance, well_funded, public_benefit, creative_role, data_intensive, global_team, diverse_inclusive, fast_paced, customer_facing, research_focused]
 - visa_sponsorship: "yes"|"no"|"unknown"
-- visa_sponsorship_types (array or null): if yes, from [h1b, h1b_transfer, o1, l1, j1, green_card, other]
-- equity: {offered: bool, min_pct: number|null, max_pct: number|null}
-- company_stage: "pre-seed"|"seed"|"series-a"|"series-b"|"series-c-plus"|"public"|"bootstrapped"|"government"|"nonprofit" or null
-- company_size: {min, max} or null (employees)
-- team_size: {min, max} or null
-- reports_to: string or null
+- visa_sponsorship_types (array): if yes, from [h1b, h1b_transfer, o1, l1, j1, green_card, other]. [] otherwise.
+- equity_offered: boolean
+- equity_min_pct, equity_max_pct: numbers, 0 if unknown
+- company_stage: "pre-seed"|"seed"|"series-a"|"series-b"|"series-c-plus"|"public"|"bootstrapped"|"government"|"nonprofit"|"unknown"
+- company_size_min, company_size_max: numbers, 0 if unknown (employees)
+- team_size_min, team_size_max: numbers, 0 if unknown
+- reports_to: string, "" if unknown
 - benefits_categories (array): from [health, dental, vision, life_insurance, disability, 401k, pension, equity_comp, bonus, unlimited_pto, generous_pto, parental_leave, remote_stipend, home_office, relocation, learning_budget, tuition_reimbursement, gym_fitness, wellness, meals, commuter, mental_health, childcare, pet_friendly, sabbatical, stock_purchase]
 - benefits_highlights (array, max 3): only UNUSUAL perks, not standard ones
-- remote_timezone_range: {earliest, latest} (e.g. "UTC-8", "UTC+1") or null
-- years_experience: {min, max} or null
-- education_level: "none"|"high-school"|"bachelors"|"masters"|"phd" or null
+- remote_timezone_earliest, remote_timezone_latest: strings like "UTC-8", "UTC+1". "" if unknown.
+- years_experience_min, years_experience_max: numbers, 0 if unknown
+- education_level: "none"|"high-school"|"bachelors"|"masters"|"phd"|"not_specified"
 - certifications (array): required/preferred certifications
 - languages (array): ISO 639-1 codes of required spoken languages
-- travel_percent: 0-100 or null
-- interview_stages: number or null
+- travel_percent: 0-100, 0 if unknown
+- interview_stages: number, 0 if unknown
 - posting_language: ISO 639-1 code of the language the POSTING ITSELF is written in, e.g. "en", "fr", "de". This is not the candidate's required language."""
 
 
@@ -813,7 +821,12 @@ class GeminiBackend:
                 "cool_factor": {"type": "STRING", "enum": ["boring", "standard", "interesting", "compelling", "exceptional"]},
                 "vibe_tags": {"type": "ARRAY", "items": {"type": "STRING", "enum": [e.value for e in VibeTag]}},
                 "visa_sponsorship": {"type": "STRING", "enum": ["yes", "no", "unknown"]},
+                "visa_sponsorship_types": {"type": "ARRAY", "items": {"type": "STRING", "enum": [
+                    "h1b", "h1b_transfer", "o1", "l1", "j1", "green_card", "other",
+                ]}},
                 "equity_offered": {"type": "BOOLEAN"},
+                "equity_min_pct": {"type": "NUMBER"},
+                "equity_max_pct": {"type": "NUMBER"},
                 "company_stage": {"type": "STRING", "enum": [
                     "pre-seed", "seed", "series-a", "series-b", "series-c-plus",
                     "public", "bootstrapped", "government", "nonprofit", "unknown"]},
@@ -822,17 +835,21 @@ class GeminiBackend:
                 "reports_to": {"type": "STRING"},
                 "benefits_categories": {"type": "ARRAY", "items": {"type": "STRING", "enum": [e.value for e in BenefitCategory]}},
                 "benefits_highlights": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "remote_timezone_earliest": {"type": "STRING"},
+                "remote_timezone_latest": {"type": "STRING"},
                 "education_level": {"type": "STRING", "enum": ["none", "high-school", "bachelors", "masters", "phd", "not_specified"]},
                 "years_experience_min": {"type": "INTEGER"}, "years_experience_max": {"type": "INTEGER"},
+                "certifications": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "languages": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "travel_percent": {"type": "INTEGER"},
+                "interview_stages": {"type": "INTEGER"},
                 "posting_language": {"type": "STRING"},
             },
-            "required": ["tagline", "office_type", "job_type", "experience_level", "is_manager",
-                          "industry_primary", "industry_tags", "industry_other_hint", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
-                          "visa_sponsorship", "benefits_categories", "salary_transparency", "posting_language"],
+            "required": list(FLAT_JSON_SCHEMA["required"]),
         }
 
     def build_request(self, job_text: str, max_tokens: int = 2000) -> dict:
-        prompt = f"{SYSTEM_PROMPT}\n\nExtract metadata:\n\n{job_text}"
+        prompt = f"{SYSTEM_PROMPT}\n\n{build_user_prompt(job_text)}"
         return {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {

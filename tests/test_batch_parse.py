@@ -8,7 +8,7 @@ from batch_parse import (
     normalize_batch_resource,
     parse_companies_file,
 )
-from parse import GeminiBackend
+from parse import COMPACT_SCHEMA, FLAT_JSON_SCHEMA, GeminiBackend
 
 
 def test_build_batch_request_entry_includes_job_metadata_and_schema():
@@ -19,6 +19,29 @@ def test_build_batch_request_entry_includes_job_metadata_and_schema():
     config = entry["request"]["generationConfig"]
     assert config["maxOutputTokens"] == 321
     assert config["responseMimeType"] == "application/json"
+
+
+def test_gemini_build_request_includes_compact_schema_and_current_industry_labels():
+    backend = GeminiBackend(api_key="test-key")
+
+    request = backend.build_request("Some job text", max_tokens=321)
+    prompt = request["contents"][0]["parts"][0]["text"]
+
+    assert COMPACT_SCHEMA in prompt
+    assert "developer_tools_infra" in prompt
+    assert "fintech_payments_banking" in prompt
+    assert "saas_software" not in prompt
+    assert "financial_services" not in prompt
+
+
+def test_gemini_schema_matches_flat_schema_field_set_and_required_keys():
+    backend = GeminiBackend(api_key="test-key")
+
+    flat_keys = set(FLAT_JSON_SCHEMA["properties"].keys())
+    gemini_keys = set(backend._schema["properties"].keys())
+
+    assert gemini_keys == flat_keys
+    assert set(backend._schema["required"]) == set(FLAT_JSON_SCHEMA["required"])
 
 
 def test_parse_companies_file_supports_explicit_and_default_ats(tmp_path):
