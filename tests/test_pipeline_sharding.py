@@ -246,6 +246,87 @@ def test_step_scrape_without_cap_fetches_all_jobs(monkeypatch):
     assert result["new_count"] == 3
 
 
+def test_step_scrape_recovers_closed_db_connection_between_companies(monkeypatch):
+    class FakeConn:
+        def __init__(self):
+            self.closed = 0
+            self.rollback_calls = 0
+
+        def rollback(self):
+            if self.closed:
+                raise RuntimeError("connection already closed")
+            self.rollback_calls += 1
+
+        def close(self):
+            self.closed = 1
+
+    class FakeScraper:
+        def __init__(self, token):
+            self.token = token
+
+        def fetch_jobs(self):
+            yield {
+                "id": f"greenhouse__{self.token}__1",
+                "ats_name": "greenhouse",
+                "board_token": self.token,
+                "title": f"Job for {self.token}",
+            }
+
+        def get_company_name(self):
+            return self.token
+
+        def get_company_domain(self):
+            return f"{self.token}.example.com"
+
+        def get_company_logo_url(self):
+            return None
+
+    reconnected = []
+    company_updates = []
+    good_conn_seen = []
+
+    def fake_get_connection():
+        conn = FakeConn()
+        reconnected.append(conn)
+        return conn
+
+    monkeypatch.setitem(pipeline.ATS_SCRAPERS, "greenhouse", FakeScraper)
+    monkeypatch.setattr(pipeline, "get_connection", fake_get_connection)
+    monkeypatch.setattr(pipeline, "init_schema", lambda conn: None)
+
+    def fake_get_existing_jobs_for_board(conn, ats, token):
+        if token == "broken":
+            conn.closed = 1
+            raise RuntimeError("SSL connection has been closed unexpectedly")
+        good_conn_seen.append(conn)
+        return {}
+
+    monkeypatch.setattr(pipeline, "get_existing_jobs_for_board", fake_get_existing_jobs_for_board)
+    monkeypatch.setattr(pipeline, "upsert_scraped_jobs", lambda conn, jobs: {
+        "new": jobs,
+        "changed": [],
+        "unchanged": 0,
+        "needs_detail_fetch": [],
+    })
+    monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
+    monkeypatch.setattr(pipeline, "upsert_company", lambda conn, ats, token, **kwargs: company_updates.append((token, conn)))
+    monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
+
+    initial_conn = FakeConn()
+    result = pipeline.step_scrape(
+        initial_conn,
+        [("greenhouse", "broken"), ("greenhouse", "healthy")],
+        max_per_company=5,
+    )
+
+    assert result["errors"] == 1
+    assert result["new_count"] == 1
+    assert len(reconnected) == 1
+    assert good_conn_seen == [reconnected[0]]
+    assert company_updates == [("healthy", reconnected[0])]
+    assert result["conn"] is reconnected[0]
+
+
 def test_build_meili_location_uses_remote_applicant_geography():
     parsed = {
         "office_type": "remote",

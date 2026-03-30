@@ -47,6 +47,38 @@ ATS_SCRAPERS = {
 }
 
 
+def _connection_is_closed(conn) -> bool:
+    closed = getattr(conn, "closed", 0)
+    try:
+        return bool(closed)
+    except Exception:
+        return False
+
+
+def _reconnect_pipeline_connection(conn):
+    try:
+        if hasattr(conn, "close") and not _connection_is_closed(conn):
+            conn.close()
+    except Exception:
+        pass
+
+    new_conn = get_connection()
+    init_schema(new_conn)
+    return new_conn
+
+
+def _recover_pipeline_connection(conn):
+    if _connection_is_closed(conn):
+        return _reconnect_pipeline_connection(conn)
+
+    try:
+        if hasattr(conn, "rollback"):
+            conn.rollback()
+        return conn
+    except Exception:
+        return _reconnect_pipeline_connection(conn)
+
+
 def parse_companies_file(path: str) -> list[tuple[str, str]]:
     """Parse companies.txt → list of (ats, board_token)."""
     companies = []
@@ -118,6 +150,9 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
 
     total_companies = len(companies)
     for idx, (ats, token) in enumerate(companies, start=1):
+        if _connection_is_closed(conn):
+            conn = _reconnect_pipeline_connection(conn)
+
         scraper_cls = ATS_SCRAPERS.get(ats)
         if not scraper_cls:
             print(f"  [{idx}/{total_companies}] {ats}:{token} — unknown ATS, skipping")
@@ -242,6 +277,10 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
         except Exception as e:
             errors += 1
             print(f"  [{idx}/{total_companies}] {ats}:{token} — ERROR: {e}")
+            try:
+                conn = _recover_pipeline_connection(conn)
+            except Exception as reconnect_error:
+                print(f"    failed to recover DB connection: {reconnect_error}")
             # Don't update company record on error — avoid marking as inactive
             continue
 
@@ -256,6 +295,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
         "changed_count": total_changed,
         "removed_count": total_removed,
         "errors": errors,
+        "conn": conn,
     }
 
 
@@ -853,8 +893,12 @@ def main():
             max_per_company=args.max_per_company,
             jobvite_refetch_existing_detail=args.jobvite_refetch_existing_detail,
         )
+        conn = scrape_result.get("conn", conn)
     else:
         print("Skipping scrape")
+
+    if _connection_is_closed(conn):
+        conn = _reconnect_pipeline_connection(conn)
 
     # Step 2: Parse new/changed jobs
     if not args.skip_parse:
