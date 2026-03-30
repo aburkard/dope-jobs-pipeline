@@ -1,7 +1,10 @@
 import html2text
 import json
+import re
+import time
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+from requests import RequestException
 
 from .base_scraper import BaseScraper
 import utils
@@ -10,6 +13,9 @@ import utils
 # TODO: This whole class
 class JobviteScraper(BaseScraper):
     ats_name = 'jobvite'
+    request_timeout_seconds = 5
+    request_attempts = 4
+    request_backoff_seconds = 1.0
 
     def __init__(self, board_token):
         super().__init__(board_token)
@@ -24,17 +30,29 @@ class JobviteScraper(BaseScraper):
         self.html2text = h
 
     def check_exists(self):
-        return self.session.head(
-            f'{self.base_url}/{self.board_token}').status_code == 200
+        return self._request('head', f'{self.base_url}/{self.board_token}').status_code == 200
 
     def _board_search_url(self):
         return f'{self.base_url}/{self.board_token}/search'
 
     def _get_board_soup(self):
         if not hasattr(self, '_cached_board_soup'):
-            response = self.session.get(self._board_search_url(), timeout=5)
+            response = self._request('get', self._board_search_url())
             self._cached_board_soup = BeautifulSoup(response.text, 'html.parser')
         return self._cached_board_soup
+
+    def _request(self, method, url, **kwargs):
+        timeout = kwargs.pop('timeout', self.request_timeout_seconds)
+        last_error = None
+        for attempt in range(1, self.request_attempts + 1):
+            try:
+                return getattr(self.session, method)(url, timeout=timeout, **kwargs)
+            except RequestException as exc:
+                last_error = exc
+                if attempt == self.request_attempts:
+                    raise
+                time.sleep(self.request_backoff_seconds * attempt)
+        raise last_error
 
     def _absolute_url(self, value):
         if not value:
@@ -103,10 +121,14 @@ class JobviteScraper(BaseScraper):
             and existing_detail.get("datePosted")
         )
 
+    @staticmethod
+    def _existing_detail_inactive(existing_detail):
+        return bool(existing_detail and existing_detail.get("inactive"))
+
     def _fetch_jobs(self, page=0, content=True, existing_details=None,
                     refetch_existing_detail=False):
         url = self._board_search_url()
-        response = self.session.get(url, params={'p': page}, timeout=5)
+        response = self._request('get', url, params={'p': page})
         soup = BeautifulSoup(response.text, 'html.parser')
         # Job listings have the css class table.jv-job-list tr, ul.jv-job-list li
         job_listings = soup.select(
@@ -141,14 +163,19 @@ class JobviteScraper(BaseScraper):
                 existing_detail = None
                 if existing_details:
                     existing_detail = existing_details.get(job['id'])
+                if self._existing_detail_inactive(existing_detail):
+                    continue
                 can_reuse_existing = self._existing_detail_complete(existing_detail)
                 if can_reuse_existing:
                     job['description'] = existing_detail["description"]
                     job['descriptionHtml'] = existing_detail["descriptionHtml"]
                     job['datePosted'] = existing_detail.get("datePosted")
                     job['validThrough'] = existing_detail.get("validThrough")
+                    job['inactive'] = bool(existing_detail.get("inactive"))
                 else:
                     job_data = self.fetch_job(job['id'])
+                    if job_data.get("inactive"):
+                        continue
                     job = {**job, **job_data}
 
             yield job
@@ -174,7 +201,7 @@ class JobviteScraper(BaseScraper):
 
     def fetch_job(self, job_id):
         url = f"{self.base_url}/{self.board_token}/job/{job_id}"
-        response = self.session.get(url, timeout=5)
+        response = self._request('get', url)
         soup = BeautifulSoup(response.text, 'html.parser')
         job = {}
         job['id'] = job_id
@@ -190,6 +217,7 @@ class JobviteScraper(BaseScraper):
             job["datePosted"] = metadata["datePosted"]
         if metadata.get("validThrough"):
             job["validThrough"] = metadata["validThrough"]
+        job["inactive"] = self.is_inactive_job(soup, metadata)
         return job
 
     def normalize_job(self, job):
@@ -207,7 +235,28 @@ class JobviteScraper(BaseScraper):
             "updated_at": None,
             "datePosted": job.get("datePosted"),
             "validThrough": job.get("validThrough"),
+            "inactive": bool(job.get("inactive")),
         }
+
+    def is_inactive_job(self, soup, metadata):
+        industry = metadata.get("industry")
+        if isinstance(industry, str) and industry.strip().lower() == "inactive":
+            return True
+
+        meta_block = soup.select_one("p.jv-job-detail-meta")
+        if meta_block:
+            meta_text = " ".join(meta_block.stripped_strings).strip().lower()
+            if meta_text.startswith("inactive") or " inactive " in f" {meta_text} ":
+                return True
+
+        for script in soup.select("script"):
+            text = script.string or script.get_text() or ""
+            if not text:
+                continue
+            if re.search(r"jobCategoryName\s*:\s*['\"]Inactive['\"]", text):
+                return True
+
+        return False
 
     def clean_description(self, job):
         # TODO: Do I need to do more here?
@@ -231,6 +280,8 @@ class JobviteScraper(BaseScraper):
                     metadata["datePosted"] = item["datePosted"]
                 if item.get("validThrough"):
                     metadata["validThrough"] = item["validThrough"]
+                if item.get("industry"):
+                    metadata["industry"] = item["industry"]
                 description_html = item.get("description")
                 if isinstance(description_html, str) and description_html.strip():
                     metadata["descriptionHtml"] = description_html.strip()

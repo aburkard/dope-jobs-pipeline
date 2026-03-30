@@ -119,6 +119,7 @@ def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
                     "descriptionHtml": "<p>Stored description</p>",
                     "datePosted": "2026-01-30",
                     "validThrough": None,
+                    "inactive": False,
                 }
             }
             yield {

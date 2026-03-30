@@ -173,9 +173,10 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                         "descriptionHtml": raw.get("descriptionHtml", ""),
                         "datePosted": raw.get("datePosted"),
                         "validThrough": raw.get("validThrough"),
+                        "inactive": raw.get("inactive", False),
                     }
                     for short_id, raw in existing_jobs_by_short_id.items()
-                    if raw.get("description") or raw.get("descriptionHtml") or raw.get("datePosted")
+                    if raw.get("description") or raw.get("descriptionHtml") or raw.get("datePosted") or raw.get("inactive")
                 }
                 job_iter = scraper.fetch_jobs(
                     existing_details=existing_details,
