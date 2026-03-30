@@ -96,10 +96,11 @@ def test_jobvite_refetches_existing_detail_when_metadata_incomplete(monkeypatch)
     scraper = JobviteScraper("sitecore")
 
     def fake_get(url, *args, **kwargs):
-        return DummyResponse(board_html)
+        page = (kwargs.get("params") or {}).get("p", 0)
+        return DummyResponse(board_html if page == 0 else "<html><body></body></html>")
 
     monkeypatch.setattr(scraper.session, "get", fake_get)
-    monkeypatch.setattr(scraper, "fetch_job", lambda job_id: {
+    monkeypatch.setattr(scraper, "_fetch_job_with_fresh_scraper", lambda job_id: {
         "description": "Fresh description",
         "descriptionHtml": "<p>Fresh description</p>",
         "datePosted": "2026-01-30",
@@ -247,6 +248,7 @@ def test_jobvite_fetch_job_marks_inactive_from_page_metadata(monkeypatch):
 def test_jobvite_request_retries_then_succeeds(monkeypatch):
     scraper = JobviteScraper("test")
     calls = {"count": 0}
+    resets = {"count": 0}
 
     class Response:
         text = "<html></html>"
@@ -259,9 +261,63 @@ def test_jobvite_request_retries_then_succeeds(monkeypatch):
         return Response()
 
     monkeypatch.setattr(scraper.session, "get", flaky_get)
+    monkeypatch.setattr(scraper, "reset_session", lambda: resets.__setitem__("count", resets["count"] + 1))
     monkeypatch.setattr("scrapers.jobvite_scraper.time.sleep", lambda *_: None)
 
     response = scraper._request("get", "https://jobs.jobvite.com/test/search")
 
     assert isinstance(response, Response)
     assert calls["count"] == 3
+    assert resets["count"] == 2
+
+
+def test_jobvite_fetch_jobs_parallel_detail_preserves_order_and_skips_inactive(monkeypatch):
+    board_html = """
+    <html>
+      <body>
+        <ul class="jv-job-list">
+          <li>
+            <span class="jv-job-list-name"><a href="/sitecore/job/job1">Job One</a></span>
+            <span class="jv-job-list-location">Remote</span>
+          </li>
+          <li>
+            <span class="jv-job-list-name"><a href="/sitecore/job/job2">Job Two</a></span>
+            <span class="jv-job-list-location">Austin</span>
+          </li>
+        </ul>
+      </body>
+    </html>
+    """
+
+    class DummyResponse:
+        def __init__(self, text):
+            self.text = text
+
+    scraper = JobviteScraper("sitecore")
+    def fake_get(url, *args, **kwargs):
+        page = (kwargs.get("params") or {}).get("p", 0)
+        return DummyResponse(board_html if page == 0 else "<html><body></body></html>")
+
+    monkeypatch.setattr(scraper.session, "get", fake_get)
+    monkeypatch.setattr(scraper, "_fetch_job_with_fresh_scraper", lambda job_id: {
+        "job1": {
+            "description": "Fresh one",
+            "descriptionHtml": "<p>Fresh one</p>",
+            "datePosted": "2026-01-30",
+            "validThrough": None,
+            "inactive": False,
+        },
+        "job2": {
+            "description": "Fresh two",
+            "descriptionHtml": "<p>Fresh two</p>",
+            "datePosted": "2026-01-31",
+            "validThrough": None,
+            "inactive": True,
+        },
+    }[job_id])
+
+    jobs = list(scraper.fetch_jobs(normalize=False))
+
+    assert [job["id"] for job in jobs] == ["job1"]
+    assert jobs[0]["title"] == "Job One"
+    assert jobs[0]["description"] == "Fresh one"

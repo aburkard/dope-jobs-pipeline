@@ -2,6 +2,7 @@ import html2text
 import json
 import re
 import time
+import concurrent.futures
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from requests import RequestException
@@ -16,6 +17,7 @@ class JobviteScraper(BaseScraper):
     request_timeout_seconds = 5
     request_attempts = 4
     request_backoff_seconds = 1.0
+    detail_fetch_workers = 8
 
     def __init__(self, board_token):
         super().__init__(board_token)
@@ -51,6 +53,7 @@ class JobviteScraper(BaseScraper):
                 last_error = exc
                 if attempt == self.request_attempts:
                     raise
+                self.reset_session()
                 time.sleep(self.request_backoff_seconds * attempt)
         raise last_error
 
@@ -134,6 +137,7 @@ class JobviteScraper(BaseScraper):
         job_listings = soup.select(
             'table.jv-job-list tr, ul.jv-job-list li, div.jv-job-list li')
         company_name = self.get_company_name()
+        parsed_jobs = []
         for job_listing in job_listings:
             title_node = job_listing.select_one(
                 'td.jv-job-list-name, span.jv-job-list-name, div.jv-job-list-name'
@@ -159,26 +163,61 @@ class JobviteScraper(BaseScraper):
             job['id'] = href.split('/')[-1]
             job['company_name'] = company_name
 
-            if content:
-                existing_detail = None
-                if existing_details:
-                    existing_detail = existing_details.get(job['id'])
-                if self._existing_detail_inactive(existing_detail):
-                    continue
-                can_reuse_existing = self._existing_detail_complete(existing_detail)
-                if can_reuse_existing:
-                    job['description'] = existing_detail["description"]
-                    job['descriptionHtml'] = existing_detail["descriptionHtml"]
-                    job['datePosted'] = existing_detail.get("datePosted")
-                    job['validThrough'] = existing_detail.get("validThrough")
-                    job['inactive'] = bool(existing_detail.get("inactive"))
-                else:
-                    job_data = self.fetch_job(job['id'])
-                    if job_data.get("inactive"):
-                        continue
-                    job = {**job, **job_data}
+            parsed_jobs.append(job)
 
-            yield job
+        if not content:
+            for job in parsed_jobs:
+                yield job
+            return
+
+        hydrated_jobs = []
+        jobs_needing_detail = []
+        for job in parsed_jobs:
+            existing_detail = existing_details.get(job['id']) if existing_details else None
+            if self._existing_detail_inactive(existing_detail):
+                continue
+
+            if self._existing_detail_complete(existing_detail):
+                hydrated_jobs.append({
+                    **job,
+                    "description": existing_detail["description"],
+                    "descriptionHtml": existing_detail["descriptionHtml"],
+                    "datePosted": existing_detail.get("datePosted"),
+                    "validThrough": existing_detail.get("validThrough"),
+                    "inactive": bool(existing_detail.get("inactive")),
+                })
+                continue
+
+            hydrated_jobs.append(job)
+            jobs_needing_detail.append((len(hydrated_jobs) - 1, job['id']))
+
+        if jobs_needing_detail:
+            if len(jobs_needing_detail) == 1:
+                index, short_id = jobs_needing_detail[0]
+                job_data = self._fetch_job_with_fresh_scraper(short_id)
+                hydrated_jobs[index] = None if job_data.get("inactive") else {**hydrated_jobs[index], **job_data}
+            else:
+                max_workers = min(self.detail_fetch_workers, len(jobs_needing_detail))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {
+                        executor.submit(self._fetch_job_with_fresh_scraper, short_id): (index, short_id)
+                        for index, short_id in jobs_needing_detail
+                    }
+                    for future in concurrent.futures.as_completed(future_map):
+                        index, _short_id = future_map[future]
+                        job_data = future.result()
+                        hydrated_jobs[index] = None if job_data.get("inactive") else {**hydrated_jobs[index], **job_data}
+
+        for job in hydrated_jobs:
+            if job is not None:
+                yield job
+
+    def _fetch_job_with_fresh_scraper(self, job_id):
+        detail_scraper = self.__class__(self.board_token)
+        try:
+            return detail_scraper.fetch_job(job_id)
+        finally:
+            detail_scraper.close_session()
 
     def fetch_jobs(self, normalize=True, content=True, existing_details=None,
                    refetch_existing_detail=False):

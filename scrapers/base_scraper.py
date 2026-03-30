@@ -16,18 +16,39 @@ class BaseScraper:
 
     def __init__(self, board_token):
         self.board_token = board_token
+        self.session = self._build_session()
 
-        headers = {
+    def _default_headers(self):
+        return {
             'Accept': 'application/json',
             'Content-Type': 'application/json',
             'User-Agent': StealthUserAgent
         }
-        self.session = requests.Session()
-        self.session.headers.update(headers)
+
+    def _build_session(self):
+        session = requests.Session()
+        session.headers.update(self._default_headers())
         retries = Retry(total=3,
                         backoff_factor=0.5,
                         status_forcelist=[502, 503, 504])
-        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
+
+    def reset_session(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._build_session()
+        return self.session
+
+    def close_session(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     # Returns True if a job board exists for the given board_token
     def check_exists(self):
