@@ -30,6 +30,49 @@ def content_similarity(text_a: str, text_b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _cluster_candidate_jobs(candidate_ids: list[str], hashes: dict[str, str], texts: dict[str, str]) -> list[list[str]]:
+    """Build connected components for duplicate candidates.
+
+    Two jobs are connected when they share a non-empty content hash or when
+    their prepared texts meet the similarity threshold. Using graph components
+    avoids representative-order bugs where A matches B and A matches C, but
+    B/C fall just below the threshold.
+    """
+    if len(candidate_ids) < 2:
+        return []
+
+    adjacency: dict[str, set[str]] = {jid: set() for jid in candidate_ids}
+
+    for idx, jid in enumerate(candidate_ids):
+        for other_jid in candidate_ids[idx + 1:]:
+            same_hash = hashes.get(jid) and hashes.get(jid) == hashes.get(other_jid)
+            similar = False
+            if not same_hash and jid in texts and other_jid in texts:
+                similar = content_similarity(texts[jid], texts[other_jid]) >= SIMILARITY_THRESHOLD
+            if same_hash or similar:
+                adjacency[jid].add(other_jid)
+                adjacency[other_jid].add(jid)
+
+    clusters: list[list[str]] = []
+    visited: set[str] = set()
+    for jid in candidate_ids:
+        if jid in visited or not adjacency[jid]:
+            continue
+        stack = [jid]
+        component: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(sorted(adjacency[current] - visited))
+        if len(component) > 1:
+            clusters.append(sorted(component))
+
+    return clusters
+
+
 def compute_job_groups(conn) -> dict:
     """Compute job_group assignments for all parsed jobs.
 
@@ -70,42 +113,11 @@ def compute_job_groups(conn) -> dict:
         if len(texts) < 2:
             continue
 
-        # First pass: group by identical content hash (guaranteed same content)
-        by_hash = defaultdict(list)
-        for jid, h in hashes.items():
-            if h:
-                by_hash[h].append(jid)
-
-        # Second pass: merge hash groups that are similar (>threshold)
-        # This catches cases where content differs slightly (localized salary/legal)
-        hash_groups = list(by_hash.values())
-        merged_clusters = []
-
-        while hash_groups:
-            current = hash_groups.pop(0)
-            # Only need similarity check if texts are available
-            ref_jid = current[0]
-            if ref_jid not in texts:
-                if len(current) > 1:
-                    merged_clusters.append(current)
-                continue
-            ref_text = texts[ref_jid]
-            i = 0
-            while i < len(hash_groups):
-                other_jid = hash_groups[i][0]
-                # Same hash = same content, auto-merge
-                if hashes.get(other_jid) == hashes.get(ref_jid) and hashes.get(ref_jid):
-                    current.extend(hash_groups.pop(i))
-                elif other_jid in texts:
-                    sim = content_similarity(ref_text, texts[other_jid])
-                    if sim >= SIMILARITY_THRESHOLD:
-                        current.extend(hash_groups.pop(i))
-                    else:
-                        i += 1
-                else:
-                    i += 1
-            if len(current) > 1:
-                merged_clusters.append(current)
+        merged_clusters = _cluster_candidate_jobs(
+            [job_id for job_id, _, _ in candidates],
+            hashes,
+            texts,
+        )
 
         # Assign group hashes
         for ci, cluster in enumerate(merged_clusters):

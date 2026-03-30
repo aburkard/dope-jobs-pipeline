@@ -570,6 +570,17 @@ class TestLocationOverlay:
         result = merge_api_data(raw, llm)
         assert result["applicant_location_requirements"] == llm["applicant_location_requirements"]
 
+    def test_remote_requirements_from_city_country_remote_label(self):
+        raw = {
+            "workplaceType": "remote",
+            "location": "Bogota, Colombia (remote)",
+        }
+        llm = {"office_type": "remote", "applicant_location_requirements": []}
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == [
+            {"scope": "country", "name": "Colombia", "country_code": "CO", "region": None}
+        ]
+
 
 class TestNoMutation:
     def test_original_dict_not_mutated(self):

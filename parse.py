@@ -1194,6 +1194,10 @@ _COUNTRY_CODE_ALIASES = {
     "GERMANY": "DE",
     "NETHERLANDS": "NL",
     "SPAIN": "ES",
+    "ARGENTINA": "AR",
+    "COLOMBIA": "CO",
+    "PANAMA": "PA",
+    "PERU": "PE",
 }
 
 
@@ -1585,6 +1589,29 @@ def _derive_remote_requirements_from_text(text: str) -> list[dict]:
         country_code = _country_code_from_value(part)
         if country_code:
             reqs.append(_make_applicant_requirement("country", part, country_code=country_code))
+            continue
+
+        parsed_location = _parse_generic_location_label(part)
+        if not parsed_location:
+            continue
+
+        parsed_country_code = _country_code_from_value(parsed_location.get("country_code"))
+        if not parsed_country_code:
+            continue
+
+        country_name = None
+        if "," in part:
+            tail = part.rsplit(",", 1)[-1].strip()
+            if _country_code_from_value(tail):
+                country_name = tail
+
+        reqs.append(
+            _make_applicant_requirement(
+                "country",
+                country_name or parsed_country_code,
+                country_code=parsed_country_code,
+            )
+        )
 
     return _dedupe_requirements(reqs)
 
