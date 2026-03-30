@@ -458,6 +458,7 @@ FLAT_JSON_SCHEMA: dict = {
         "location_lat", "location_lng", "salary_min", "salary_max",
         "salary_currency", "salary_period", "salary_transparency",
         "office_type", "hybrid_days", "job_type", "experience_level", "is_manager",
+        "applicant_location_requirements",
         "industry_primary", "industry_tags", "industry_other_hint", "hard_skills", "soft_skills", "cool_factor", "vibe_tags",
         "visa_sponsorship", "visa_sponsorship_types", "equity_offered",
         "equity_min_pct", "equity_max_pct", "company_stage",

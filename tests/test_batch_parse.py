@@ -42,6 +42,7 @@ def test_gemini_schema_matches_flat_schema_field_set_and_required_keys():
 
     assert gemini_keys == flat_keys
     assert set(backend._schema["required"]) == set(FLAT_JSON_SCHEMA["required"])
+    assert set(FLAT_JSON_SCHEMA["required"]) == flat_keys
 
 
 def test_parse_companies_file_supports_explicit_and_default_ats(tmp_path):
