@@ -16,7 +16,7 @@ on:
         required: true
         default: "8"
       jobvite_refetch_existing_detail:
-        description: "Force Jobvite detail HTML/date refetch for existing jobs"
+        description: "For Jobvite, backfill missing stored detail HTML/date metadata on existing jobs"
         type: boolean
         required: false
         default: "false"

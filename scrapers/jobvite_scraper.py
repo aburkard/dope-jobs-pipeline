@@ -94,6 +94,15 @@ class JobviteScraper(BaseScraper):
     def fetch_job_board(self):
         raise NotImplementedError
 
+    @staticmethod
+    def _existing_detail_complete(existing_detail):
+        return bool(
+            existing_detail
+            and existing_detail.get("description")
+            and existing_detail.get("descriptionHtml")
+            and existing_detail.get("datePosted")
+        )
+
     def _fetch_jobs(self, page=0, content=True, existing_details=None,
                     refetch_existing_detail=False):
         url = self._board_search_url()
@@ -132,13 +141,7 @@ class JobviteScraper(BaseScraper):
                 existing_detail = None
                 if existing_details:
                     existing_detail = existing_details.get(job['id'])
-                can_reuse_existing = (
-                    existing_detail
-                    and not refetch_existing_detail
-                    and existing_detail.get("description")
-                    and existing_detail.get("descriptionHtml")
-                    and existing_detail.get("datePosted")
-                )
+                can_reuse_existing = self._existing_detail_complete(existing_detail)
                 if can_reuse_existing:
                     job['description'] = existing_detail["description"]
                     job['descriptionHtml'] = existing_detail["descriptionHtml"]

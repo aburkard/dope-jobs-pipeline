@@ -120,3 +120,51 @@ def test_jobvite_refetches_existing_detail_when_metadata_incomplete(monkeypatch)
     assert jobs[0]["description"] == "Fresh description"
     assert jobs[0]["descriptionHtml"] == "<p>Fresh description</p>"
     assert jobs[0]["datePosted"] == "2026-01-30"
+
+
+def test_jobvite_refetch_flag_still_reuses_complete_existing_detail(monkeypatch):
+    board_html = """
+    <html>
+      <body>
+        <ul class="jv-job-list">
+          <li>
+            <span class="jv-job-list-name"><a href="/sitecore/job/oz3wzfwr">Senior Software Engineer</a></span>
+            <span class="jv-job-list-location">Remote</span>
+          </li>
+        </ul>
+      </body>
+    </html>
+    """
+
+    class DummyResponse:
+        def __init__(self, text):
+            self.text = text
+
+    scraper = JobviteScraper("sitecore")
+
+    def fake_get(url, *args, **kwargs):
+        return DummyResponse(board_html)
+
+    monkeypatch.setattr(scraper.session, "get", fake_get)
+    monkeypatch.setattr(
+        scraper,
+        "fetch_job",
+        lambda job_id: (_ for _ in ()).throw(AssertionError("fetch_job should not be called")),
+    )
+
+    jobs = list(scraper.fetch_jobs(
+        normalize=False,
+        existing_details={
+            "oz3wzfwr": {
+                "description": "Stored description",
+                "descriptionHtml": "<p>Stored description</p>",
+                "datePosted": "2026-01-30",
+                "validThrough": None,
+            }
+        },
+        refetch_existing_detail=True,
+    ))
+
+    assert jobs[0]["description"] == "Stored description"
+    assert jobs[0]["descriptionHtml"] == "<p>Stored description</p>"
+    assert jobs[0]["datePosted"] == "2026-01-30"

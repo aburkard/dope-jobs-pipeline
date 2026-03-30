@@ -843,7 +843,7 @@ def main():
     parser.add_argument("--shard-index", type=int, default=None, help="0-based shard index for company selection")
     parser.add_argument("--total-shards", type=int, default=None, help="Total number of shards for company selection")
     parser.add_argument("--jobvite-refetch-existing-detail", action="store_true",
-                        help="Force Jobvite detail HTML refetch for existing jobs")
+                        help="For Jobvite, backfill missing stored detail HTML/date metadata on existing jobs")
     args = parser.parse_args()
 
     if (args.shard_index is None) != (args.total_shards is None):
