@@ -143,6 +143,34 @@ class TestWorkplaceType:
         result = merge_api_data(raw, llm)
         assert result["office_type"] == "hybrid"
 
+    def test_onsite_workplace_keeps_llm_hybrid_when_model_has_strong_signal(self):
+        raw = {"workplaceType": "OnSite"}
+        llm = {"office_type": "hybrid", "hybrid_days": 3}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "hybrid"
+        assert result["hybrid_days"] == 3
+
+    def test_onsite_workplace_overrides_llm_hybrid_without_strong_signal(self):
+        raw = {"workplaceType": "OnSite"}
+        llm = {"office_type": "hybrid", "hybrid_days": None}
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "onsite"
+        assert result["hybrid_days"] is None
+
+    def test_onsite_workplace_keeps_llm_remote_when_model_has_strong_signal(self):
+        raw = {"workplaceType": "OnSite"}
+        llm = {
+            "office_type": "remote",
+            "hybrid_days": None,
+            "applicant_location_requirements": [
+                {"scope": "country", "name": "United States", "country_code": "US", "region": None}
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["office_type"] == "remote"
+        assert result["hybrid_days"] is None
+        assert result["applicant_location_requirements"] == llm["applicant_location_requirements"]
+
     def test_remote_locations_backfill_applicant_geography_from_existing_locations(self):
         raw = {}
         llm = {
@@ -517,13 +545,11 @@ class TestLocationOverlay:
             {"scope": "country", "name": "Canada", "country_code": "CA", "region": None}
         ]
 
-    def test_non_remote_clears_llm_applicant_requirements(self):
+    def test_onsite_workplace_clears_weak_llm_remote_requirements(self):
         raw = {"workplaceType": "OnSite"}
         llm = {
             "office_type": "remote",
-            "applicant_location_requirements": [
-                {"scope": "city", "name": "Paris", "country_code": "FR", "region": None}
-            ],
+            "applicant_location_requirements": [],
         }
         result = merge_api_data(raw, llm)
         assert result["office_type"] == "onsite"
@@ -560,6 +586,51 @@ class TestLocationOverlay:
         raw = {
             "workplaceType": "remote",
             "location": "Ankeny, IA",
+        }
+        llm = {
+            "office_type": "remote",
+            "applicant_location_requirements": [
+                {"scope": "country", "name": "United States", "country_code": "US", "region": None}
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == llm["applicant_location_requirements"]
+
+    def test_remote_requirements_keep_more_specific_llm_states_over_ats_country(self):
+        raw = {
+            "workplaceType": "Remote",
+            "location": "United States",
+        }
+        llm = {
+            "office_type": "remote",
+            "applicant_location_requirements": [
+                {"scope": "state", "name": "Florida", "country_code": "US", "region": "FL"},
+                {"scope": "state", "name": "Texas", "country_code": "US", "region": "TX"},
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == llm["applicant_location_requirements"]
+
+    def test_remote_requirements_prefer_ats_structured_country_over_llm_country(self):
+        raw = {
+            "workplaceType": "Remote",
+            "locationCountry": "Canada",
+        }
+        llm = {
+            "office_type": "remote",
+            "applicant_location_requirements": [
+                {"scope": "country", "name": "United States", "country_code": "US", "region": None}
+            ],
+        }
+        result = merge_api_data(raw, llm)
+        assert result["applicant_location_requirements"] == [
+            {"scope": "country", "name": "Canada", "country_code": "CA", "region": None}
+        ]
+
+    def test_remote_requirements_keep_llm_when_text_derived_ats_is_same_specificity(self):
+        raw = {
+            "workplaceType": "Remote",
+            "location": "Canada",
         }
         llm = {
             "office_type": "remote",

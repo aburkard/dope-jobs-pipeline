@@ -1075,25 +1075,16 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    # --- Office type: Ashby workplaceType, Lever workplaceType ---
-    workplace = raw_job.get("workplaceType", "")
-    if workplace:
-        wp_lower = workplace.lower()
-        if wp_lower in ("remote",):
-            merged["office_type"] = "remote"
-        elif wp_lower in ("hybrid",):
-            merged["office_type"] = "hybrid"
-        elif wp_lower in ("onsite", "on-site", "in-office"):
-            merged["office_type"] = "onsite"
-    elif raw_job.get("isRemote") is True:
-        merged["office_type"] = "remote"
-    else:
-        li_tag = _extract_linkedin_workplace_tag(raw_job)
-        if li_tag:
-            merged["office_type"] = li_tag
+    # --- Office type: structured ATS data is strong for remote/hybrid, softer for onsite ---
+    merged["office_type"] = _choose_office_type(raw_job, merged)
+    if merged.get("office_type") != "hybrid":
+        merged["hybrid_days"] = None
 
+    llm_requirements = _dedupe_requirements(merged.get("applicant_location_requirements") or [])
     if merged.get("office_type") != "remote":
         merged["applicant_location_requirements"] = []
+    else:
+        merged["applicant_location_requirements"] = llm_requirements
 
     # --- Job type: Ashby employmentType, Lever commitment ---
     emp_type = raw_job.get("employmentType", "")
@@ -1121,9 +1112,16 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
             merged["equity"] = {"offered": True, "min_pct": None, "max_pct": None}
 
     # --- Applicant geography for remote roles ---
-    ats_requirements = _derive_remote_applicant_location_requirements(raw_job, merged.get("office_type"))
-    if ats_requirements:
-        merged["applicant_location_requirements"] = ats_requirements
+    ats_requirements, ats_requirements_source = _derive_remote_applicant_location_requirements_with_source(
+        raw_job,
+        merged.get("office_type"),
+    )
+    if merged.get("office_type") == "remote":
+        merged["applicant_location_requirements"] = _choose_remote_requirement_source(
+            llm_requirements,
+            ats_requirements,
+            ats_requirements_source,
+        )
 
     # --- Work locations ---
     merged["locations"] = _derive_work_locations(
@@ -1420,6 +1418,83 @@ def _dedupe_requirements(requirements: list[dict]) -> list[dict]:
     return deduped
 
 
+_APPLICANT_REQUIREMENT_SPECIFICITY = {
+    "region_group": 1,
+    "country": 2,
+    "state": 3,
+    "city": 4,
+}
+
+
+def _requirement_key(requirement: dict) -> tuple:
+    scope = requirement.get("scope")
+    if scope == "country" and requirement.get("country_code"):
+        return ("country", requirement.get("country_code"))
+    if scope == "region_group":
+        return ("region_group", (requirement.get("name") or "").upper())
+    return (
+        scope,
+        requirement.get("name"),
+        requirement.get("country_code"),
+        requirement.get("region"),
+    )
+
+
+def _requirements_specificity(requirements: list[dict]) -> int:
+    best = 0
+    for requirement in requirements or []:
+        best = max(best, _APPLICANT_REQUIREMENT_SPECIFICITY.get(requirement.get("scope"), 0))
+    return best
+
+
+def _requirement_keys(requirements: list[dict]) -> set[tuple]:
+    return {_requirement_key(requirement) for requirement in requirements or [] if isinstance(requirement, dict)}
+
+
+def _prefer_requirement_superset(left: list[dict], right: list[dict]) -> list[dict] | None:
+    left_keys = _requirement_keys(left)
+    right_keys = _requirement_keys(right)
+    if not left_keys or not right_keys:
+        return None
+    if left_keys <= right_keys:
+        return right
+    if right_keys <= left_keys:
+        return left
+    return None
+
+
+def _choose_remote_requirement_source(
+    llm_requirements: list[dict],
+    ats_requirements: list[dict],
+    ats_source_strength: str | None,
+) -> list[dict]:
+    llm_requirements = _dedupe_requirements(llm_requirements or [])
+    ats_requirements = _dedupe_requirements(ats_requirements or [])
+
+    if not ats_requirements:
+        return llm_requirements
+    if not llm_requirements:
+        return ats_requirements
+
+    llm_specificity = _requirements_specificity(llm_requirements)
+    ats_specificity = _requirements_specificity(ats_requirements)
+
+    if llm_specificity > ats_specificity:
+        return llm_requirements
+    if ats_specificity > llm_specificity:
+        return ats_requirements
+
+    superset = _prefer_requirement_superset(llm_requirements, ats_requirements)
+    if superset is not None:
+        return _dedupe_requirements(superset)
+
+    if ats_source_strength == "structured":
+        return ats_requirements
+    if ats_source_strength == "text":
+        return llm_requirements
+    return llm_requirements
+
+
 def _make_location(label: str | None = None, city: str | None = None, state: str | None = None,
                    country_code: str | None = None, lat: float | None = None,
                    lng: float | None = None) -> dict:
@@ -1616,9 +1691,52 @@ def _derive_remote_requirements_from_text(text: str) -> list[dict]:
     return _dedupe_requirements(reqs)
 
 
-def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: str | None) -> list[dict]:
+def _derive_ats_office_type(raw_job: dict) -> str | None:
+    workplace = _to_str(raw_job.get("workplaceType"))
+    if workplace:
+        wp_lower = workplace.lower()
+        if wp_lower == "remote":
+            return "remote"
+        if wp_lower == "hybrid":
+            return "hybrid"
+        if wp_lower in {"onsite", "on-site", "in-office"}:
+            return "onsite"
+
+    if raw_job.get("isRemote") is True:
+        return "remote"
+
+    return _extract_linkedin_workplace_tag(raw_job)
+
+
+def _llm_has_strong_workplace_signal(metadata: dict) -> bool:
+    office_type = _to_str(metadata.get("office_type"))
+    if office_type == "hybrid":
+        hybrid_days = metadata.get("hybrid_days")
+        return isinstance(hybrid_days, int) and hybrid_days > 0
+    if office_type == "remote":
+        return bool(metadata.get("applicant_location_requirements"))
+    return False
+
+
+def _choose_office_type(raw_job: dict, llm_metadata: dict) -> str | None:
+    llm_office_type = _to_str(llm_metadata.get("office_type"))
+    ats_office_type = _derive_ats_office_type(raw_job)
+
+    if ats_office_type in {"remote", "hybrid"}:
+        return ats_office_type
+    if ats_office_type == "onsite":
+        if llm_office_type in {"remote", "hybrid"} and _llm_has_strong_workplace_signal(llm_metadata):
+            return llm_office_type
+        return "onsite"
+    return llm_office_type
+
+
+def _derive_remote_applicant_location_requirements_with_source(
+    raw_job: dict,
+    office_type: str | None,
+) -> tuple[list[dict], str | None]:
     if office_type != "remote":
-        return []
+        return [], None
 
     reqs = []
 
@@ -1650,7 +1768,7 @@ def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: s
         )
 
     if reqs:
-        return _dedupe_requirements(reqs)
+        return _dedupe_requirements(reqs), "structured"
 
     # Lever / Greenhouse / fallback location strings.
     location_texts = []
@@ -1669,7 +1787,12 @@ def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: s
         if isinstance(title, str) and title:
             reqs.extend(_derive_remote_requirements_from_text(title))
 
-    return _dedupe_requirements(reqs)
+    return _dedupe_requirements(reqs), ("text" if reqs else None)
+
+
+def _derive_remote_applicant_location_requirements(raw_job: dict, office_type: str | None) -> list[dict]:
+    reqs, _ = _derive_remote_applicant_location_requirements_with_source(raw_job, office_type)
+    return reqs
 
 
 def _derive_remote_requirements_from_locations(locations: list[dict] | None) -> list[dict]:
