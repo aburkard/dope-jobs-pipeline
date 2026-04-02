@@ -57,12 +57,16 @@ def init_schema(conn):
             parse_error_count INTEGER DEFAULT 0,
             last_parse_error TEXT,
             job_group TEXT,
+            parse_provider TEXT,
+            parse_model TEXT,
+            parse_params JSONB,
             raw_json JSONB,
             parsed_json JSONB
         )""",
         """CREATE TABLE IF NOT EXISTS pipeline_parse_batches (
             batch_id TEXT PRIMARY KEY,
             model TEXT NOT NULL,
+            params JSONB,
             display_name TEXT,
             state TEXT NOT NULL,
             input_file_name TEXT,
@@ -133,7 +137,7 @@ def init_schema(conn):
             SELECT table_name, column_name
             FROM information_schema.columns
             WHERE table_schema = 'public'
-              AND table_name IN ('pipeline_companies', 'pipeline_jobs')
+              AND table_name IN ('pipeline_companies', 'pipeline_jobs', 'pipeline_parse_batches')
         """)
         existing_columns = {(row[0], row[1]) for row in cur.fetchall()}
 
@@ -152,6 +156,14 @@ def init_schema(conn):
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN job_group TEXT")
         if ("pipeline_jobs", "public_job_id") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN public_job_id TEXT")
+        if ("pipeline_jobs", "parse_provider") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN parse_provider TEXT")
+        if ("pipeline_jobs", "parse_model") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN parse_model TEXT")
+        if ("pipeline_jobs", "parse_params") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN parse_params JSONB")
+        if ("pipeline_parse_batches", "params") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_parse_batches ADD COLUMN params JSONB")
 
         for stmt in alter_statements:
             cur.execute(stmt)
@@ -382,7 +394,14 @@ def get_jobs_needing_parse(conn, limit: int | None = None,
         return [{"id": r[0], "ats": r[1], "board_token": r[2], "title": r[3], "raw_json": r[4]} for r in cur.fetchall()]
 
 
-def save_parsed_result(conn, job_id: str, parsed_json: dict):
+def save_parsed_result(
+    conn,
+    job_id: str,
+    parsed_json: dict,
+    parse_provider: str | None = None,
+    parse_model: str | None = None,
+    parse_params: dict | None = None,
+):
     """Save LLM extraction result and clear needs_parse flag."""
     now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
@@ -390,9 +409,12 @@ def save_parsed_result(conn, job_id: str, parsed_json: dict):
             UPDATE pipeline_jobs SET
                 parsed_json = %s,
                 last_parsed_at = %s,
-                needs_parse = FALSE
+                needs_parse = FALSE,
+                parse_provider = COALESCE(%s, parse_provider),
+                parse_model = COALESCE(%s, parse_model),
+                parse_params = COALESCE(%s, parse_params)
             WHERE id = %s
-        """, (Json(parsed_json), now, job_id))
+        """, (Json(parsed_json), now, parse_provider, parse_model, Json(parse_params) if parse_params is not None else None, job_id))
     conn.commit()
 
 
@@ -560,6 +582,7 @@ def rename_parse_batch(conn, old_batch_id: str, new_batch_id: str):
 
 
 def save_parse_batch(conn, batch_id: str, model: str, state: str, display_name: str | None = None,
+                     params: dict | None = None,
                      input_file_name: str | None = None, output_file_name: str | None = None,
                      requested_count: int = 0, succeeded_count: int = 0, failed_count: int = 0,
                      stale_count: int = 0, completed_at=None, last_error: str | None = None):
@@ -569,13 +592,14 @@ def save_parse_batch(conn, batch_id: str, model: str, state: str, display_name: 
         cur.execute(
             """
             INSERT INTO pipeline_parse_batches (
-                batch_id, model, display_name, state, input_file_name, output_file_name,
+                batch_id, model, params, display_name, state, input_file_name, output_file_name,
                 requested_count, succeeded_count, failed_count, stale_count, submitted_at,
                 updated_at, completed_at, last_error
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (batch_id) DO UPDATE SET
                 model = EXCLUDED.model,
+                params = COALESCE(EXCLUDED.params, pipeline_parse_batches.params),
                 display_name = COALESCE(EXCLUDED.display_name, pipeline_parse_batches.display_name),
                 state = EXCLUDED.state,
                 input_file_name = COALESCE(EXCLUDED.input_file_name, pipeline_parse_batches.input_file_name),
@@ -589,7 +613,7 @@ def save_parse_batch(conn, batch_id: str, model: str, state: str, display_name: 
                 last_error = COALESCE(EXCLUDED.last_error, pipeline_parse_batches.last_error)
             """,
             (
-                batch_id, model, display_name, state, input_file_name, output_file_name,
+                batch_id, model, Json(params) if params is not None else None, display_name, state, input_file_name, output_file_name,
                 requested_count, succeeded_count, failed_count, stale_count, now, now, completed_at, last_error,
             ),
         )
@@ -625,7 +649,7 @@ def get_parse_batch(conn, batch_id: str) -> dict | None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT batch_id, model, display_name, state, input_file_name, output_file_name,
+            SELECT batch_id, model, params, display_name, state, input_file_name, output_file_name,
                    requested_count, succeeded_count, failed_count, stale_count,
                    submitted_at, updated_at, completed_at, last_error
             FROM pipeline_parse_batches
@@ -639,18 +663,19 @@ def get_parse_batch(conn, batch_id: str) -> dict | None:
     return {
         "batch_id": row[0],
         "model": row[1],
-        "display_name": row[2],
-        "state": row[3],
-        "input_file_name": row[4],
-        "output_file_name": row[5],
-        "requested_count": row[6],
-        "succeeded_count": row[7],
-        "failed_count": row[8],
-        "stale_count": row[9],
-        "submitted_at": row[10],
-        "updated_at": row[11],
-        "completed_at": row[12],
-        "last_error": row[13],
+        "params": row[2],
+        "display_name": row[3],
+        "state": row[4],
+        "input_file_name": row[5],
+        "output_file_name": row[6],
+        "requested_count": row[7],
+        "succeeded_count": row[8],
+        "failed_count": row[9],
+        "stale_count": row[10],
+        "submitted_at": row[11],
+        "updated_at": row[12],
+        "completed_at": row[13],
+        "last_error": row[14],
     }
 
 
@@ -711,8 +736,15 @@ def get_parse_batch_job_rows(conn, batch_id: str) -> list[dict]:
     ]
 
 
-def apply_parse_batch_chunk(conn, batch_id: str, success_rows: list[tuple[str, str, dict]],
-                            error_rows: list[tuple[str, str, str]]) -> dict:
+def apply_parse_batch_chunk(
+    conn,
+    batch_id: str,
+    success_rows: list[tuple[str, str, dict]],
+    error_rows: list[tuple[str, str, str]],
+    parse_provider: str | None = None,
+    parse_model: str | None = None,
+    parse_params: dict | None = None,
+) -> dict:
     """Apply a chunk of batch parse results with a single transaction."""
     attempted_ids = [row[0] for row in success_rows] + [row[0] for row in error_rows]
     if not attempted_ids:
@@ -725,21 +757,34 @@ def apply_parse_batch_chunk(conn, batch_id: str, success_rows: list[tuple[str, s
             updated = execute_values(
                 cur,
                 """
-                WITH incoming(job_id, expected_hash, parsed_json) AS (VALUES %s)
+                WITH incoming(job_id, expected_hash, parsed_json, parse_provider, parse_model, parse_params) AS (VALUES %s)
                 UPDATE pipeline_jobs AS pj
                 SET parsed_json = incoming.parsed_json,
                     last_parsed_at = NOW(),
                     needs_parse = FALSE,
                     parse_error_count = 0,
-                    last_parse_error = NULL
+                    last_parse_error = NULL,
+                    parse_provider = COALESCE(incoming.parse_provider, pj.parse_provider),
+                    parse_model = COALESCE(incoming.parse_model, pj.parse_model),
+                    parse_params = COALESCE(incoming.parse_params, pj.parse_params)
                 FROM incoming
                 WHERE pj.id = incoming.job_id
                   AND pj.removed_at IS NULL
                   AND pj.content_hash = incoming.expected_hash
                 RETURNING pj.id
                 """,
-                [(job_id, expected_hash, Json(parsed_json)) for job_id, expected_hash, parsed_json in success_rows],
-                template="(%s, %s, %s)",
+                [
+                    (
+                        job_id,
+                        expected_hash,
+                        Json(parsed_json),
+                        parse_provider,
+                        parse_model,
+                        Json(parse_params) if parse_params is not None else None,
+                    )
+                    for job_id, expected_hash, parsed_json in success_rows
+                ],
+                template="(%s, %s, %s, %s, %s, %s)",
                 fetch=True,
             )
             applied_success_ids = [row[0] for row in updated]
@@ -779,7 +824,16 @@ def apply_parse_batch_chunk(conn, batch_id: str, success_rows: list[tuple[str, s
     }
 
 
-def save_parsed_batch_result(conn, batch_id: str, job_id: str, expected_hash: str, parsed_json: dict) -> bool:
+def save_parsed_batch_result(
+    conn,
+    batch_id: str,
+    job_id: str,
+    expected_hash: str,
+    parsed_json: dict,
+    parse_provider: str | None = None,
+    parse_model: str | None = None,
+    parse_params: dict | None = None,
+) -> bool:
     """Save a batch parse result if the job content has not changed since submission."""
     now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
@@ -790,12 +844,23 @@ def save_parsed_batch_result(conn, batch_id: str, job_id: str, expected_hash: st
                 last_parsed_at = %s,
                 needs_parse = FALSE,
                 parse_error_count = 0,
-                last_parse_error = NULL
+                last_parse_error = NULL,
+                parse_provider = COALESCE(%s, parse_provider),
+                parse_model = COALESCE(%s, parse_model),
+                parse_params = COALESCE(%s, parse_params)
             WHERE id = %s
               AND removed_at IS NULL
               AND content_hash = %s
             """,
-            (Json(parsed_json), now, job_id, expected_hash),
+            (
+                Json(parsed_json),
+                now,
+                parse_provider,
+                parse_model,
+                Json(parse_params) if parse_params is not None else None,
+                job_id,
+                expected_hash,
+            ),
         )
         applied = cur.rowcount > 0
         cur.execute(

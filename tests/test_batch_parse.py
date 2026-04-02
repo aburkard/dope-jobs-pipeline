@@ -218,9 +218,12 @@ def test_collect_batch_matches_results_by_job_id_not_output_order(monkeypatch):
             },
         ]
 
-    def fake_apply_parse_batch_chunk(conn, batch_id, success_rows, error_rows):
+    def fake_apply_parse_batch_chunk(conn, batch_id, success_rows, error_rows, parse_provider=None, parse_model=None, parse_params=None):
         applied["success_rows"] = list(success_rows)
         applied["error_rows"] = list(error_rows)
+        applied["parse_provider"] = parse_provider
+        applied["parse_model"] = parse_model
+        applied["parse_params"] = parse_params
         return {
             "applied_success_ids": [row[0] for row in success_rows],
             "applied_failure_count": 0,
@@ -233,6 +236,9 @@ def test_collect_batch_matches_results_by_job_id_not_output_order(monkeypatch):
     def fake_update_parse_batch(conn, batch_id, **kwargs):
         updated["kwargs"] = kwargs
 
+    def fake_get_parse_batch(conn, batch_id):
+        return {"params": {"method": "batch", "max_output_tokens": 2000}}
+
     monkeypatch.setattr("batch_parse.GeminiBackend", DummyBackend)
     monkeypatch.setattr("batch_parse.GeoResolver", DummyGeoResolver)
     monkeypatch.setattr("batch_parse.GeminiBatchClient", DummyClient)
@@ -240,6 +246,7 @@ def test_collect_batch_matches_results_by_job_id_not_output_order(monkeypatch):
     monkeypatch.setattr("batch_parse.get_parse_batch_job_rows", fake_get_parse_batch_job_rows)
     monkeypatch.setattr("batch_parse.apply_parse_batch_chunk", fake_apply_parse_batch_chunk)
     monkeypatch.setattr("batch_parse.delete_parse_batch_jobs", fake_delete_parse_batch_jobs)
+    monkeypatch.setattr("batch_parse.get_parse_batch", fake_get_parse_batch)
     monkeypatch.setattr("batch_parse.update_parse_batch", fake_update_parse_batch)
     monkeypatch.setattr("batch_parse.merge_api_data", lambda raw, parsed: parsed)
 
@@ -251,6 +258,13 @@ def test_collect_batch_matches_results_by_job_id_not_output_order(monkeypatch):
         ("job-a", "hash-a", {"tagline": "tagline-a"}),
     ]
     assert applied["error_rows"] == []
+    assert applied["parse_provider"] == "google"
+    assert applied["parse_model"] == "gemini-test"
+    assert applied["parse_params"] == {
+        "method": "batch",
+        "max_output_tokens": 2000,
+        "batch_id": "batches/test",
+    }
     assert deleted.get("job_ids") is None
     assert updated["kwargs"]["failed_count"] == 0
     assert updated["kwargs"]["stale_count"] == 0

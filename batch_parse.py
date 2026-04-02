@@ -28,6 +28,7 @@ from db import (
     delete_parse_batch,
     delete_parse_batch_jobs,
     get_connection,
+    get_parse_batch,
     get_parse_batch_job_rows,
     init_schema,
     list_parse_batches,
@@ -309,6 +310,7 @@ def submit_batch(conn, limit: int, model: str, max_tokens: int,
             conn,
             batch_name,
             model=model,
+            params={"method": "batch", "max_output_tokens": max_tokens},
             state=batch.get("state", "STATE_UNSPECIFIED"),
             display_name=batch.get("displayName", display_name),
             input_file_name=input_file["name"],
@@ -351,6 +353,7 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
     client = GeminiBatchClient(model=model)
     geo_resolver = GeoResolver(conn)
     batch = status_batch(conn, batch_name, model)
+    batch_record = get_parse_batch(conn, batch_name) or {}
     state = batch.get("state", "STATE_UNSPECIFIED")
 
     if state not in {"JOB_STATE_SUCCEEDED", "BATCH_STATE_SUCCEEDED", "SUCCEEDED"}:
@@ -383,11 +386,24 @@ def collect_batch(conn, batch_name: str, model: str) -> list[str]:
             f"Batch output line count mismatch: got {len(lines)} lines for {len(reserved_jobs)} reserved jobs"
         )
 
+    parse_provider = "google"
+    parse_params = dict(batch_record.get("params") or {})
+    parse_params["method"] = "batch"
+    parse_params["batch_id"] = batch_name
+
     def flush_chunk():
         nonlocal successes, failures, stale, chunk_success_rows, chunk_error_rows, parsed_ids
         if not chunk_success_rows and not chunk_error_rows:
             return
-        result = apply_parse_batch_chunk(conn, batch_name, chunk_success_rows, chunk_error_rows)
+        result = apply_parse_batch_chunk(
+            conn,
+            batch_name,
+            chunk_success_rows,
+            chunk_error_rows,
+            parse_provider=parse_provider,
+            parse_model=model,
+            parse_params=parse_params,
+        )
         successes += len(result["applied_success_ids"])
         failures += result["applied_failure_count"]
         stale += result["stale_count"]

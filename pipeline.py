@@ -319,9 +319,13 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
     if "gemini" in model.lower():
         key = api_key or os.environ.get("GEMINI_API_KEY", "")
         backend = GeminiBackend(model=model, api_key=key)
+        parse_provider = "google"
+        parse_params = {"method": "direct"}
     else:
         key = api_key or os.environ.get("OPENAI_API_KEY", "not-needed")
         backend = OpenAIBackend(base_url, model, api_key=key)
+        parse_provider = "openai"
+        parse_params = {"method": "direct", "base_url": base_url}
 
     successes = 0
     failures = 0
@@ -374,7 +378,14 @@ def step_parse(conn, base_url: str, model: str, api_key: str | None = None,
                 failures += 1
             elif result_tuple[1] is not None:
                 jid, parsed, raw = result_tuple
-                save_parsed_result(conn, jid, parsed)
+                save_parsed_result(
+                    conn,
+                    jid,
+                    parsed,
+                    parse_provider=parse_provider,
+                    parse_model=model,
+                    parse_params=parse_params,
+                )
                 successes += 1
                 parsed_job_ids.append(jid)
             else:
