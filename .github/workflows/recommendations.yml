@@ -1,0 +1,71 @@
+name: Recommendations
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Maximum source jobs to refresh in this run"
+        required: true
+        default: "500"
+      meili_host:
+        description: "Internal Meili host protected by Cloudflare Access"
+        required: true
+        default: "https://search-internal.dopejobs.xyz"
+      algorithm_version:
+        description: "Recommendation algorithm version stamp"
+        required: true
+        default: "meili-similar-v1"
+      recommendations_per_job:
+        description: "How many recommendations to store per job"
+        required: true
+        default: "5"
+      candidate_limit:
+        description: "How many similar candidates to request per filter pass"
+        required: true
+        default: "24"
+      score_threshold:
+        description: "Minimum Meili similarity score"
+        required: true
+        default: "0.89"
+      timeout_seconds:
+        description: "Per-request timeout"
+        required: true
+        default: "10"
+
+concurrency:
+  group: dopejobs-recommendations
+  cancel-in-progress: false
+
+jobs:
+  refresh-recommendations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Refresh recommendations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          uv run python job_recommendations.py \
+            --meili-host "${{ inputs.meili_host }}" \
+            --algorithm-version "${{ inputs.algorithm_version }}" \
+            --limit "${{ inputs.limit }}" \
+            --recommendations-per-job "${{ inputs.recommendations_per_job }}" \
+            --candidate-limit "${{ inputs.candidate_limit }}" \
+            --score-threshold "${{ inputs.score_threshold }}" \
+            --timeout-seconds "${{ inputs.timeout_seconds }}"

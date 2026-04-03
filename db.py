@@ -91,6 +91,15 @@ def init_schema(conn):
             PRIMARY KEY (batch_id, request_index),
             UNIQUE (batch_id, job_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS pipeline_job_recommendations (
+            source_job_id TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+            recommended_job_id TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+            rank INTEGER NOT NULL,
+            score DOUBLE PRECISION,
+            algorithm_version TEXT NOT NULL,
+            generated_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (source_job_id, recommended_job_id)
+        )""",
         """CREATE TABLE IF NOT EXISTS geo_places (
             geoname_id BIGINT PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -127,6 +136,8 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_companies_company_slug ON pipeline_companies (company_slug)",
         "CREATE INDEX IF NOT EXISTS idx_parse_batch_jobs_job_id ON pipeline_parse_batch_jobs (job_id)",
         "CREATE INDEX IF NOT EXISTS idx_parse_batches_state ON pipeline_parse_batches (state)",
+        "CREATE INDEX IF NOT EXISTS idx_job_recommendations_source_rank ON pipeline_job_recommendations (source_job_id, rank)",
+        "CREATE INDEX IF NOT EXISTS idx_job_recommendations_recommended ON pipeline_job_recommendations (recommended_job_id)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_kind ON geo_places (kind)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_country_admin1 ON geo_places (country_code, admin1_code)",
         "CREATE INDEX IF NOT EXISTS idx_geo_places_population ON geo_places (population DESC)",
@@ -171,6 +182,12 @@ def init_schema(conn):
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_content_hash TEXT")
         if ("pipeline_jobs", "meili_loaded_last_parsed_at") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_last_parsed_at TIMESTAMPTZ")
+        if ("pipeline_jobs", "recommendations_generated_at") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN recommendations_generated_at TIMESTAMPTZ")
+        if ("pipeline_jobs", "recommendations_algorithm_version") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN recommendations_algorithm_version TEXT")
+        if ("pipeline_jobs", "recommendations_source_last_parsed_at") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN recommendations_source_last_parsed_at TIMESTAMPTZ")
         if ("pipeline_parse_batches", "params") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_parse_batches ADD COLUMN params JSONB")
 
@@ -370,6 +387,7 @@ def mark_removed(conn, ats: str, board_token: str, seen_ids: set[str]) -> list[s
         """, (now, ats, board_token, list(seen_ids)))
         removed_ids = [row[0] for row in cur.fetchall()]
     conn.commit()
+    delete_job_recommendations(conn, removed_ids)
     return removed_ids
 
 
@@ -561,6 +579,113 @@ def mark_jobs_meili_deleted(conn, job_ids: list[str]) -> None:
             WHERE id = ANY(%s)
             """,
             (job_ids,),
+        )
+    conn.commit()
+
+
+def delete_job_recommendations(conn, job_ids: list[str]) -> None:
+    """Delete recommendation edges that reference any of the given jobs."""
+    if not job_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM pipeline_job_recommendations
+            WHERE source_job_id = ANY(%s)
+               OR recommended_job_id = ANY(%s)
+            """,
+            (job_ids, job_ids),
+        )
+    conn.commit()
+
+
+def get_jobs_needing_recommendation_refresh(
+    conn,
+    algorithm_version: str,
+    limit: int | None = None,
+    job_ids: list[str] | None = None,
+) -> list[dict]:
+    """Return parsed active jobs whose recommendation set is missing or stale."""
+    query = """
+        SELECT id, title, parsed_json, last_parsed_at
+        FROM pipeline_jobs
+        WHERE removed_at IS NULL
+          AND parsed_json IS NOT NULL
+          AND meili_loaded_last_parsed_at IS NOT DISTINCT FROM last_parsed_at
+          AND (
+              recommendations_generated_at IS NULL
+              OR recommendations_algorithm_version IS DISTINCT FROM %s
+              OR recommendations_source_last_parsed_at IS DISTINCT FROM last_parsed_at
+          )
+    """
+    params: list[object] = [algorithm_version]
+    if job_ids is not None:
+        if not job_ids:
+            return []
+        query += " AND id = ANY(%s)"
+        params.append(job_ids)
+    query += " ORDER BY last_parsed_at ASC NULLS LAST, id"
+    if limit is not None:
+        query += " LIMIT %s"
+        params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return [
+            {"id": row[0], "title": row[1], "parsed_json": row[2] or {}, "last_parsed_at": row[3]}
+            for row in cur.fetchall()
+        ]
+
+
+def replace_job_recommendations(
+    conn,
+    source_job_id: str,
+    recommendations: list[dict],
+    *,
+    algorithm_version: str,
+    source_last_parsed_at,
+) -> None:
+    """Replace the stored recommendation set for a source job."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM pipeline_job_recommendations WHERE source_job_id = %s",
+            (source_job_id,),
+        )
+        if recommendations:
+            execute_values(
+                cur,
+                """
+                INSERT INTO pipeline_job_recommendations (
+                    source_job_id,
+                    recommended_job_id,
+                    rank,
+                    score,
+                    algorithm_version,
+                    generated_at
+                )
+                VALUES %s
+                """,
+                [
+                    (
+                        source_job_id,
+                        row["recommended_job_id"],
+                        row["rank"],
+                        row.get("score"),
+                        algorithm_version,
+                        datetime.now(timezone.utc),
+                    )
+                    for row in recommendations
+                ],
+                template="(%s, %s, %s, %s, %s, %s)",
+            )
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET recommendations_generated_at = NOW(),
+                recommendations_algorithm_version = %s,
+                recommendations_source_last_parsed_at = %s
+            WHERE id = %s
+            """,
+            (algorithm_version, source_last_parsed_at, source_job_id),
         )
     conn.commit()
 
