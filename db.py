@@ -60,6 +60,9 @@ def init_schema(conn):
             parse_provider TEXT,
             parse_model TEXT,
             parse_params JSONB,
+            meili_loaded_at TIMESTAMPTZ,
+            meili_loaded_content_hash TEXT,
+            meili_loaded_last_parsed_at TIMESTAMPTZ,
             raw_json JSONB,
             parsed_json JSONB
         )""",
@@ -162,6 +165,12 @@ def init_schema(conn):
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN parse_model TEXT")
         if ("pipeline_jobs", "parse_params") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN parse_params JSONB")
+        if ("pipeline_jobs", "meili_loaded_at") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_at TIMESTAMPTZ")
+        if ("pipeline_jobs", "meili_loaded_content_hash") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_content_hash TEXT")
+        if ("pipeline_jobs", "meili_loaded_last_parsed_at") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_last_parsed_at TIMESTAMPTZ")
         if ("pipeline_parse_batches", "params") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_parse_batches ADD COLUMN params JSONB")
 
@@ -495,6 +504,67 @@ def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int | None = None) -> list[str]:
+    """Return parsed active jobs whose current parsed version is not yet loaded into Meili."""
+    query = """
+        SELECT id
+        FROM pipeline_jobs
+        WHERE removed_at IS NULL
+          AND parsed_json IS NOT NULL
+          AND (
+              meili_loaded_content_hash IS DISTINCT FROM content_hash
+              OR meili_loaded_last_parsed_at IS DISTINCT FROM last_parsed_at
+          )
+    """
+    params: list[object] = []
+    if batch_id is not None:
+        query += " AND parse_params->>'batch_id' = %s"
+        params.append(batch_id)
+    query += " ORDER BY last_parsed_at ASC NULLS LAST, id"
+    if limit is not None:
+        query += " LIMIT %s"
+        params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return [row[0] for row in cur.fetchall()]
+
+
+def mark_jobs_meili_loaded(conn, job_ids: list[str]) -> None:
+    """Stamp jobs with the parsed/content version successfully loaded into Meili."""
+    if not job_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET meili_loaded_at = NOW(),
+                meili_loaded_content_hash = content_hash,
+                meili_loaded_last_parsed_at = last_parsed_at
+            WHERE id = ANY(%s)
+            """,
+            (job_ids,),
+        )
+    conn.commit()
+
+
+def mark_jobs_meili_deleted(conn, job_ids: list[str]) -> None:
+    """Clear Meili load tracking after the corresponding docs are deleted."""
+    if not job_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET meili_loaded_at = NULL,
+                meili_loaded_content_hash = NULL,
+                meili_loaded_last_parsed_at = NULL
+            WHERE id = ANY(%s)
+            """,
+            (job_ids,),
+        )
+    conn.commit()
+
+
 def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, dict]:
     """Get existing raw jobs for a board keyed by compound job ID."""
     with conn.cursor() as cur:
@@ -506,25 +576,53 @@ def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, d
         return {row[0]: (row[1] or {}) for row in cur.fetchall()}
 
 
+def parse_batch_selection_where(selection: str) -> str:
+    """Return the SQL predicate for a parse-batch queue selection."""
+    if selection == "needs_parse":
+        return "removed_at IS NULL AND needs_parse = TRUE"
+    if selection == "failed_once":
+        return "removed_at IS NULL AND parsed_json IS NULL AND COALESCE(parse_error_count, 0) > 0"
+    if selection == "never_parsed":
+        return (
+            "removed_at IS NULL AND parsed_json IS NULL AND last_parsed_at IS NULL "
+            "AND COALESCE(parse_error_count, 0) = 0 AND last_parse_error IS NULL"
+        )
+    raise ValueError("selection must be 'needs_parse', 'never_parsed', or 'failed_once'")
+
+
 def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int,
-                               companies: list[tuple[str, str]] | None = None) -> list[dict]:
-    """Reserve up to ``limit`` jobs for a Gemini batch parse submission."""
+                               companies: list[tuple[str, str]] | None = None,
+                               ats_list: list[str] | None = None,
+                               selection: str = "needs_parse") -> list[dict]:
+    """Reserve up to ``limit`` jobs for a parse run.
+
+    selection:
+      - ``needs_parse``: current incremental queue
+      - ``never_parsed``: active jobs with no parsed_json / no previous parse
+      - ``failed_once``: active jobs with no parsed_json and at least one parse error
+    """
     if limit <= 0:
         raise ValueError("limit must be greater than 0")
+    selection_where = parse_batch_selection_where(selection)
 
     with conn.cursor() as cur:
         query = """
             SELECT id, ats, board_token, title, raw_json, content_hash
             FROM pipeline_jobs
-            WHERE needs_parse = TRUE
-              AND removed_at IS NULL
+            WHERE removed_at IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM pipeline_parse_batch_jobs pbj
                   WHERE pbj.job_id = pipeline_jobs.id
               )
         """
+        query += f" AND {selection_where}"
         params: list[object] = []
+        if ats_list is not None:
+            if not ats_list:
+                return []
+            query += " AND ats = ANY(%s)"
+            params.append(ats_list)
         if companies is not None:
             if not companies:
                 return []
@@ -542,6 +640,11 @@ def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int,
         cur.execute(query, params)
         rows = cur.fetchall()
         if rows:
+            cur.execute(
+                "SELECT COALESCE(MAX(request_index), -1) + 1 FROM pipeline_parse_batch_jobs WHERE batch_id = %s",
+                (batch_id,),
+            )
+            next_index = cur.fetchone()[0]
             execute_values(
                 cur,
                 """
@@ -549,7 +652,7 @@ def claim_jobs_for_parse_batch(conn, batch_id: str, limit: int,
                 VALUES %s
                 """,
                 [
-                    (batch_id, index, row[0], row[5] or "")
+                    (batch_id, next_index + index, row[0], row[5] or "")
                     for index, row in enumerate(rows)
                 ],
             )
@@ -759,14 +862,14 @@ def apply_parse_batch_chunk(
                 """
                 WITH incoming(job_id, expected_hash, parsed_json, parse_provider, parse_model, parse_params) AS (VALUES %s)
                 UPDATE pipeline_jobs AS pj
-                SET parsed_json = incoming.parsed_json,
+                SET parsed_json = incoming.parsed_json::jsonb,
                     last_parsed_at = NOW(),
                     needs_parse = FALSE,
                     parse_error_count = 0,
                     last_parse_error = NULL,
                     parse_provider = COALESCE(incoming.parse_provider, pj.parse_provider),
                     parse_model = COALESCE(incoming.parse_model, pj.parse_model),
-                    parse_params = COALESCE(incoming.parse_params, pj.parse_params)
+                    parse_params = COALESCE(incoming.parse_params::jsonb, pj.parse_params)
                 FROM incoming
                 WHERE pj.id = incoming.job_id
                   AND pj.removed_at IS NULL

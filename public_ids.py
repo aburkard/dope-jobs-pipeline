@@ -19,6 +19,12 @@ def short_public_job_id(job_id: str) -> str:
     return base64.b32encode(digest).decode("ascii").rstrip("=").lower()
 
 
+def meili_safe_job_id(job_id: str) -> str:
+    """Reversible Meili-safe identifier for a canonical job id."""
+    encoded = base64.urlsafe_b64encode(job_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"job_{encoded}"
+
+
 def _short_suffix(text: str, length: int = 6) -> str:
     digest = hashlib.blake2b(text.encode("utf-8"), digest_size=5, person=b"dopeco").digest()
     return base64.b32encode(digest).decode("ascii").rstrip("=").lower()[:length]

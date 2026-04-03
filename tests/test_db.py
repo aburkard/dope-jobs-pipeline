@@ -1,6 +1,6 @@
 """Tests for db.py — content hash, job_id, change detection."""
 import pytest
-from db import content_hash, job_id
+from db import content_hash, job_id, parse_batch_selection_where
 
 
 class TestContentHash:
@@ -203,3 +203,17 @@ class TestScraperNormalization:
         assert "Build pipelines" in fetched["description"]
         assert fetched["datePosted"] == "2026-03-01"
         assert fetched["validThrough"] == "2026-04-01T00:00"
+
+
+def test_parse_batch_selection_where_never_parsed_excludes_prior_failures():
+    where = parse_batch_selection_where("never_parsed")
+    assert "parsed_json IS NULL" in where
+    assert "last_parsed_at IS NULL" in where
+    assert "COALESCE(parse_error_count, 0) = 0" in where
+    assert "last_parse_error IS NULL" in where
+
+
+def test_parse_batch_selection_where_failed_once_targets_prior_failures():
+    where = parse_batch_selection_where("failed_once")
+    assert "parsed_json IS NULL" in where
+    assert "COALESCE(parse_error_count, 0) > 0" in where

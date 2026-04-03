@@ -658,9 +658,28 @@ def _build_meili_location(parsed_json: dict) -> str:
     return ""
 
 
+def _extract_apply_url(raw_json: dict) -> str:
+    if not isinstance(raw_json, dict):
+        return ""
+
+    candidates = (
+        "applyUrl",
+        "apply_url",
+        "url",
+        "hostedUrl",
+        "jobUrl",
+        "absolute_url",
+    )
+    for key in candidates:
+        value = raw_json.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
-              full_reload: bool = False):
+              full_reload: bool = False, meili_batch_size: int = 1000):
     """Load parsed jobs from DB into MeiliSearch."""
     import meilisearch
 
@@ -762,6 +781,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             description = ""
 
         # String versions of arrays for embedding template
+        apply_url = _extract_apply_url(raw)
         skills_text = ', '.join(m.get("hard_skills", []) + m.get("soft_skills", []))
         vibes_text = ', '.join(v.replace('_', ' ') for v in m.get("vibe_tags", []))
         sal_text = ""
@@ -788,6 +808,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "company_slug": company_slug,
             "company_domain": company_domain,
             "company_logo": company_logo,
+            "apply_url": apply_url,
             "description": description[:3000],
             "location": location_str,
             "locations_all": _build_meili_locations_all(m),
@@ -859,7 +880,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             settings["embedders"] = embedders
         index.update_settings(settings)
 
-    def wait_for_task(task_uid: int, timeout_in_ms: int = 60000) -> bool:
+    def wait_for_task(task_uid: int, timeout_in_ms: int = 120000) -> bool:
         try:
             result = client.wait_for_task(task_uid, timeout_in_ms=timeout_in_ms)
             status = getattr(result, "status", None)
@@ -898,11 +919,26 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     configure_jobs_index(index)
 
     # Upsert documents in batches
-    BATCH_SIZE = 1000
+    def _add_documents_with_retry(batch: list[dict], primary_key: str = "meili_id",
+                                 retries: int = 3, backoff_seconds: float = 1.5) -> object:
+        last_error = None
+        for attempt in range(retries):
+            try:
+                return index.add_documents(batch, primary_key=primary_key)
+            except Exception as exc:  # network hiccup handling for shared hosting / transient failures
+                last_error = exc
+                if attempt == retries - 1:
+                    break
+                sleep_seconds = backoff_seconds * (attempt + 1)
+                print(f"  Warning: failed to start add_documents for batch ({len(batch)} docs): {type(exc).__name__}; retrying in {sleep_seconds:.1f}s")
+                time.sleep(sleep_seconds)
+        raise RuntimeError(f"Failed to submit documents for batch of {len(batch)} docs") from last_error
+
+    BATCH_SIZE = max(1, int(meili_batch_size))
     if docs:
         for i in range(0, len(docs), BATCH_SIZE):
             batch = docs[i:i + BATCH_SIZE]
-            task = index.add_documents(batch, primary_key="meili_id")
+            task = _add_documents_with_retry(batch)
             print(f"  Upserting batch {i//BATCH_SIZE + 1} ({len(batch)} docs)... (task {task.task_uid})")
             if wait_for_task(task.task_uid):
                 mark_jobs_meili_loaded(conn, [doc["id"] for doc in batch])

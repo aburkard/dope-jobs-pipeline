@@ -1,5 +1,9 @@
+import sys
+import types
+
 import pipeline
 from pipeline import filter_companies_for_shard, shard_for_company, should_mark_removed, resolve_companies
+from public_ids import meili_safe_job_id
 
 
 def test_shard_for_company_is_stable():
@@ -429,3 +433,147 @@ def test_build_job_geojson_includes_all_unique_points():
             ],
         },
     }
+
+
+def test_step_load_marks_loaded_and_deleted(monkeypatch):
+    captured = {}
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.query = query
+            self.params = params
+
+        def fetchall(self):
+            if "FROM pipeline_companies" in self.query:
+                return [("greenhouse", "figma", "Figma", "figma", "figma.com", "https://example.com/logo.png")]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakeTask:
+        def __init__(self, task_uid):
+            self.task_uid = task_uid
+
+    class FakeIndex:
+        def __init__(self):
+            self.primary_key = "meili_id"
+
+        def update_filterable_attributes(self, attrs):
+            self.filterable = attrs
+
+        def update_searchable_attributes(self, attrs):
+            self.searchable = attrs
+
+        def update_sortable_attributes(self, attrs):
+            self.sortable = attrs
+
+        def update_settings(self, settings):
+            self.settings = settings
+
+        def get_primary_key(self):
+            return self.primary_key
+
+        def add_documents(self, docs, primary_key="id"):
+            self.docs = docs
+            self.primary_key_arg = primary_key
+            return FakeTask(1)
+
+        def delete_documents(self, ids):
+            self.deleted = ids
+            return FakeTask(2)
+
+        def get_stats(self):
+            return types.SimpleNamespace(number_of_documents=1)
+
+    class FakeClient:
+        def __init__(self, host, key):
+            self.host = host
+            self.key = key
+            self._index = FakeIndex()
+            captured["client"] = self
+
+        def get_index(self, uid):
+            assert uid == "jobs"
+            return self._index
+
+        def index(self, name):
+            assert name == "jobs"
+            return self._index
+
+        def wait_for_task(self, task_uid, timeout_in_ms=0):
+            return {"uid": task_uid}
+
+    fake_meili = types.SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "meilisearch", fake_meili)
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_parsed_jobs",
+        lambda conn, job_ids=None, include_removed=False: [
+            {
+                "id": "greenhouse__figma__123",
+                "public_job_id": "abc123",
+                "ats": "greenhouse",
+                "board_token": "figma",
+                "title": "Engineer",
+                "parsed_json": {
+                    "tagline": "Build product quality systems at Figma.",
+                    "locations": [],
+                    "applicant_location_requirements": [],
+                    "office_type": "remote",
+                    "job_type": "full_time",
+                    "experience_level": "senior",
+                    "is_manager": False,
+                    "industry_primary": "enterprise_software",
+                    "industry_tags": ["enterprise_software"],
+                    "salary": None,
+                    "salary_transparency": "not_disclosed",
+                    "hard_skills": [],
+                    "soft_skills": [],
+                    "cool_factor": "interesting",
+                    "vibe_tags": [],
+                    "visa_sponsorship": "unknown",
+                    "equity": {"offered": False},
+                    "company_stage": "public",
+                    "benefits_categories": [],
+                    "benefits_highlights": [],
+                    "reports_to": "",
+                },
+                "job_group": None,
+                "raw_json": {},
+            }
+        ],
+    )
+    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda conn, job_ids=None: ["greenhouse__figma__gone"])
+    monkeypatch.setattr(pipeline, "get_latest_fx_rates", lambda conn: ({}, None))
+    monkeypatch.setattr(pipeline, "_load_geo_place_lookup", lambda conn, ids: {})
+    monkeypatch.setattr(pipeline, "_build_primary_geo", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geojson", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geo_fields", lambda parsed, lookup: {})
+
+    loaded_calls = []
+    deleted_calls = []
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: loaded_calls.append(list(ids)))
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: deleted_calls.append(list(ids)))
+
+    pipeline.step_load(
+        FakeConn(),
+        meili_host="http://example.com",
+        meili_key="key",
+        parsed_job_ids=["greenhouse__figma__123"],
+        removed_job_ids=["greenhouse__figma__gone"],
+    )
+
+    assert loaded_calls == [["greenhouse__figma__123"]]
+    assert deleted_calls == [["greenhouse__figma__gone"]]
+    assert captured["client"]._index.primary_key_arg == "meili_id"
+    assert captured["client"]._index.docs[0]["meili_id"] == meili_safe_job_id("greenhouse__figma__123")
+    assert captured["client"]._index.deleted == [meili_safe_job_id("greenhouse__figma__gone")]

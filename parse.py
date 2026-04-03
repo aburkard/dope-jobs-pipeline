@@ -1910,7 +1910,10 @@ def load_raw_jobs(path: str, limit: int | None = None) -> list[dict]:
     return jobs
 
 
-def prepare_job_text(raw_job: dict, max_chars: int = 8000) -> str:
+PREPARE_JOB_TEXT_MAX_CHARS = 32000
+
+
+def prepare_job_text(raw_job: dict, max_chars: int = PREPARE_JOB_TEXT_MAX_CHARS) -> str:
     """Clean and prepare job text for extraction, including ATS metadata."""
     title = raw_job.get("title", "") or ""
     content = (

@@ -1,4 +1,4 @@
-from public_ids import derive_company_slug_map, short_public_job_id
+from public_ids import derive_company_slug_map, meili_safe_job_id, short_public_job_id
 
 
 def test_short_public_job_id_is_stable_and_compact():
@@ -6,6 +6,13 @@ def test_short_public_job_id_is_stable_and_compact():
     assert value == short_public_job_id("greenhouse__scaleai__4655244005")
     assert len(value) == 16
     assert value.islower()
+
+
+def test_meili_safe_job_id_is_stable_and_safe():
+    value = meili_safe_job_id("ashby__primer.io__2f27bcf5-d08b-4141-b0ea-b89d07e7b5d5")
+    assert value == meili_safe_job_id("ashby__primer.io__2f27bcf5-d08b-4141-b0ea-b89d07e7b5d5")
+    assert value.startswith("job_")
+    assert "." not in value
 
 
 def test_company_slug_prefers_company_identity_over_board_token():
