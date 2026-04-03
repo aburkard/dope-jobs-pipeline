@@ -18,7 +18,7 @@ on:
       recommendations_per_job:
         description: "How many recommendations to store per job"
         required: true
-        default: "5"
+        default: "10"
       candidate_limit:
         description: "How many similar candidates to request per filter pass"
         required: true
