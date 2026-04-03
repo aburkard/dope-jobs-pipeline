@@ -19,6 +19,7 @@ import math
 import os
 import time
 import sys
+import uuid
 from collections import defaultdict
 from urllib.parse import urlparse
 
@@ -34,9 +35,11 @@ from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
     record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
-    get_existing_jobs_for_board, get_latest_fx_rates,
+    get_existing_jobs_for_board, get_latest_fx_rates, mark_jobs_meili_deleted,
+    mark_jobs_meili_loaded,
 )
 from salary_normalization import normalize_salary_annual_usd
+from public_ids import meili_safe_job_id
 
 
 ATS_SCRAPERS = {
@@ -45,6 +48,44 @@ ATS_SCRAPERS = {
     "ashby": AshbyScraper,
     "jobvite": JobviteScraper,
 }
+
+
+def _jobs_embedders_settings() -> dict:
+    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_api_key:
+        return {}
+
+    return {
+        "default": {
+            "source": "rest",
+            "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+            "headers": {
+                "Content-Type": "application/json",
+                "x-goog-api-key": gemini_api_key,
+            },
+            "request": {
+                "requests": [
+                    {
+                        "model": "models/gemini-embedding-001",
+                        "content": {
+                            "parts": [
+                                {"text": "{{text}}"},
+                            ]
+                        },
+                    },
+                    "{{..}}",
+                ],
+            },
+            "response": {
+                "embeddings": [
+                    {"values": "{{embedding}}"},
+                    "{{..}}",
+                ]
+            },
+            "dimensions": 3072,
+            "documentTemplateMaxBytes": 10000,
+        }
+    }
 
 
 def _connection_is_closed(conn) -> bool:
@@ -670,6 +711,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         if g:
             group_counts[g] = group_counts.get(g, 0) + 1
 
+    boilerplate_cache: dict[str, set[str]] = {}
+
     # Build MeiliSearch documents
     docs = []
     for row in parsed_rows:
@@ -710,7 +753,10 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         # Remove boilerplate
         if raw_desc:
             from detect_boilerplate import get_boilerplate_hashes, remove_boilerplate
-            bp_hashes = get_boilerplate_hashes(conn, board)
+            bp_hashes = boilerplate_cache.get(board)
+            if bp_hashes is None:
+                bp_hashes = get_boilerplate_hashes(conn, board)
+                boilerplate_cache[board] = bp_hashes
             description = remove_boilerplate(raw_desc, bp_hashes)
         else:
             description = ""
@@ -733,6 +779,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
                 all_industry_tags.append(value)
 
         doc = {
+            "meili_id": meili_safe_job_id(row["id"]),
             "id": row["id"],
             "public_job_id": row.get("public_job_id"),
             "title": row["title"],
@@ -783,10 +830,9 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
     client = meilisearch.Client(meili_host, key)
-    index = client.index("jobs")
 
-    # Configure index settings (idempotent)
-    index.update_filterable_attributes([
+    def configure_jobs_index(index):
+        index.update_filterable_attributes([
         "office_type", "job_type", "experience_level", "is_manager",
         "industry", "industry_tags", "company_slug", "ats_type",
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
@@ -797,40 +843,93 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
         "_geo", "_geojson",
-    ])
-    index.update_searchable_attributes([
+        ])
+        index.update_searchable_attributes([
         "title", "tagline", "company", "description", "location", "locations_all",
         "hard_skills", "soft_skills", "benefits_highlights",
-    ])
-    index.update_sortable_attributes([
+        ])
+        index.update_sortable_attributes([
         "salary_min", "salary_max",
         "salary_annual_min_usd", "salary_annual_max_usd",
         "_geo",
-    ])
-    index.update_settings({"pagination": {"maxTotalHits": 500000}})
+        ])
+        settings = {"pagination": {"maxTotalHits": 500000}}
+        embedders = _jobs_embedders_settings()
+        if embedders:
+            settings["embedders"] = embedders
+        index.update_settings(settings)
+
+    def wait_for_task(task_uid: int, timeout_in_ms: int = 60000) -> bool:
+        try:
+            result = client.wait_for_task(task_uid, timeout_in_ms=timeout_in_ms)
+            status = getattr(result, "status", None)
+            if status is None and isinstance(result, dict):
+                status = result.get("status")
+            return status == "succeeded" or status is None
+        except Exception:
+            return False
+
+    target_index_uid = "jobs"
+    jobs_index_exists = True
+    try:
+        jobs_index = client.get_index(target_index_uid)
+        current_primary_key = jobs_index.get_primary_key()
+    except Exception:
+        jobs_index_exists = False
+        current_primary_key = None
+
+    recreate_index = full_reload and jobs_index_exists and current_primary_key not in {None, "meili_id"}
+    active_index_uid = target_index_uid
+    if recreate_index:
+        active_index_uid = f"{target_index_uid}_rebuild_{uuid.uuid4().hex[:8]}"
+        task = client.create_index(active_index_uid, {"primaryKey": "meili_id"})
+        if not wait_for_task(task.task_uid):
+            raise RuntimeError(f"Timed out creating temporary Meili index {active_index_uid}")
+    elif not jobs_index_exists:
+        task = client.create_index(target_index_uid, {"primaryKey": "meili_id"})
+        if not wait_for_task(task.task_uid):
+            raise RuntimeError("Timed out creating Meili jobs index")
+    elif current_primary_key not in {None, "meili_id"}:
+        raise RuntimeError(
+            f"jobs index primary key is {current_primary_key!r}; run a full reload to migrate to 'meili_id'"
+        )
+
+    index = client.index(active_index_uid)
+    configure_jobs_index(index)
 
     # Upsert documents in batches
     BATCH_SIZE = 1000
     if docs:
         for i in range(0, len(docs), BATCH_SIZE):
             batch = docs[i:i + BATCH_SIZE]
-            task = index.add_documents(batch, primary_key="id")
+            task = index.add_documents(batch, primary_key="meili_id")
             print(f"  Upserting batch {i//BATCH_SIZE + 1} ({len(batch)} docs)... (task {task.task_uid})")
-            try:
-                client.wait_for_task(task.task_uid, timeout_in_ms=60000)
-            except Exception:
+            if wait_for_task(task.task_uid):
+                mark_jobs_meili_loaded(conn, [doc["id"] for doc in batch])
+            else:
                 print("  (waiting for index timed out, but task is queued)")
 
     # Delete removed jobs in batches
-    if removed_ids:
+    if removed_ids and active_index_uid == target_index_uid:
         for i in range(0, len(removed_ids), BATCH_SIZE):
             batch = removed_ids[i:i + BATCH_SIZE]
-            task = index.delete_documents(ids=batch)
+            task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
             print(f"  Deleting batch ({len(batch)} removed jobs)...")
-            try:
-                client.wait_for_task(task.task_uid, timeout_in_ms=30000)
-            except Exception:
+            if wait_for_task(task.task_uid, timeout_in_ms=30000):
+                mark_jobs_meili_deleted(conn, batch)
+            else:
                 pass
+
+    if recreate_index:
+        swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])
+        if not wait_for_task(swap_task.task_uid):
+            raise RuntimeError("Timed out swapping Meili jobs indexes")
+        delete_task = client.delete_index(active_index_uid)
+        wait_for_task(delete_task.task_uid, timeout_in_ms=30000)
+        mark_jobs_meili_loaded(conn, [row["id"] for row in parsed_rows])
+        if removed_ids:
+            mark_jobs_meili_deleted(conn, removed_ids)
+        index = client.index(target_index_uid)
 
     stats = index.get_stats()
     print(f"  Index: {stats.number_of_documents} documents")
