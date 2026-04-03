@@ -132,7 +132,11 @@ def post_json(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "dopejobs-recommendations/1.0",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if access_headers:
