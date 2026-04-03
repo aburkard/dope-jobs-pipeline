@@ -228,7 +228,11 @@ def build_recommendations_for_job(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate job recommendations from Meili similar-documents")
     parser.add_argument("--meili-host", default=os.environ.get("MEILISEARCH_HOST"), help="MeiliSearch host")
-    parser.add_argument("--meili-key", default=os.environ.get("MEILISEARCH_MASTER_KEY"), help="MeiliSearch master key")
+    parser.add_argument(
+        "--meili-key",
+        default=os.environ.get("MEILISEARCH_RECOMMENDATIONS_KEY") or os.environ.get("MEILISEARCH_MASTER_KEY"),
+        help="Meili API key for recommendation reads",
+    )
     parser.add_argument("--cf-access-client-id", default=os.environ.get("CF_ACCESS_CLIENT_ID"))
     parser.add_argument("--cf-access-client-secret", default=os.environ.get("CF_ACCESS_CLIENT_SECRET"))
     parser.add_argument("--algorithm-version", default=DEFAULT_ALGORITHM_VERSION)
