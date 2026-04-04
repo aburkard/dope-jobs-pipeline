@@ -1,0 +1,55 @@
+name: Workable Widget Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many Workable tokens to probe"
+        required: true
+        default: "20"
+      timeout_seconds:
+        description: "Per-request timeout"
+        required: true
+        default: "20"
+      sleep_seconds:
+        description: "Delay between probes"
+        required: true
+        default: "0.25"
+
+concurrency:
+  group: workable-widget-smoke
+  cancel-in-progress: false
+
+jobs:
+  probe-workable-widget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Probe Workable widget endpoints
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          uv run python probe_workable_widget.py \
+            --tokens-file workable.smoke.txt \
+            --limit "${{ inputs.limit }}" \
+            --timeout-seconds "${{ inputs.timeout_seconds }}" \
+            --sleep-seconds "${{ inputs.sleep_seconds }}" \
+            --output-json workable-widget-results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: workable-widget-results
+          path: workable-widget-results.json
