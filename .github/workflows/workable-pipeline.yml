@@ -7,8 +7,12 @@ on:
         description: "Total shard count for this rollout"
         required: true
         default: "20"
+      companies_per_shard:
+        description: "Approximate number of Workable companies each shard should process"
+        required: true
+        default: "50"
       db_company_limit:
-        description: "Optional cap on DB-selected Workable companies for this run"
+        description: "Optional cap on total DB-selected Workable companies for this run"
         required: false
         default: ""
       max_per_company:
@@ -55,19 +59,21 @@ jobs:
             exit 0
           fi
 
+          DB_COMPANY_LIMIT="${{ inputs.db_company_limit }}"
+          if [ -z "$DB_COMPANY_LIMIT" ]; then
+            DB_COMPANY_LIMIT=$(( ${{ inputs.total_shards }} * ${{ inputs.companies_per_shard }} ))
+          fi
+
           ARGS=(
             --companies-from-db
             --ats-filter workable
             --scrape-status-filter pending blocked error empty active
             --shard-index "${{ matrix.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
+            --db-company-limit "$DB_COMPANY_LIMIT"
             --skip-parse
             --skip-load
           )
-
-          if [ -n "${{ inputs.db_company_limit }}" ]; then
-            ARGS+=(--db-company-limit "${{ inputs.db_company_limit }}")
-          fi
 
           if [ -n "${{ inputs.max_per_company }}" ]; then
             ARGS+=(--max-per-company "${{ inputs.max_per_company }}")

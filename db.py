@@ -1232,7 +1232,12 @@ def get_geo_place_counts(conn) -> dict[str, int]:
         cur.execute("SELECT kind, COUNT(*) FROM geo_places GROUP BY kind ORDER BY kind")
         return {row[0]: row[1] for row in cur.fetchall()}
 
-def get_companies_to_scrape(conn, limit: int, ats_filter: list[str] | None = None) -> list[tuple[str, str]]:
+def get_companies_to_scrape(
+    conn,
+    limit: int,
+    ats_filter: list[str] | None = None,
+    ats_exclude_filter: list[str] | None = None,
+) -> list[tuple[str, str]]:
     """Select a bounded set of active companies for scraping.
 
     Prioritize companies that have never been scraped, then oldest scrape times.
@@ -1247,6 +1252,9 @@ def get_companies_to_scrape(conn, limit: int, ats_filter: list[str] | None = Non
         if ats_filter:
             query += " AND ats = ANY(%s)"
             params.append(ats_filter)
+        if ats_exclude_filter:
+            query += " AND NOT (ats = ANY(%s))"
+            params.append(ats_exclude_filter)
         query += """
             ORDER BY last_scraped_at NULLS FIRST, ats, board_token
             LIMIT %s
@@ -1260,6 +1268,7 @@ def get_companies_to_scrape_by_status(
     conn,
     limit: int,
     ats_filter: list[str] | None = None,
+    ats_exclude_filter: list[str] | None = None,
     scrape_statuses: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Select companies by scrape status, prioritizing pending rows first."""
@@ -1273,6 +1282,9 @@ def get_companies_to_scrape_by_status(
         if ats_filter:
             query += " AND ats = ANY(%s)"
             params.append(ats_filter)
+        if ats_exclude_filter:
+            query += " AND NOT (ats = ANY(%s))"
+            params.append(ats_exclude_filter)
         if scrape_statuses:
             query += " AND COALESCE(scrape_status, 'pending') = ANY(%s)"
             params.append(scrape_statuses)

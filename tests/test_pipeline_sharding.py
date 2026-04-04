@@ -106,17 +106,27 @@ def test_resolve_companies_allows_unbounded_db_selection(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "get_companies_to_scrape",
-        lambda conn, limit, ats_filter=None: [("greenhouse", "figma")] if limit == 10_000_000 and ats_filter is None else [],
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None: (
+            [("greenhouse", "figma")]
+            if limit == 10_000_000 and ats_filter is None and ats_exclude_filter is None else []
+        ),
     )
     companies = resolve_companies(object(), companies_from_db=True, db_company_limit=None)
     assert companies == [("greenhouse", "figma")]
 
 
 def test_resolve_companies_uses_bounded_db_selection(monkeypatch):
-    monkeypatch.setattr(pipeline, "get_companies_to_scrape", lambda conn, limit, ats_filter=None: [
-        ("greenhouse", "figma"),
-        ("ashby", "openai"),
-    ] if limit == 2 and ats_filter is None else [])
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape",
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None: (
+            [
+                ("greenhouse", "figma"),
+                ("ashby", "openai"),
+            ]
+            if limit == 2 and ats_filter is None and ats_exclude_filter is None else []
+        ),
+    )
     companies = resolve_companies(object(), companies_from_db=True, db_company_limit=2)
     assert companies == [("greenhouse", "figma"), ("ashby", "openai")]
 
@@ -125,7 +135,10 @@ def test_resolve_companies_passes_ats_filter(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "get_companies_to_scrape",
-        lambda conn, limit, ats_filter=None: [("workable", "telegraph")] if limit == 5 and ats_filter == ["workable"] else [],
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None: (
+            [("workable", "telegraph")]
+            if limit == 5 and ats_filter == ["workable"] and ats_exclude_filter is None else []
+        ),
     )
     companies = resolve_companies(
         object(),
@@ -136,12 +149,31 @@ def test_resolve_companies_passes_ats_filter(monkeypatch):
     assert companies == [("workable", "telegraph")]
 
 
+def test_resolve_companies_passes_ats_exclude_filter(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape",
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None: (
+            [("greenhouse", "figma")]
+            if limit == 5 and ats_filter is None and ats_exclude_filter == ["workable"] else []
+        ),
+    )
+    companies = resolve_companies(
+        object(),
+        companies_from_db=True,
+        db_company_limit=5,
+        ats_exclude_filter=["workable"],
+    )
+    assert companies == [("greenhouse", "figma")]
+
+
 def test_resolve_companies_passes_scrape_status_filter(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "get_companies_to_scrape_by_status",
-        lambda conn, limit, ats_filter=None, scrape_statuses=None: (
-            [("workable", "loopme")] if limit == 5 and ats_filter == ["workable"] and scrape_statuses == ["pending", "error"] else []
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None, scrape_statuses=None: (
+            [("workable", "loopme")]
+            if limit == 5 and ats_filter == ["workable"] and ats_exclude_filter is None and scrape_statuses == ["pending", "error"] else []
         ),
     )
     companies = resolve_companies(
@@ -152,6 +184,25 @@ def test_resolve_companies_passes_scrape_status_filter(monkeypatch):
         scrape_status_filter=["pending", "error"],
     )
     assert companies == [("workable", "loopme")]
+
+
+def test_resolve_companies_passes_ats_exclude_filter_with_status_selection(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape_by_status",
+        lambda conn, limit, ats_filter=None, ats_exclude_filter=None, scrape_statuses=None: (
+            [("greenhouse", "openai")]
+            if limit == 5 and ats_filter is None and ats_exclude_filter == ["workable"] and scrape_statuses == ["pending"] else []
+        ),
+    )
+    companies = resolve_companies(
+        object(),
+        companies_from_db=True,
+        db_company_limit=5,
+        ats_exclude_filter=["workable"],
+        scrape_status_filter=["pending"],
+    )
+    assert companies == [("greenhouse", "openai")]
 
 
 def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):

@@ -148,6 +148,7 @@ def resolve_companies(conn, companies_path: str | None = None,
                       companies_from_db: bool = False,
                       db_company_limit: int | None = None,
                       ats_filter: list[str] | None = None,
+                      ats_exclude_filter: list[str] | None = None,
                       scrape_status_filter: list[str] | None = None) -> list[tuple[str, str]]:
     """Resolve companies from either a file or a bounded DB query."""
     if companies_from_db:
@@ -159,9 +160,15 @@ def resolve_companies(conn, companies_path: str | None = None,
                 conn,
                 limit=limit,
                 ats_filter=ats_filter,
+                ats_exclude_filter=ats_exclude_filter,
                 scrape_statuses=scrape_status_filter,
             )
-        return get_companies_to_scrape(conn, limit=limit, ats_filter=ats_filter)
+        return get_companies_to_scrape(
+            conn,
+            limit=limit,
+            ats_filter=ats_filter,
+            ats_exclude_filter=ats_exclude_filter,
+        )
 
     if not companies_path:
         raise ValueError("--companies is required unless --companies-from-db is used")
@@ -1076,6 +1083,8 @@ def main():
                         help="Required safety cap when using --companies-from-db")
     parser.add_argument("--ats-filter", nargs="+", default=None,
                         help="Restrict DB company selection to one or more ATS names")
+    parser.add_argument("--ats-exclude-filter", nargs="+", default=None,
+                        help="Exclude one or more ATS names from DB company selection")
     parser.add_argument("--scrape-status-filter", nargs="+", default=None,
                         help="Restrict DB company selection to one or more scrape statuses")
     parser.add_argument("--skip-scrape", action="store_true")
@@ -1121,6 +1130,7 @@ def main():
             companies_from_db=args.companies_from_db,
             db_company_limit=args.db_company_limit,
             ats_filter=args.ats_filter,
+            ats_exclude_filter=args.ats_exclude_filter,
             scrape_status_filter=args.scrape_status_filter,
         )
     except ValueError as e:
