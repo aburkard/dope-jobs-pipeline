@@ -1927,51 +1927,62 @@ def prepare_job_text(raw_job: dict, max_chars: int = PREPARE_JOB_TEXT_MAX_CHARS)
 
     # Include ATS metadata as context
     meta_parts = []
+    seen_meta_parts = set()
+
+    def add_meta_part(value: str | None):
+        if not value:
+            return
+        normalized = value.strip()
+        if not normalized or normalized in seen_meta_parts:
+            return
+        seen_meta_parts.add(normalized)
+        meta_parts.append(normalized)
     # Location from ATS
     loc = raw_job.get("location", {})
     if isinstance(loc, dict) and loc.get("name"):
-        meta_parts.append(f"Location: {loc['name']}")
+        add_meta_part(f"Location: {loc['name']}")
     elif isinstance(loc, str) and loc:
-        meta_parts.append(f"Location: {loc}")
+        add_meta_part(f"Location: {loc}")
     if raw_job.get("workplaceType"):
-        meta_parts.append(f"Workplace type: {raw_job['workplaceType']}")
+        add_meta_part(f"Workplace type: {raw_job['workplaceType']}")
     if raw_job.get("isRemote") is True:
-        meta_parts.append("Remote flag: true")
+        add_meta_part("Remote flag: true")
+    employment_type = raw_job.get("employmentType") or raw_job.get("commitment")
+    if employment_type:
+        add_meta_part(f"Employment type: {employment_type}")
     if raw_job.get("allLocations"):
-        meta_parts.append(f"Allowed locations: {', '.join(raw_job['allLocations'])}")
+        add_meta_part(f"Allowed locations: {', '.join(raw_job['allLocations'])}")
     # Only pass location context to LLM (helps with geocoding)
     # Salary, office_type, job_type come from API structured data — not LLM
     if raw_job.get("departments"):
-        meta_parts.append(f"Department: {', '.join(raw_job['departments'])}")
+        add_meta_part(f"Department: {', '.join(raw_job['departments'])}")
     if raw_job.get("offices"):
         office_names = [o.get("location") or o.get("name", "") for o in raw_job["offices"]]
         if office_names:
-            meta_parts.append(f"Offices: {', '.join(office_names)}")
+            add_meta_part(f"Offices: {', '.join(office_names)}")
     if raw_job.get("department"):
-        meta_parts.append(f"Department: {raw_job['department']}")
+        add_meta_part(f"Department: {raw_job['department']}")
     if raw_job.get("allLocations"):
-        meta_parts.append(f"Locations: {', '.join(raw_job['allLocations'])}")
+        add_meta_part(f"Locations: {', '.join(raw_job['allLocations'])}")
     elif raw_job.get("categories") and isinstance(raw_job["categories"], dict):
         if raw_job["categories"].get("location"):
-            meta_parts.append(f"Location: {raw_job['categories']['location']}")
+            add_meta_part(f"Location: {raw_job['categories']['location']}")
     # Ashby location context (helps LLM with geocoding, other fields come from API)
     if raw_job.get("locationName"):
-        meta_parts.append(f"Location: {raw_job['locationName']}")
+        add_meta_part(f"Location: {raw_job['locationName']}")
     if raw_job.get("locationCity"):
         loc_detail = raw_job["locationCity"]
         if raw_job.get("locationRegion"):
             loc_detail += f", {raw_job['locationRegion']}"
         if raw_job.get("locationCountry"):
             loc_detail += f", {raw_job['locationCountry']}"
-        meta_parts.append(f"Location detail: {loc_detail}")
+        add_meta_part(f"Location detail: {loc_detail}")
     if raw_job.get("secondaryLocations"):
         locs = [sl.get("location", "") for sl in raw_job["secondaryLocations"] if sl.get("location")]
         if locs:
-            meta_parts.append(f"Also in: {', '.join(locs)}")
-    if raw_job.get("department"):
-        meta_parts.append(f"Department: {raw_job['department']}")
+            add_meta_part(f"Also in: {', '.join(locs)}")
     if raw_job.get("team"):
-        meta_parts.append(f"Team: {raw_job['team']}")
+        add_meta_part(f"Team: {raw_job['team']}")
 
     meta_str = "\n".join(meta_parts)
     if meta_str:

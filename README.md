@@ -15,6 +15,7 @@ This repo is the standalone ingestion pipeline for dopejobs. It is intended to r
 - Lever
 - Ashby
 - Jobvite
+- Workable
 
 ## Architecture
 
@@ -71,6 +72,12 @@ uv run python pipeline.py --companies companies.smoke.txt --skip-load
 uv run python pipeline.py --companies companies.smoke.txt --skip-scrape
 uv run python pipeline.py --companies companies.smoke.txt --skip-parse
 uv run python pipeline.py --companies companies.smoke.txt --full-load
+```
+
+Seed board tokens into `pipeline_companies` so the DB-driven scrape workflow can pick them up:
+
+```bash
+uv run python seed_company_tokens.py --ats workable --tokens-file /path/to/workable.txt
 ```
 
 ## Sharding

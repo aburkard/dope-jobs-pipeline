@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="Which queue slice to claim.",
     )
     parser.add_argument(
+        "--ats",
+        nargs="+",
+        default=None,
+        help="Optional ATS restriction for the claimed parse slice.",
+    )
+    parser.add_argument(
         "--balanced-by-ats",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -125,6 +131,7 @@ def _build_parse_params(args: argparse.Namespace, batch_id: str) -> dict[str, An
         "variant": args.variant,
         "prompt_max_chars": args.prompt_max_chars,
         "selection": args.selection,
+        "ats": args.ats,
         "balanced_by_ats": args.balanced_by_ats,
     }
 
@@ -151,18 +158,23 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "HTTP 429" in text or "Rate limit exceeded" in text
 
 
-def _ats_counts_for_selection(conn, selection: str) -> list[tuple[str, int]]:
+def _ats_counts_for_selection(conn, selection: str, ats_list: list[str] | None = None) -> list[tuple[str, int]]:
     where = parse_batch_selection_where(selection)
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
+        query = f"""
             SELECT ats, COUNT(*)
             FROM pipeline_jobs
             WHERE {where}
+        """
+        params: list[Any] = []
+        if ats_list:
+            query += " AND ats = ANY(%s)"
+            params.append(ats_list)
+        query += """
             GROUP BY ats
             ORDER BY ats
-            """
-        )
+        """
+        cur.execute(query, params)
         return [(row[0], row[1]) for row in cur.fetchall()]
 
 
@@ -192,16 +204,24 @@ def _proportional_ats_targets(counts: list[tuple[str, int]], total_limit: int) -
     return [(ats, floor) for ats, _, floor, _ in exact if floor > 0]
 
 
-def claim_jobs_slice(conn, batch_id: str, limit: int, selection: str, balanced_by_ats: bool) -> list[dict]:
+def claim_jobs_slice(
+    conn,
+    batch_id: str,
+    limit: int,
+    selection: str,
+    balanced_by_ats: bool,
+    ats_list: list[str] | None = None,
+) -> list[dict]:
     if not balanced_by_ats:
         return claim_jobs_for_parse_batch(
             conn,
             batch_id=batch_id,
             limit=limit,
+            ats_list=ats_list,
             selection=selection,
         )
 
-    ats_targets = _proportional_ats_targets(_ats_counts_for_selection(conn, selection), limit)
+    ats_targets = _proportional_ats_targets(_ats_counts_for_selection(conn, selection, ats_list=ats_list), limit)
     claimed: list[dict] = []
     for ats, target in ats_targets:
         if target <= 0:
@@ -223,6 +243,7 @@ def claim_jobs_slice(conn, batch_id: str, limit: int, selection: str, balanced_b
                 conn,
                 batch_id=batch_id,
                 limit=remaining,
+                ats_list=ats_list,
                 selection=selection,
             )
         )
@@ -244,6 +265,7 @@ def main() -> int:
         limit=args.limit,
         selection=args.selection,
         balanced_by_ats=args.balanced_by_ats,
+        ats_list=args.ats,
     )
     if not jobs:
         print(json.dumps({"batch_id": batch_id, "status": "no_jobs"}))
@@ -357,6 +379,7 @@ def main() -> int:
                     "status": "started",
                     "requested_count": len(jobs),
                     "selection": args.selection,
+                    "ats": args.ats,
                     "model": args.model,
                     "reasoning_effort": args.reasoning_effort,
                     "verbosity": args.verbosity,

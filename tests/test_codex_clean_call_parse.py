@@ -57,3 +57,33 @@ def test_is_rate_limit_error_matches_known_messages():
     assert parse_mod._is_rate_limit_error(RuntimeError('HTTP 429: {"detail":"Rate limit exceeded"}'))
     assert parse_mod._is_rate_limit_error(RuntimeError("Rate limit exceeded"))
     assert not parse_mod._is_rate_limit_error(RuntimeError("HTTP 500: boom"))
+
+
+def test_claim_jobs_slice_passes_ats_list_when_not_balanced(monkeypatch):
+    captured = {}
+
+    def fake_claim(conn, batch_id, limit, ats_list=None, selection=None):
+        captured["batch_id"] = batch_id
+        captured["limit"] = limit
+        captured["ats_list"] = ats_list
+        captured["selection"] = selection
+        return [{"id": "workable__x__1"}]
+
+    monkeypatch.setattr(parse_mod, "claim_jobs_for_parse_batch", fake_claim)
+
+    jobs = parse_mod.claim_jobs_slice(
+        object(),
+        batch_id="batch-1",
+        limit=5,
+        selection="needs_parse",
+        balanced_by_ats=False,
+        ats_list=["workable"],
+    )
+
+    assert jobs == [{"id": "workable__x__1"}]
+    assert captured == {
+        "batch_id": "batch-1",
+        "limit": 5,
+        "ats_list": ["workable"],
+        "selection": "needs_parse",
+    }

@@ -1,6 +1,6 @@
 """Tests for merge_api_data — overlaying API structured data onto LLM extraction."""
 import pytest
-from parse import _flat_to_job_metadata, merge_api_data, prepare_language_detection_text
+from parse import _flat_to_job_metadata, merge_api_data, prepare_job_text, prepare_language_detection_text
 
 
 class TestGreenhousePayRanges:
@@ -385,6 +385,26 @@ class TestIndustryCanonicalization:
             "developer_tools",
         ]
         assert result["industry_other_hint"] is None
+
+
+class TestPrepareJobText:
+    def test_dedupes_department_and_includes_employment_type(self):
+        raw = {
+            "title": "Account Manager, Supply",
+            "description": "<p>Body</p>",
+            "location": "Beijing, China",
+            "workplaceType": "hybrid",
+            "employmentType": "Full-time",
+            "departments": ["Marketplace", "Account Management"],
+            "department": "Account Management",
+        }
+
+        text = prepare_job_text(raw)
+
+        assert "Workplace type: hybrid" in text
+        assert "Employment type: Full-time" in text
+        assert text.count("Department: Account Management") == 1
+        assert "Department: Marketplace, Account Management" in text
 
 
 class TestLocationOverlay:

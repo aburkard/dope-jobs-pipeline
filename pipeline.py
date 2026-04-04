@@ -769,6 +769,37 @@ def _extract_posted_at(raw_json: dict) -> tuple[str | None, int | None]:
     return None, None
 
 
+def _build_years_experience_buckets(parsed_json: dict) -> list[str]:
+    years_experience = parsed_json.get("years_experience") or {}
+    min_years = years_experience.get("min")
+    max_years = years_experience.get("max")
+
+    if not isinstance(min_years, int):
+        min_years = None
+    if not isinstance(max_years, int):
+        max_years = None
+
+    buckets: list[str] = []
+
+    def overlaps(bucket_min: int, bucket_max: int) -> bool:
+        min_ok = min_years is None or min_years <= bucket_max
+        max_ok = max_years is None or max_years >= bucket_min
+        return min_ok and max_ok
+
+    if overlaps(0, 2):
+        buckets.append("0_2")
+    if overlaps(3, 5):
+        buckets.append("3_5")
+    if overlaps(6, 9):
+        buckets.append("6_9")
+    if (max_years is None and min_years is not None and min_years >= 10) or (
+        max_years is not None and max_years >= 10
+    ):
+        buckets.append("10_plus")
+
+    return buckets
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False, meili_batch_size: int = 1000):
@@ -891,6 +922,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             if isinstance(value, str) and value and value not in all_industry_tags:
                 all_industry_tags.append(value)
         years_experience = m.get("years_experience") or {}
+        years_experience_buckets = _build_years_experience_buckets(m)
 
         doc = {
             "meili_id": meili_safe_job_id(row["id"]),
@@ -927,6 +959,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "salary_transparency": m.get("salary_transparency", "not_disclosed"),
             "years_experience_min": years_experience.get("min"),
             "years_experience_max": years_experience.get("max"),
+            "years_experience_buckets": years_experience_buckets,
             "education_level": m.get("education_level"),
             "hard_skills": m.get("hard_skills", []),
             "soft_skills": m.get("soft_skills", []),
@@ -951,8 +984,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
     client = meilisearch.Client(meili_host, key)
 
-    def configure_jobs_index(index):
-        index.update_filterable_attributes([
+    filterable_attributes = [
         "office_type", "job_type", "experience_level", "is_manager",
         "industry", "industry_tags", "company_slug", "ats_type",
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
@@ -960,22 +992,27 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "salary_min", "salary_max",
         "salary_annual_min_usd", "salary_annual_max_usd",
         "posted_at_ts",
-        "years_experience_min", "years_experience_max", "education_level",
+        "years_experience_min", "years_experience_max", "years_experience_buckets", "education_level",
         "work_geoname_ids", "work_country_codes", "work_admin1_keys",
         "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
         "_geo", "_geojson",
-        ])
-        index.update_searchable_attributes([
+    ]
+    searchable_attributes = [
         "title", "tagline", "company", "description", "location", "locations_all",
         "hard_skills", "soft_skills", "benefits_highlights",
-        ])
-        index.update_sortable_attributes([
+    ]
+    sortable_attributes = [
         "salary_min", "salary_max",
         "salary_annual_min_usd", "salary_annual_max_usd",
         "posted_at_ts",
         "_geo",
-        ])
+    ]
+
+    def configure_jobs_index(index):
+        index.update_filterable_attributes(filterable_attributes)
+        index.update_searchable_attributes(searchable_attributes)
+        index.update_sortable_attributes(sortable_attributes)
         settings = {"pagination": {"maxTotalHits": 500000}}
         embedders = _jobs_embedders_settings()
         if embedders:
@@ -1018,7 +1055,11 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         )
 
     index = client.index(active_index_uid)
-    configure_jobs_index(index)
+    should_configure_index = recreate_index or not jobs_index_exists or full_reload
+    if should_configure_index:
+        configure_jobs_index(index)
+    else:
+        print("  Skipping Meili index settings refresh for incremental load")
 
     # Upsert documents in batches
     def _add_documents_with_retry(batch: list[dict], primary_key: str = "meili_id",
@@ -1045,7 +1086,10 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             if wait_for_task(task.task_uid):
                 mark_jobs_meili_loaded(conn, [doc["id"] for doc in batch])
             else:
-                print("  (waiting for index timed out, but task is queued)")
+                raise RuntimeError(
+                    f"Timed out waiting for Meili task {task.task_uid}; "
+                    "stopping further document submissions to avoid overloading the queue"
+                )
 
     # Delete removed jobs in batches
     if removed_ids and active_index_uid == target_index_uid:
@@ -1056,7 +1100,10 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             if wait_for_task(task.task_uid, timeout_in_ms=30000):
                 mark_jobs_meili_deleted(conn, batch)
             else:
-                pass
+                raise RuntimeError(
+                    f"Timed out waiting for Meili delete task {task.task_uid}; "
+                    "stopping further deletions to avoid overloading the queue"
+                )
 
     if recreate_index:
         swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])

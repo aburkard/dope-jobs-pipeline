@@ -94,6 +94,9 @@ class BaseScraper:
     def get_company_domain(self):
         raise NotImplementedError
 
+    def get_company_description(self):
+        return None
+
     def get_company_logo_url(self):
         raise NotImplementedError
 
