@@ -171,6 +171,50 @@ class TestScraperNormalization:
         assert normalized["datePosted"] == "2026-03-01"
         assert normalized["validThrough"] == "2026-04-01T00:00"
 
+    def test_workable_fields(self):
+        from scrapers.workable_scraper import WorkableScraper
+        scraper = WorkableScraper("test")
+        raw = {
+            "shortcode": "E6CD91E25F",
+            "title": "Account Manager, Supply",
+            "description": "<p>Build supply relationships</p>",
+            "application_url": "https://apply.workable.com/j/E6CD91E25F/apply",
+            "url": "https://apply.workable.com/j/E6CD91E25F",
+            "locations": [
+                {
+                    "country": "China",
+                    "countryCode": "CN",
+                    "city": "Beijing",
+                    "region": "Beijing",
+                    "hidden": False,
+                }
+            ],
+            "department": "Marketplace",
+            "telecommuting": False,
+            "employment_type": "Full-time",
+            "created_at": "2026-03-11",
+            "published_on": "2026-03-17",
+            "education": "Bachelor's Degree",
+            "experience": "Mid-Senior level",
+            "function": "Sales",
+            "industry": "Marketing and Advertising",
+        }
+        scraper._cached_company_name = "Example Co"
+        normalized = scraper.normalize_job(raw)
+        assert normalized["id"] == "workable__test__E6CD91E25F"
+        assert normalized["workplace"] is None
+        assert normalized["workplaceType"] is None
+        assert normalized["remote"] is False
+        assert normalized["isRemote"] is False
+        assert normalized["department"] == "Marketplace"
+        assert normalized["departments"] == ["Marketplace"]
+        assert normalized["applyUrl"] == "https://apply.workable.com/j/E6CD91E25F/apply"
+        assert normalized["employmentType"] == "Full-time"
+        assert normalized["createdAt"] == "2026-03-11"
+        assert normalized["datePosted"] == "2026-03-17"
+        assert normalized["education"] == "Bachelor's Degree"
+        assert normalized["requirements"] == ""
+
     def test_jobvite_fetch_job_falls_back_to_json_ld_description(self, monkeypatch):
         from scrapers.jobvite_scraper import JobviteScraper
 

@@ -21,6 +21,7 @@ import time
 import sys
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ from scrapers.greenhouse_scraper import GreenhouseScraper
 from scrapers.lever_scraper import LeverScraper
 from scrapers.ashby_scraper import AshbyScraper
 from scrapers.jobvite_scraper import JobviteScraper
+from scrapers.workable_scraper import WorkableScraper
 from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
@@ -47,6 +49,7 @@ ATS_SCRAPERS = {
     "lever": LeverScraper,
     "ashby": AshbyScraper,
     "jobvite": JobviteScraper,
+    "workable": WorkableScraper,
 }
 
 
@@ -59,6 +62,10 @@ def _jobs_embedders_settings() -> dict:
         "default": {
             "source": "rest",
             "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+            "distribution": {
+                "mean": 0.83,
+                "sigma": 0.04,
+            },
             "headers": {
                 "Content-Type": "application/json",
                 "x-goog-api-key": gemini_api_key,
@@ -138,13 +145,14 @@ def parse_companies_file(path: str) -> list[tuple[str, str]]:
 
 def resolve_companies(conn, companies_path: str | None = None,
                       companies_from_db: bool = False,
-                      db_company_limit: int | None = None) -> list[tuple[str, str]]:
+                      db_company_limit: int | None = None,
+                      ats_filter: list[str] | None = None) -> list[tuple[str, str]]:
     """Resolve companies from either a file or a bounded DB query."""
     if companies_from_db:
         if db_company_limit is not None and db_company_limit <= 0:
             raise ValueError("--db-company-limit must be greater than 0")
         limit = db_company_limit if db_company_limit is not None else 10_000_000
-        return get_companies_to_scrape(conn, limit=limit)
+        return get_companies_to_scrape(conn, limit=limit, ats_filter=ats_filter)
 
     if not companies_path:
         raise ValueError("--companies is required unless --companies-from-db is used")
@@ -275,6 +283,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
             # Update company record
             company_name = None
             company_domain = None
+            company_description = None
             company_logo = None
             try:
                 company_name = scraper.get_company_name()
@@ -282,6 +291,10 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                 pass
             try:
                 company_domain = scraper.get_company_domain()
+            except Exception:
+                pass
+            try:
+                company_description = scraper.get_company_description()
             except Exception:
                 pass
             try:
@@ -294,6 +307,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                 token,
                 company_name=company_name,
                 domain=company_domain,
+                description=company_description,
                 scraped_logo_url=company_logo,
                 job_count=len(jobs),
                 job_count_exact=complete_scrape,
@@ -677,6 +691,48 @@ def _extract_apply_url(raw_json: dict) -> str:
     return ""
 
 
+def _extract_posted_at(raw_json: dict) -> tuple[str | None, int | None]:
+    if not isinstance(raw_json, dict):
+        return None, None
+
+    for key in ("publishedAt", "first_published", "datePosted", "createdAt"):
+        value = raw_json.get(key)
+        if value in (None, ""):
+            continue
+
+        dt: datetime | None = None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        elif isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                continue
+
+            if candidate.isdigit():
+                timestamp = float(candidate)
+                if timestamp > 10_000_000_000:
+                    timestamp /= 1000.0
+                dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            else:
+                normalized = candidate.replace("Z", "+00:00")
+                try:
+                    dt = datetime.fromisoformat(normalized)
+                except ValueError:
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+
+        if dt is not None:
+            return dt.isoformat(), int(dt.timestamp())
+
+    return None, None
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False, meili_batch_size: int = 1000):
@@ -784,6 +840,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         apply_url = _extract_apply_url(raw)
         skills_text = ', '.join(m.get("hard_skills", []) + m.get("soft_skills", []))
         vibes_text = ', '.join(v.replace('_', ' ') for v in m.get("vibe_tags", []))
+        posted_at, posted_at_ts = _extract_posted_at(raw)
         sal_text = ""
         if sal and sal.get("min"):
             sal_text = f"${sal['min']:,.0f}"
@@ -797,6 +854,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         for value in [primary_industry, *secondary_industry_tags]:
             if isinstance(value, str) and value and value not in all_industry_tags:
                 all_industry_tags.append(value)
+        years_experience = m.get("years_experience") or {}
 
         doc = {
             "meili_id": meili_safe_job_id(row["id"]),
@@ -809,6 +867,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "company_domain": company_domain,
             "company_logo": company_logo,
             "apply_url": apply_url,
+            "posted_at": posted_at,
+            "posted_at_ts": posted_at_ts,
             "description": description[:3000],
             "location": location_str,
             "locations_all": _build_meili_locations_all(m),
@@ -829,6 +889,9 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "salary_fx_usd_per_unit": normalized_salary["salary_fx_usd_per_unit"] if normalized_salary else None,
             "salary_fx_as_of": fx_as_of,
             "salary_transparency": m.get("salary_transparency", "not_disclosed"),
+            "years_experience_min": years_experience.get("min"),
+            "years_experience_max": years_experience.get("max"),
+            "education_level": m.get("education_level"),
             "hard_skills": m.get("hard_skills", []),
             "soft_skills": m.get("soft_skills", []),
             "cool_factor": m.get("cool_factor", "standard"),
@@ -860,6 +923,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         "company_stage", "benefits_categories", "salary_transparency",
         "salary_min", "salary_max",
         "salary_annual_min_usd", "salary_annual_max_usd",
+        "posted_at_ts",
+        "years_experience_min", "years_experience_max", "education_level",
         "work_geoname_ids", "work_country_codes", "work_admin1_keys",
         "applicant_country_codes", "applicant_admin1_keys",
         "job_group", "location_count",
@@ -872,6 +937,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         index.update_sortable_attributes([
         "salary_min", "salary_max",
         "salary_annual_min_usd", "salary_annual_max_usd",
+        "posted_at_ts",
         "_geo",
         ])
         settings = {"pagination": {"maxTotalHits": 500000}}
@@ -979,6 +1045,8 @@ def main():
                               help="Select companies from pipeline_companies instead of a file")
     parser.add_argument("--db-company-limit", type=int, default=None,
                         help="Required safety cap when using --companies-from-db")
+    parser.add_argument("--ats-filter", nargs="+", default=None,
+                        help="Restrict DB company selection to one or more ATS names")
     parser.add_argument("--skip-scrape", action="store_true")
     parser.add_argument("--skip-parse", action="store_true")
     parser.add_argument("--skip-load", action="store_true")
@@ -1021,6 +1089,7 @@ def main():
             companies_path=args.companies,
             companies_from_db=args.companies_from_db,
             db_company_limit=args.db_company_limit,
+            ats_filter=args.ats_filter,
         )
     except ValueError as e:
         parser.error(str(e))

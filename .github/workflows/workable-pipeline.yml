@@ -1,0 +1,75 @@
+name: Workable Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_shards:
+        description: "Total shard count for this rollout"
+        required: true
+        default: "20"
+      db_company_limit:
+        description: "Optional cap on DB-selected Workable companies for this run"
+        required: false
+        default: ""
+      max_per_company:
+        description: "Optional max jobs fetched per company"
+        required: false
+        default: ""
+
+concurrency:
+  group: workable-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-workable-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run sharded Workable scrape
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
+          MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ "${{ matrix.shard_index }}" -ge "${{ inputs.total_shards }}" ]; then
+            echo "Skipping shard ${{ matrix.shard_index }} because total_shards=${{ inputs.total_shards }}"
+            exit 0
+          fi
+
+          ARGS=(
+            --companies-from-db
+            --ats-filter workable
+            --shard-index "${{ matrix.shard_index }}"
+            --total-shards "${{ inputs.total_shards }}"
+            --skip-parse
+            --skip-load
+          )
+
+          if [ -n "${{ inputs.db_company_limit }}" ]; then
+            ARGS+=(--db-company-limit "${{ inputs.db_company_limit }}")
+          fi
+
+          if [ -n "${{ inputs.max_per_company }}" ]; then
+            ARGS+=(--max-per-company "${{ inputs.max_per_company }}")
+          fi
+
+          uv run python pipeline.py "${ARGS[@]}"

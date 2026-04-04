@@ -34,6 +34,7 @@ def init_schema(conn):
             company_name TEXT,
             company_slug TEXT,
             domain TEXT,
+            description TEXT,
             logo_url TEXT,
             scraped_logo_url TEXT,
             boilerplate_hashes JSONB,
@@ -164,6 +165,8 @@ def init_schema(conn):
             added_scraped_logo_url = True
         if ("pipeline_companies", "company_slug") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN company_slug TEXT")
+        if ("pipeline_companies", "description") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN description TEXT")
         if ("pipeline_companies", "boilerplate_hashes") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN boilerplate_hashes JSONB")
         if ("pipeline_jobs", "job_group") not in existing_columns:
@@ -1220,19 +1223,27 @@ def get_geo_place_counts(conn) -> dict[str, int]:
         cur.execute("SELECT kind, COUNT(*) FROM geo_places GROUP BY kind ORDER BY kind")
         return {row[0]: row[1] for row in cur.fetchall()}
 
-def get_companies_to_scrape(conn, limit: int) -> list[tuple[str, str]]:
+def get_companies_to_scrape(conn, limit: int, ats_filter: list[str] | None = None) -> list[tuple[str, str]]:
     """Select a bounded set of active companies for scraping.
 
     Prioritize companies that have never been scraped, then oldest scrape times.
     """
     with conn.cursor() as cur:
-        cur.execute("""
+        query = """
             SELECT ats, board_token
             FROM pipeline_companies
             WHERE active = TRUE
+        """
+        params: list[object] = []
+        if ats_filter:
+            query += " AND ats = ANY(%s)"
+            params.append(ats_filter)
+        query += """
             ORDER BY last_scraped_at NULLS FIRST, ats, board_token
             LIMIT %s
-        """, (limit,))
+        """
+        params.append(limit)
+        cur.execute(query, params)
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
@@ -1342,7 +1353,8 @@ def backfill_public_job_ids(conn, only_missing: bool = True, chunk_size: int = 5
 
 
 def upsert_company(conn, ats: str, board_token: str, company_name: str | None = None,
-                    domain: str | None = None, logo_url: str | None = None,
+                    domain: str | None = None, description: str | None = None,
+                    logo_url: str | None = None,
                     scraped_logo_url: str | None = None,
                     job_count: int = 0, job_count_exact: bool = True):
     """Upsert a company record."""
@@ -1357,14 +1369,15 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO pipeline_companies (
-                ats, board_token, company_name, company_slug, domain, logo_url, scraped_logo_url,
-                last_scraped_at, job_count, active
+                ats, board_token, company_name, company_slug, domain, description,
+                logo_url, scraped_logo_url, last_scraped_at, job_count, active
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s > 0)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s > 0)
             ON CONFLICT (ats, board_token) DO UPDATE SET
                 company_name = COALESCE(EXCLUDED.company_name, pipeline_companies.company_name),
                 company_slug = COALESCE(EXCLUDED.company_slug, pipeline_companies.company_slug),
                 domain = COALESCE(EXCLUDED.domain, pipeline_companies.domain),
+                description = COALESCE(EXCLUDED.description, pipeline_companies.description),
                 logo_url = COALESCE(EXCLUDED.logo_url, pipeline_companies.logo_url),
                 scraped_logo_url = COALESCE(EXCLUDED.scraped_logo_url, pipeline_companies.scraped_logo_url),
                 last_scraped_at = EXCLUDED.last_scraped_at,
@@ -1377,7 +1390,7 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                     ELSE pipeline_companies.active OR EXCLUDED.job_count > 0
                 END
         """, (
-            ats, board_token, company_name, company_slug, domain, logo_url, scraped_logo_url,
+            ats, board_token, company_name, company_slug, domain, description, logo_url, scraped_logo_url,
             now, job_count, job_count, job_count_exact, job_count_exact,
         ))
     conn.commit()

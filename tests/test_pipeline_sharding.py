@@ -1,5 +1,6 @@
 import sys
 import types
+from datetime import datetime, timezone
 
 import pipeline
 from pipeline import filter_companies_for_shard, shard_for_company, should_mark_removed, resolve_companies
@@ -37,6 +38,16 @@ def test_should_mark_removed_only_for_complete_scrapes():
     assert should_mark_removed(3, None) is True
     assert should_mark_removed(3, 10) is True
     assert should_mark_removed(10, 10) is False
+
+
+def test_extract_posted_at_supports_iso_dates_and_epoch_millis():
+    iso_value, iso_ts = pipeline._extract_posted_at({"first_published": "2026-04-01T12:30:00Z"})
+    assert iso_value == "2026-04-01T12:30:00+00:00"
+    assert iso_ts == int(datetime(2026, 4, 1, 12, 30, tzinfo=timezone.utc).timestamp())
+
+    lever_value, lever_ts = pipeline._extract_posted_at({"createdAt": 1715731200000})
+    assert lever_value == "2024-05-15T00:00:00+00:00"
+    assert lever_ts == int(datetime(2024, 5, 15, 0, 0, tzinfo=timezone.utc).timestamp())
 
 
 def test_step_scrape_does_not_overwrite_company_job_count_for_truncated_scrapes(monkeypatch):
@@ -95,19 +106,34 @@ def test_resolve_companies_allows_unbounded_db_selection(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "get_companies_to_scrape",
-        lambda conn, limit: [("greenhouse", "figma")] if limit == 10_000_000 else [],
+        lambda conn, limit, ats_filter=None: [("greenhouse", "figma")] if limit == 10_000_000 and ats_filter is None else [],
     )
     companies = resolve_companies(object(), companies_from_db=True, db_company_limit=None)
     assert companies == [("greenhouse", "figma")]
 
 
 def test_resolve_companies_uses_bounded_db_selection(monkeypatch):
-    monkeypatch.setattr(pipeline, "get_companies_to_scrape", lambda conn, limit: [
+    monkeypatch.setattr(pipeline, "get_companies_to_scrape", lambda conn, limit, ats_filter=None: [
         ("greenhouse", "figma"),
         ("ashby", "openai"),
-    ] if limit == 2 else [])
+    ] if limit == 2 and ats_filter is None else [])
     companies = resolve_companies(object(), companies_from_db=True, db_company_limit=2)
     assert companies == [("greenhouse", "figma"), ("ashby", "openai")]
+
+
+def test_resolve_companies_passes_ats_filter(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape",
+        lambda conn, limit, ats_filter=None: [("workable", "telegraph")] if limit == 5 and ats_filter == ["workable"] else [],
+    )
+    companies = resolve_companies(
+        object(),
+        companies_from_db=True,
+        db_company_limit=5,
+        ats_filter=["workable"],
+    )
+    assert companies == [("workable", "telegraph")]
 
 
 def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
@@ -536,6 +562,8 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
                     "industry_tags": ["enterprise_software"],
                     "salary": None,
                     "salary_transparency": "not_disclosed",
+                    "years_experience": {"min": 3, "max": 5},
+                    "education_level": "bachelors",
                     "hard_skills": [],
                     "soft_skills": [],
                     "cool_factor": "interesting",
@@ -548,7 +576,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
                     "reports_to": "",
                 },
                 "job_group": None,
-                "raw_json": {},
+                "raw_json": {"first_published": "2026-04-01T12:30:00Z"},
             }
         ],
     )
@@ -576,4 +604,12 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
     assert deleted_calls == [["greenhouse__figma__gone"]]
     assert captured["client"]._index.primary_key_arg == "meili_id"
     assert captured["client"]._index.docs[0]["meili_id"] == meili_safe_job_id("greenhouse__figma__123")
+    assert captured["client"]._index.docs[0]["posted_at_ts"] == 1775046600
+    assert captured["client"]._index.docs[0]["years_experience_min"] == 3
+    assert captured["client"]._index.docs[0]["years_experience_max"] == 5
+    assert captured["client"]._index.docs[0]["education_level"] == "bachelors"
+    assert "posted_at_ts" in captured["client"]._index.filterable
+    assert "years_experience_min" in captured["client"]._index.filterable
+    assert "years_experience_max" in captured["client"]._index.filterable
+    assert "education_level" in captured["client"]._index.filterable
     assert captured["client"]._index.deleted == [meili_safe_job_id("greenhouse__figma__gone")]
