@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 
 from bs4 import BeautifulSoup
 
@@ -49,9 +50,103 @@ class WorkableScraper(BaseScraper):
             }
         return self._cached_widget_jobs_by_shortcode
 
+    def _fetch_widget_jobs(self):
+        if not hasattr(self, "_cached_widget_jobs"):
+            self._cached_widget_jobs = self._merge_widget_jobs(
+                list(self._fetch_widget_board().get("jobs", []) or [])
+            )
+        return self._cached_widget_jobs
+
+    def _location_rows_for_job(self, job):
+        rows = []
+        for location in job.get("locations") or []:
+            if isinstance(location, dict):
+                rows.append(
+                    {
+                        "city": location.get("city"),
+                        "region": location.get("region"),
+                        "country": location.get("country"),
+                        "countryCode": location.get("countryCode"),
+                        "hidden": location.get("hidden", False),
+                    }
+                )
+        if rows:
+            return rows
+
+        city = job.get("city")
+        region = job.get("state")
+        country = job.get("country")
+        if city or region or country:
+            rows.append(
+                {
+                    "city": city,
+                    "region": region,
+                    "country": country,
+                    "countryCode": None,
+                    "hidden": False,
+                }
+            )
+        return rows
+
+    def _merge_widget_jobs(self, jobs):
+        merged_jobs = []
+        by_shortcode = {}
+
+        for job in jobs:
+            shortcode = job.get("shortcode")
+            if not shortcode:
+                merged_jobs.append(job)
+                continue
+
+            existing = by_shortcode.get(shortcode)
+            if existing is None:
+                merged = deepcopy(job)
+                merged["locations"] = self._location_rows_for_job(job)
+                by_shortcode[shortcode] = merged
+                merged_jobs.append(merged)
+                continue
+
+            seen_locations = {
+                (
+                    loc.get("city"),
+                    loc.get("region"),
+                    loc.get("country"),
+                    loc.get("countryCode"),
+                )
+                for loc in existing.get("locations") or []
+                if isinstance(loc, dict)
+            }
+            for location in self._location_rows_for_job(job):
+                key = (
+                    location.get("city"),
+                    location.get("region"),
+                    location.get("country"),
+                    location.get("countryCode"),
+                )
+                if key not in seen_locations:
+                    existing.setdefault("locations", []).append(location)
+                    seen_locations.add(key)
+
+            # Fill any missing scalar fields from sibling rows sharing the same shortcode.
+            for field in (
+                "employment_type",
+                "telecommuting",
+                "department",
+                "description",
+                "published_on",
+                "created_at",
+                "education",
+                "experience",
+                "function",
+                "industry",
+            ):
+                if not existing.get(field) and job.get(field):
+                    existing[field] = job.get(field)
+
+        return merged_jobs
+
     def fetch_jobs(self, normalize=True):
-        widget_jobs_by_shortcode = self._fetch_widget_jobs_by_shortcode()
-        for shortcode, merged in widget_jobs_by_shortcode.items():
+        for merged in self._fetch_widget_jobs():
             if normalize:
                 merged = self.normalize_job(merged)
             merged = self.add_default_fields(merged)

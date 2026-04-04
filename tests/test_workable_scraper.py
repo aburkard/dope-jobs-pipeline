@@ -126,3 +126,60 @@ def test_workable_fetch_jobs_uses_widget_only(monkeypatch):
     assert normalized["datePosted"] == "2026-03-17"
     assert normalized["education"] == "Bachelor's Degree"
     assert normalized["requirements"] == ""
+
+
+def test_workable_fetch_jobs_merges_duplicate_shortcodes_into_multi_location_job(monkeypatch):
+    widget_payload = {
+        "name": "LoopMe",
+        "account": "2b41b749-ad30-43ee-b19f-ee7283d36f7c",
+        "description": None,
+        "jobs": [
+            {
+                "title": "AI Platform Senior Software Engineer",
+                "shortcode": "525989D896",
+                "employment_type": "Full-time",
+                "telecommuting": False,
+                "department": "Technology",
+                "url": "https://apply.workable.com/j/525989D896",
+                "application_url": "https://apply.workable.com/j/525989D896/apply",
+                "published_on": "2026-03-17",
+                "created_at": "2026-03-11",
+                "city": "Kraków",
+                "state": "Lesser Poland Voivodeship",
+                "country": "Poland",
+                "locations": [{"country": "Poland", "city": "Kraków", "region": "Lesser Poland Voivodeship"}],
+                "description": "<p>Widget description</p>",
+            },
+            {
+                "title": "AI Platform Senior Software Engineer",
+                "shortcode": "525989D896",
+                "employment_type": "Full-time",
+                "telecommuting": False,
+                "department": "Technology",
+                "url": "https://apply.workable.com/j/525989D896",
+                "application_url": "https://apply.workable.com/j/525989D896/apply",
+                "published_on": "2026-03-17",
+                "created_at": "2026-03-11",
+                "city": "Lviv",
+                "state": "Lviv Oblast",
+                "country": "Ukraine",
+                "locations": [{"country": "Ukraine", "city": "Lviv", "region": "Lviv Oblast"}],
+                "description": "<p>Widget description</p>",
+            },
+        ],
+    }
+
+    scraper = WorkableScraper("loopme")
+    monkeypatch.setattr(
+        scraper.session,
+        "get",
+        lambda *args, **kwargs: DummyResponse(json_data=widget_payload),
+    )
+
+    jobs = list(scraper.fetch_jobs(normalize=True))
+    assert len(jobs) == 1
+    assert jobs[0]["location"] == "Kraków, Lesser Poland Voivodeship, Poland"
+    assert jobs[0]["locations"] == [
+        {"city": "Kraków", "region": "Lesser Poland Voivodeship", "country": "Poland", "countryCode": None, "hidden": False},
+        {"city": "Lviv", "region": "Lviv Oblast", "country": "Ukraine", "countryCode": None, "hidden": False},
+    ]
