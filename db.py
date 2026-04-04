@@ -37,6 +37,9 @@ def init_schema(conn):
             description TEXT,
             logo_url TEXT,
             scraped_logo_url TEXT,
+            scrape_status TEXT,
+            last_scrape_error TEXT,
+            last_http_status INTEGER,
             boilerplate_hashes JSONB,
             last_scraped_at TIMESTAMPTZ,
             job_count INTEGER DEFAULT 0,
@@ -167,6 +170,12 @@ def init_schema(conn):
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN company_slug TEXT")
         if ("pipeline_companies", "description") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN description TEXT")
+        if ("pipeline_companies", "scrape_status") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN scrape_status TEXT")
+        if ("pipeline_companies", "last_scrape_error") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN last_scrape_error TEXT")
+        if ("pipeline_companies", "last_http_status") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN last_http_status INTEGER")
         if ("pipeline_companies", "boilerplate_hashes") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_companies ADD COLUMN boilerplate_hashes JSONB")
         if ("pipeline_jobs", "job_group") not in existing_columns:
@@ -1247,6 +1256,39 @@ def get_companies_to_scrape(conn, limit: int, ats_filter: list[str] | None = Non
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
+def get_companies_to_scrape_by_status(
+    conn,
+    limit: int,
+    ats_filter: list[str] | None = None,
+    scrape_statuses: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Select companies by scrape status, prioritizing pending rows first."""
+    with conn.cursor() as cur:
+        query = """
+            SELECT ats, board_token
+            FROM pipeline_companies
+            WHERE 1 = 1
+        """
+        params: list[object] = []
+        if ats_filter:
+            query += " AND ats = ANY(%s)"
+            params.append(ats_filter)
+        if scrape_statuses:
+            query += " AND COALESCE(scrape_status, 'pending') = ANY(%s)"
+            params.append(scrape_statuses)
+        query += """
+            ORDER BY
+                CASE WHEN COALESCE(scrape_status, 'pending') = 'pending' THEN 0 ELSE 1 END,
+                last_scraped_at NULLS FIRST,
+                ats,
+                board_token
+            LIMIT %s
+        """
+        params.append(limit)
+        cur.execute(query, params)
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+
 def backfill_company_slugs(conn, only_missing: bool = True, chunk_size: int = 1000) -> int:
     """Backfill deterministic public company slugs."""
     query = """
@@ -1352,11 +1394,17 @@ def backfill_public_job_ids(conn, only_missing: bool = True, chunk_size: int = 5
     return total_updated
 
 
+_UNSET = object()
+
+
 def upsert_company(conn, ats: str, board_token: str, company_name: str | None = None,
                     domain: str | None = None, description: str | None = None,
                     logo_url: str | None = None,
                     scraped_logo_url: str | None = None,
-                    job_count: int = 0, job_count_exact: bool = True):
+                    job_count: int = 0, job_count_exact: bool = True,
+                    scrape_status: str | object = _UNSET,
+                    last_scrape_error: str | None | object = _UNSET,
+                    last_http_status: int | None | object = _UNSET):
     """Upsert a company record."""
     now = datetime.now(timezone.utc)
     slug_map = derive_company_slug_map([{
@@ -1366,13 +1414,20 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
         "domain": domain,
     }])
     company_slug = slug_map[(ats, board_token)]
+    scrape_status_is_set = scrape_status is not _UNSET
+    last_scrape_error_is_set = last_scrape_error is not _UNSET
+    last_http_status_is_set = last_http_status is not _UNSET
+    scrape_status_value = None if scrape_status is _UNSET else scrape_status
+    last_scrape_error_value = None if last_scrape_error is _UNSET else last_scrape_error
+    last_http_status_value = None if last_http_status is _UNSET else last_http_status
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO pipeline_companies (
                 ats, board_token, company_name, company_slug, domain, description,
-                logo_url, scraped_logo_url, last_scraped_at, job_count, active
+                logo_url, scraped_logo_url, scrape_status, last_scrape_error, last_http_status,
+                last_scraped_at, job_count, active
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s > 0)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s > 0)
             ON CONFLICT (ats, board_token) DO UPDATE SET
                 company_name = COALESCE(EXCLUDED.company_name, pipeline_companies.company_name),
                 company_slug = COALESCE(EXCLUDED.company_slug, pipeline_companies.company_slug),
@@ -1380,6 +1435,18 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                 description = COALESCE(EXCLUDED.description, pipeline_companies.description),
                 logo_url = COALESCE(EXCLUDED.logo_url, pipeline_companies.logo_url),
                 scraped_logo_url = COALESCE(EXCLUDED.scraped_logo_url, pipeline_companies.scraped_logo_url),
+                scrape_status = CASE
+                    WHEN %s THEN EXCLUDED.scrape_status
+                    ELSE pipeline_companies.scrape_status
+                END,
+                last_scrape_error = CASE
+                    WHEN %s THEN EXCLUDED.last_scrape_error
+                    ELSE pipeline_companies.last_scrape_error
+                END,
+                last_http_status = CASE
+                    WHEN %s THEN EXCLUDED.last_http_status
+                    ELSE pipeline_companies.last_http_status
+                END,
                 last_scraped_at = EXCLUDED.last_scraped_at,
                 job_count = CASE
                     WHEN %s THEN EXCLUDED.job_count
@@ -1391,7 +1458,10 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                 END
         """, (
             ats, board_token, company_name, company_slug, domain, description, logo_url, scraped_logo_url,
-            now, job_count, job_count, job_count_exact, job_count_exact,
+            scrape_status_value, last_scrape_error_value, last_http_status_value,
+            now, job_count, job_count,
+            scrape_status_is_set, last_scrape_error_is_set, last_http_status_is_set,
+            job_count_exact, job_count_exact,
         ))
     conn.commit()
 

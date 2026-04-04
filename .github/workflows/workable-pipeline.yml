@@ -58,6 +58,7 @@ jobs:
           ARGS=(
             --companies-from-db
             --ats-filter workable
+            --scrape-status-filter pending blocked error empty active
             --shard-index "${{ matrix.shard_index }}"
             --total-shards "${{ inputs.total_shards }}"
             --skip-parse

@@ -1,10 +1,18 @@
 from __future__ import annotations
 from copy import deepcopy
+import re
 
 from bs4 import BeautifulSoup
 
 from .base_scraper import BaseScraper
 import utils
+
+
+class WorkableScrapeError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None, blocked: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.blocked = blocked
 
 
 class WorkableScraper(BaseScraper):
@@ -37,7 +45,29 @@ class WorkableScraper(BaseScraper):
         if not hasattr(self, "_cached_widget_board"):
             url = f"{self.base_url}/api/v1/widget/accounts/{self.board_token}?details=true"
             response = self.session.get(url, timeout=20)
-            self._cached_widget_board = response.json()
+            text = response.text or ""
+            title_match = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
+            title = title_match.group(1).strip() if title_match else None
+            if response.headers.get("cf-mitigated") == "challenge" or title == "Security challenge":
+                raise WorkableScrapeError("Cloudflare challenge", status_code=response.status_code, blocked=True)
+            if not response.ok:
+                raise WorkableScrapeError(
+                    f"HTTP {response.status_code} from Workable widget",
+                    status_code=response.status_code,
+                )
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise WorkableScrapeError(
+                    f"Invalid JSON from Workable widget: {exc}",
+                    status_code=response.status_code,
+                ) from exc
+            if not isinstance(payload, dict) or "jobs" not in payload:
+                raise WorkableScrapeError(
+                    "Unexpected payload from Workable widget",
+                    status_code=response.status_code,
+                )
+            self._cached_widget_board = payload
         return self._cached_widget_board
 
     def _fetch_widget_jobs_by_shortcode(self):

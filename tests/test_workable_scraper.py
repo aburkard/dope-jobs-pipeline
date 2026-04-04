@@ -1,12 +1,15 @@
 from scrapers.workable_scraper import WorkableScraper
+from scrapers.workable_scraper import WorkableScrapeError
 
 
 class DummyResponse:
-    def __init__(self, *, text=None, json_data=None, url=None, ok=True):
+    def __init__(self, *, text=None, json_data=None, url=None, ok=True, status_code=200, headers=None):
         self.text = text or ""
         self._json_data = json_data
         self.url = url or "https://apply.workable.com/loopme/"
         self.ok = ok
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def json(self):
         return self._json_data
@@ -126,6 +129,28 @@ def test_workable_fetch_jobs_uses_widget_only(monkeypatch):
     assert normalized["datePosted"] == "2026-03-17"
     assert normalized["education"] == "Bachelor's Degree"
     assert normalized["requirements"] == ""
+
+
+def test_workable_widget_challenge_raises_blocked_error(monkeypatch):
+    scraper = WorkableScraper("loopme")
+    monkeypatch.setattr(
+        scraper.session,
+        "get",
+        lambda *args, **kwargs: DummyResponse(
+            text="<html><title>Security challenge</title></html>",
+            ok=False,
+            status_code=403,
+            headers={"cf-mitigated": "challenge"},
+        ),
+    )
+
+    try:
+        scraper.fetch_job_board()
+    except WorkableScrapeError as exc:
+        assert exc.blocked is True
+        assert exc.status_code == 403
+    else:
+        raise AssertionError("Expected WorkableScrapeError")
 
 
 def test_workable_fetch_jobs_merges_duplicate_shortcodes_into_multi_location_job(monkeypatch):

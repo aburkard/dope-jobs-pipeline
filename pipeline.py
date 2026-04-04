@@ -37,6 +37,7 @@ from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
     record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
+    get_companies_to_scrape_by_status,
     get_existing_jobs_for_board, get_latest_fx_rates, mark_jobs_meili_deleted,
     mark_jobs_meili_loaded,
 )
@@ -146,12 +147,20 @@ def parse_companies_file(path: str) -> list[tuple[str, str]]:
 def resolve_companies(conn, companies_path: str | None = None,
                       companies_from_db: bool = False,
                       db_company_limit: int | None = None,
-                      ats_filter: list[str] | None = None) -> list[tuple[str, str]]:
+                      ats_filter: list[str] | None = None,
+                      scrape_status_filter: list[str] | None = None) -> list[tuple[str, str]]:
     """Resolve companies from either a file or a bounded DB query."""
     if companies_from_db:
         if db_company_limit is not None and db_company_limit <= 0:
             raise ValueError("--db-company-limit must be greater than 0")
         limit = db_company_limit if db_company_limit is not None else 10_000_000
+        if scrape_status_filter:
+            return get_companies_to_scrape_by_status(
+                conn,
+                limit=limit,
+                ats_filter=ats_filter,
+                scrape_statuses=scrape_status_filter,
+            )
         return get_companies_to_scrape(conn, limit=limit, ats_filter=ats_filter)
 
     if not companies_path:
@@ -215,26 +224,43 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                 for jid, raw in existing_jobs.items()
             }
 
-            if ats == "jobvite":
-                existing_details = {
-                    short_id: {
-                        "description": raw.get("description", ""),
-                        "descriptionHtml": raw.get("descriptionHtml", ""),
-                        "datePosted": raw.get("datePosted"),
-                        "validThrough": raw.get("validThrough"),
-                        "inactive": raw.get("inactive", False),
+            try:
+                if ats == "jobvite":
+                    existing_details = {
+                        short_id: {
+                            "description": raw.get("description", ""),
+                            "descriptionHtml": raw.get("descriptionHtml", ""),
+                            "datePosted": raw.get("datePosted"),
+                            "validThrough": raw.get("validThrough"),
+                            "inactive": raw.get("inactive", False),
+                        }
+                        for short_id, raw in existing_jobs_by_short_id.items()
+                        if raw.get("description") or raw.get("descriptionHtml") or raw.get("datePosted") or raw.get("inactive")
                     }
-                    for short_id, raw in existing_jobs_by_short_id.items()
-                    if raw.get("description") or raw.get("descriptionHtml") or raw.get("datePosted") or raw.get("inactive")
-                }
-                job_iter = scraper.fetch_jobs(
-                    existing_details=existing_details,
-                    refetch_existing_detail=jobvite_refetch_existing_detail,
+                    job_iter = scraper.fetch_jobs(
+                        existing_details=existing_details,
+                        refetch_existing_detail=jobvite_refetch_existing_detail,
+                    )
+                    jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
+                else:
+                    job_iter = scraper.fetch_jobs()
+                    jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
+            except Exception as scrape_error:
+                http_status = getattr(scrape_error, "status_code", None)
+                scrape_status = "blocked" if getattr(scrape_error, "blocked", False) else "error"
+                upsert_company(
+                    conn,
+                    ats,
+                    token,
+                    job_count=0,
+                    job_count_exact=False,
+                    scrape_status=scrape_status,
+                    last_scrape_error=str(scrape_error),
+                    last_http_status=http_status,
                 )
-                jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
-            else:
-                job_iter = scraper.fetch_jobs()
-                jobs = list(job_iter) if max_per_company is None else list(itertools.islice(job_iter, max_per_company))
+                print(f"  [{idx}/{total_companies}] {ats}:{token} — {scrape_status}: {scrape_error}")
+                errors += 1
+                continue
 
             # Detect changes against DB
             result = upsert_scraped_jobs(conn, jobs)
@@ -311,6 +337,9 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
                 scraped_logo_url=company_logo,
                 job_count=len(jobs),
                 job_count_exact=complete_scrape,
+                scrape_status="active" if jobs else "empty",
+                last_scrape_error=None,
+                last_http_status=200,
             )
 
             status_parts = []
@@ -1047,6 +1076,8 @@ def main():
                         help="Required safety cap when using --companies-from-db")
     parser.add_argument("--ats-filter", nargs="+", default=None,
                         help="Restrict DB company selection to one or more ATS names")
+    parser.add_argument("--scrape-status-filter", nargs="+", default=None,
+                        help="Restrict DB company selection to one or more scrape statuses")
     parser.add_argument("--skip-scrape", action="store_true")
     parser.add_argument("--skip-parse", action="store_true")
     parser.add_argument("--skip-load", action="store_true")
@@ -1090,6 +1121,7 @@ def main():
             companies_from_db=args.companies_from_db,
             db_company_limit=args.db_company_limit,
             ats_filter=args.ats_filter,
+            scrape_status_filter=args.scrape_status_filter,
         )
     except ValueError as e:
         parser.error(str(e))

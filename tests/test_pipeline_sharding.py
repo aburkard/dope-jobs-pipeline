@@ -136,6 +136,24 @@ def test_resolve_companies_passes_ats_filter(monkeypatch):
     assert companies == [("workable", "telegraph")]
 
 
+def test_resolve_companies_passes_scrape_status_filter(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "get_companies_to_scrape_by_status",
+        lambda conn, limit, ats_filter=None, scrape_statuses=None: (
+            [("workable", "loopme")] if limit == 5 and ats_filter == ["workable"] and scrape_statuses == ["pending", "error"] else []
+        ),
+    )
+    companies = resolve_companies(
+        object(),
+        companies_from_db=True,
+        db_company_limit=5,
+        ats_filter=["workable"],
+        scrape_status_filter=["pending", "error"],
+    )
+    assert companies == [("workable", "loopme")]
+
+
 def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
     class FakeScraper:
         def __init__(self, token):
