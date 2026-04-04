@@ -1,6 +1,8 @@
 """Tests for db.py — content hash, job_id, change detection."""
+from datetime import datetime, timezone
+
 import pytest
-from db import content_hash, job_id, parse_batch_selection_where
+from db import content_hash, current_meili_doc_version, job_id, parse_batch_selection_where
 
 
 class TestContentHash:
@@ -62,6 +64,13 @@ class TestJobId:
         job = {"ats_name": "greenhouse", "board_token": "anthropic"}
         result = job_id(job)
         assert result == "greenhouse__anthropic__"
+
+
+def test_current_meili_doc_version_changes_when_job_group_changes():
+    parsed_at = datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc)
+    version_a = current_meili_doc_version("hash", parsed_at, "group-a", "job-1")
+    version_b = current_meili_doc_version("hash", parsed_at, "group-b", "job-1")
+    assert version_a != version_b
 
 
 class TestScraperNormalization:

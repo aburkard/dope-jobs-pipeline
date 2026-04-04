@@ -8,8 +8,9 @@ import difflib
 from collections import defaultdict
 from dotenv import load_dotenv
 load_dotenv()
+from psycopg2.extras import execute_values
 
-from db import get_connection, content_hash as content_hash_str
+from db import get_connection
 from parse import prepare_job_text
 
 
@@ -73,31 +74,45 @@ def _cluster_candidate_jobs(candidate_ids: list[str], hashes: dict[str, str], te
     return clusters
 
 
-def compute_job_groups(conn) -> dict:
-    """Compute job_group assignments for all parsed jobs.
+def _board_scope_sql(boards: list[tuple[str, str]] | None) -> tuple[str, list[str]]:
+    if not boards:
+        return "", []
+
+    clauses = []
+    params: list[str] = []
+    for ats, board_token in boards:
+        clauses.append("(ats = %s AND board_token = %s)")
+        params.extend([ats, board_token])
+    return " AND (" + " OR ".join(clauses) + ")", params
+
+
+def compute_job_groups(conn, boards: list[tuple[str, str]] | None = None) -> tuple[dict, dict]:
+    """Compute job_group assignments for live jobs in the selected scope.
 
     Returns dict of {job_id: job_group_hash} for jobs that belong to a group.
     Jobs with no group (unique postings) are not included.
     """
+    where_scope, params = _board_scope_sql(boards)
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, board_token, title, raw_json, content_hash
+        cur.execute(f"""
+            SELECT id, ats, board_token, title, raw_json, content_hash
             FROM pipeline_jobs
-            WHERE parsed_json IS NOT NULL AND removed_at IS NULL
+            WHERE raw_json IS NOT NULL AND removed_at IS NULL
+            {where_scope}
             ORDER BY board_token, title
-        """)
+        """, params)
         rows = cur.fetchall()
 
-    # Group candidates by company + normalized title
+    # Group candidates by ATS board + normalized title
     by_key = defaultdict(list)
-    for job_id, board, title, raw_json, stored_hash in rows:
+    for job_id, ats_name, board, title, raw_json, stored_hash in rows:
         normalized_title = (title or "").strip()
-        by_key[(board, normalized_title)].append((job_id, raw_json, stored_hash))
+        by_key[(ats_name, board, normalized_title)].append((job_id, raw_json, stored_hash))
 
     groups = {}
     group_stats = {"groups": 0, "grouped_jobs": 0, "singletons": 0}
 
-    for (board, title), candidates in by_key.items():
+    for (ats_name, board, title), candidates in by_key.items():
         if len(candidates) == 1:
             group_stats["singletons"] += 1
             continue
@@ -122,7 +137,7 @@ def compute_job_groups(conn) -> dict:
         # Assign group hashes
         for ci, cluster in enumerate(merged_clusters):
             suffix = f"__{ci}" if ci > 0 else ""
-            group_hash = hashlib.sha256(f"{board}__{title}{suffix}".encode()).hexdigest()[:16]
+            group_hash = hashlib.sha256(f"{ats_name}__{board}__{title}{suffix}".encode()).hexdigest()[:16]
             for jid in cluster:
                 groups[jid] = group_hash
             group_stats["groups"] += 1
@@ -131,22 +146,82 @@ def compute_job_groups(conn) -> dict:
     return groups, group_stats
 
 
-def save_job_groups(conn, groups: dict):
-    """Save job_group assignments to DB and update MeiliSearch documents."""
+def save_job_groups(conn, groups: dict, boards: list[tuple[str, str]] | None = None) -> list[str]:
+    """Save job_group assignments to DB for the selected scope.
+
+    Returns job ids whose persisted job_group changed.
+    """
     # Add job_group column if not exists
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE pipeline_jobs ADD COLUMN IF NOT EXISTS job_group TEXT")
     conn.commit()
 
-    # Clear existing groups
+    where_scope, params = _board_scope_sql(boards)
+    existing_query = f"""
+        SELECT id, job_group
+        FROM pipeline_jobs
+        WHERE removed_at IS NULL
+        {where_scope}
+    """
     with conn.cursor() as cur:
-        cur.execute("UPDATE pipeline_jobs SET job_group = NULL")
+        cur.execute(existing_query, params)
+        existing = {job_id: job_group for job_id, job_group in cur.fetchall()}
 
-    # Set new groups
-    for job_id, group_hash in groups.items():
-        with conn.cursor() as cur:
-            cur.execute("UPDATE pipeline_jobs SET job_group = %s WHERE id = %s", (group_hash, job_id))
+    previous_counts: dict[str, int] = defaultdict(int)
+    for previous_group in existing.values():
+        if previous_group:
+            previous_counts[previous_group] += 1
+
+    new_counts: dict[str, int] = defaultdict(int)
+    for new_group in groups.values():
+        if new_group:
+            new_counts[new_group] += 1
+
+    changed_ids = []
+    for job_id, previous_group in existing.items():
+        new_group = groups.get(job_id)
+        previous_count = previous_counts.get(previous_group, 1 if previous_group is None else 0)
+        new_count = new_counts.get(new_group, 1 if new_group is None else 0)
+        if previous_group != new_group or previous_count != new_count:
+            changed_ids.append(job_id)
+
+    clear_query = f"""
+        UPDATE pipeline_jobs
+        SET job_group = NULL
+        WHERE removed_at IS NULL
+        {where_scope}
+    """
+    with conn.cursor() as cur:
+        cur.execute(clear_query, params)
+        if groups:
+            execute_values(
+                cur,
+                """
+                WITH incoming(job_id, group_hash) AS (VALUES %s)
+                UPDATE pipeline_jobs AS pj
+                SET job_group = incoming.group_hash
+                FROM incoming
+                WHERE pj.id = incoming.job_id
+                """,
+                [(job_id, group_hash) for job_id, group_hash in groups.items()],
+                template="(%s, %s)",
+            )
     conn.commit()
+    return changed_ids
+
+
+def recompute_job_groups_for_boards(conn, boards: list[tuple[str, str]]) -> tuple[list[str], dict]:
+    """Recompute job groups for a bounded set of boards.
+
+    Returns (changed_job_ids, stats).
+    """
+    normalized = sorted({(ats, board_token) for ats, board_token in boards})
+    if not normalized:
+        return [], {"groups": 0, "grouped_jobs": 0, "singletons": 0}
+
+    groups, stats = compute_job_groups(conn, boards=normalized)
+    changed_ids = save_job_groups(conn, groups, boards=normalized)
+    return changed_ids, stats
 
 
 def get_group_summary(conn) -> list[dict]:

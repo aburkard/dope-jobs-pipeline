@@ -25,6 +25,19 @@ def get_connection():
     return psycopg2.connect(url)
 
 
+def current_meili_doc_version(
+    content_hash: str | None,
+    last_parsed_at: datetime | None,
+    job_group: str | None,
+    job_id_value: str,
+) -> str:
+    """Compute a version hash for fields that materially shape the Meili doc."""
+    effective_group = job_group or job_id_value
+    parsed_at = last_parsed_at.isoformat() if last_parsed_at is not None else ""
+    payload = f"{content_hash or ''}|{parsed_at}|{effective_group}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
 def init_schema(conn):
     """Create tables if they don't exist."""
     create_statements = [
@@ -67,6 +80,7 @@ def init_schema(conn):
             meili_loaded_at TIMESTAMPTZ,
             meili_loaded_content_hash TEXT,
             meili_loaded_last_parsed_at TIMESTAMPTZ,
+            meili_loaded_doc_version TEXT,
             raw_json JSONB,
             parsed_json JSONB
         )""",
@@ -194,6 +208,8 @@ def init_schema(conn):
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_content_hash TEXT")
         if ("pipeline_jobs", "meili_loaded_last_parsed_at") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_last_parsed_at TIMESTAMPTZ")
+        if ("pipeline_jobs", "meili_loaded_doc_version") not in existing_columns:
+            alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN meili_loaded_doc_version TEXT")
         if ("pipeline_jobs", "recommendations_generated_at") not in existing_columns:
             alter_statements.append("ALTER TABLE pipeline_jobs ADD COLUMN recommendations_generated_at TIMESTAMPTZ")
         if ("pipeline_jobs", "recommendations_algorithm_version") not in existing_columns:
@@ -542,8 +558,24 @@ def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int
         WHERE removed_at IS NULL
           AND parsed_json IS NOT NULL
           AND (
-              meili_loaded_content_hash IS DISTINCT FROM content_hash
-              OR meili_loaded_last_parsed_at IS DISTINCT FROM last_parsed_at
+              (
+                  meili_loaded_doc_version IS NULL
+                  AND (
+                      meili_loaded_content_hash IS DISTINCT FROM content_hash
+                      OR meili_loaded_last_parsed_at IS DISTINCT FROM last_parsed_at
+                  )
+              )
+              OR (
+                  meili_loaded_doc_version IS NOT NULL
+                  AND meili_loaded_doc_version IS DISTINCT FROM md5(
+                      concat_ws(
+                          '|',
+                          COALESCE(content_hash, ''),
+                          COALESCE(last_parsed_at::text, ''),
+                          COALESCE(job_group, id)
+                      )
+                  )
+              )
           )
     """
     params: list[object] = []
@@ -569,7 +601,15 @@ def mark_jobs_meili_loaded(conn, job_ids: list[str]) -> None:
             UPDATE pipeline_jobs
             SET meili_loaded_at = NOW(),
                 meili_loaded_content_hash = content_hash,
-                meili_loaded_last_parsed_at = last_parsed_at
+                meili_loaded_last_parsed_at = last_parsed_at,
+                meili_loaded_doc_version = md5(
+                    concat_ws(
+                        '|',
+                        COALESCE(content_hash, ''),
+                        COALESCE(last_parsed_at::text, ''),
+                        COALESCE(job_group, id)
+                    )
+                )
             WHERE id = ANY(%s)
             """,
             (job_ids,),
@@ -587,7 +627,8 @@ def mark_jobs_meili_deleted(conn, job_ids: list[str]) -> None:
             UPDATE pipeline_jobs
             SET meili_loaded_at = NULL,
                 meili_loaded_content_hash = NULL,
-                meili_loaded_last_parsed_at = NULL
+                meili_loaded_last_parsed_at = NULL,
+                meili_loaded_doc_version = NULL
             WHERE id = ANY(%s)
             """,
             (job_ids,),

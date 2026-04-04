@@ -43,6 +43,7 @@ from db import (
 )
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
+from job_groups import recompute_job_groups_for_boards
 
 
 ATS_SCRAPERS = {
@@ -212,6 +213,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
     errors = 0
     touched_job_ids = set()
     removed_job_ids = set()
+    successful_boards: set[tuple[str, str]] = set()
 
     total_companies = len(companies)
     for idx, (ats, token) in enumerate(companies, start=1):
@@ -365,6 +367,7 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
             touched_job_ids.update(job_id(job) for job in result["new"])
             touched_job_ids.update(job_id(job) for job in result["changed"])
             removed_job_ids.update(removed_ids)
+            successful_boards.add((ats, token))
 
         except Exception as e:
             errors += 1
@@ -378,11 +381,27 @@ def step_scrape(conn, companies: list[tuple[str, str]], max_per_company: int | N
 
         time.sleep(0.3)
 
+    job_group_changed_job_ids: set[str] = set()
+    job_group_stats = {"groups": 0, "grouped_jobs": 0, "singletons": 0}
+    if successful_boards:
+        changed_ids, job_group_stats = recompute_job_groups_for_boards(conn, list(successful_boards))
+        job_group_changed_job_ids = set(changed_ids)
+        if changed_ids:
+            print(
+                "Job groups refreshed: "
+                f"{job_group_stats['groups']} groups, "
+                f"{job_group_stats['grouped_jobs']} grouped jobs, "
+                f"{len(changed_ids)} changed rows"
+            )
+        else:
+            print("Job groups refreshed: no changes")
+
     print(f"\nScrape complete: {total_new} new, {total_changed} changed, "
           f"{total_unchanged} unchanged, {total_removed} removed, {errors} errors")
     return {
         "touched_job_ids": touched_job_ids,
         "removed_job_ids": removed_job_ids,
+        "job_group_changed_job_ids": job_group_changed_job_ids,
         "new_count": total_new,
         "changed_count": total_changed,
         "removed_count": total_removed,
@@ -1195,7 +1214,7 @@ def main():
     if args.total_shards is not None:
         print(f"Using shard {args.shard_index}/{args.total_shards}: {len(selected_companies)} of {len(companies)} companies")
 
-    scrape_result = {"touched_job_ids": set(), "removed_job_ids": set()}
+    scrape_result = {"touched_job_ids": set(), "removed_job_ids": set(), "job_group_changed_job_ids": set()}
     parsed_job_ids = []
 
     # Step 1: Scrape + detect changes
@@ -1228,11 +1247,12 @@ def main():
     # Step 3: Load to MeiliSearch
     if not args.skip_load:
         meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
+        jobs_to_load = list(set(parsed_job_ids) | set(scrape_result.get("job_group_changed_job_ids", set())))
         step_load(
             conn,
             meili_host=meili_host,
             meili_key=args.meili_key,
-            parsed_job_ids=parsed_job_ids,
+            parsed_job_ids=jobs_to_load,
             removed_job_ids=list(scrape_result["removed_job_ids"]),
             full_reload=args.full_load,
         )

@@ -90,6 +90,7 @@ def test_step_scrape_does_not_overwrite_company_job_count_for_truncated_scrapes(
         "unchanged": 0,
         "needs_detail_fetch": [],
     })
+    monkeypatch.setattr(pipeline, "recompute_job_groups_for_boards", lambda conn, boards: ([], {"groups": 0, "grouped_jobs": 0, "singletons": 0}))
     monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
     monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
 
@@ -259,6 +260,7 @@ def test_step_scrape_reuses_existing_jobvite_descriptions(monkeypatch):
         "unchanged": 0,
         "needs_detail_fetch": [],
     })
+    monkeypatch.setattr(pipeline, "recompute_job_groups_for_boards", lambda conn, boards: ([], {"groups": 0, "grouped_jobs": 0, "singletons": 0}))
     monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
     monkeypatch.setattr(pipeline, "upsert_company", lambda *args, **kwargs: None)
     monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
@@ -344,6 +346,7 @@ def test_step_scrape_without_cap_fetches_all_jobs(monkeypatch):
         "unchanged": 0,
         "needs_detail_fetch": [],
     })
+    monkeypatch.setattr(pipeline, "recompute_job_groups_for_boards", lambda conn, boards: ([], {"groups": 0, "grouped_jobs": 0, "singletons": 0}))
     monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
     monkeypatch.setattr(pipeline, "upsert_company", lambda *args, **kwargs: None)
     monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
@@ -351,6 +354,67 @@ def test_step_scrape_without_cap_fetches_all_jobs(monkeypatch):
     result = pipeline.step_scrape(object(), [("greenhouse", "figma")], max_per_company=None)
 
     assert result["new_count"] == 3
+
+
+def test_step_scrape_refreshes_job_groups_for_successful_boards_only(monkeypatch):
+    class GoodScraper:
+        def __init__(self, token):
+            self.token = token
+
+        def fetch_jobs(self):
+            yield {
+                "id": f"greenhouse__{self.token}__1",
+                "ats_name": "greenhouse",
+                "board_token": self.token,
+                "title": "Engineer",
+            }
+
+        def get_company_name(self):
+            return self.token
+
+        def get_company_domain(self):
+            return f"{self.token}.example.com"
+
+        def get_company_logo_url(self):
+            return None
+
+    class BadScraper:
+        def __init__(self, token):
+            self.token = token
+
+        def fetch_jobs(self):
+            raise RuntimeError("boom")
+
+    captured = {}
+    monkeypatch.setitem(pipeline.ATS_SCRAPERS, "greenhouse", GoodScraper)
+    monkeypatch.setitem(pipeline.ATS_SCRAPERS, "lever", BadScraper)
+    monkeypatch.setattr(pipeline, "get_existing_jobs_for_board", lambda conn, ats, token: {})
+    monkeypatch.setattr(pipeline, "upsert_scraped_jobs", lambda conn, jobs: {
+        "new": jobs,
+        "changed": [],
+        "unchanged": 0,
+        "needs_detail_fetch": [],
+    })
+    monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
+    monkeypatch.setattr(pipeline, "upsert_company", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline,
+        "recompute_job_groups_for_boards",
+        lambda conn, boards: (
+            captured.setdefault("boards", list(boards)) and ["greenhouse__figma__1"],
+            {"groups": 1, "grouped_jobs": 2, "singletons": 0},
+        ),
+    )
+    monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
+
+    result = pipeline.step_scrape(
+        object(),
+        [("greenhouse", "figma"), ("lever", "spotify")],
+        max_per_company=5,
+    )
+
+    assert captured["boards"] == [("greenhouse", "figma")]
+    assert result["job_group_changed_job_ids"] == {"greenhouse__figma__1"}
 
 
 def test_step_scrape_recovers_closed_db_connection_between_companies(monkeypatch):
@@ -415,6 +479,7 @@ def test_step_scrape_recovers_closed_db_connection_between_companies(monkeypatch
         "unchanged": 0,
         "needs_detail_fetch": [],
     })
+    monkeypatch.setattr(pipeline, "recompute_job_groups_for_boards", lambda conn, boards: ([], {"groups": 0, "grouped_jobs": 0, "singletons": 0}))
     monkeypatch.setattr(pipeline, "mark_removed", lambda conn, ats, token, seen_ids: [])
     monkeypatch.setattr(pipeline, "upsert_company", lambda conn, ats, token, **kwargs: company_updates.append((token, conn)))
     monkeypatch.setattr(pipeline, "time", type("T", (), {"sleep": staticmethod(lambda _: None)}))
@@ -432,6 +497,37 @@ def test_step_scrape_recovers_closed_db_connection_between_companies(monkeypatch
     assert good_conn_seen == [reconnected[0]]
     assert company_updates == [("healthy", reconnected[0])]
     assert result["conn"] is reconnected[0]
+
+
+def test_main_loads_job_group_changed_rows(monkeypatch):
+    captured = {}
+
+    class FakeConn:
+        closed = 0
+
+        def close(self):
+            self.closed = 1
+
+    monkeypatch.setattr(sys, "argv", ["pipeline.py", "--companies", "companies.txt", "--skip-parse"])
+    monkeypatch.setattr(pipeline, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(pipeline, "init_schema", lambda conn: None)
+    monkeypatch.setattr(pipeline, "resolve_companies", lambda *args, **kwargs: [("greenhouse", "figma")])
+    monkeypatch.setattr(pipeline, "filter_companies_for_shard", lambda companies, shard_index, total_shards: companies)
+    monkeypatch.setattr(
+        pipeline,
+        "step_scrape",
+        lambda conn, companies, max_per_company=None, jobvite_refetch_existing_detail=False: {
+            "touched_job_ids": set(),
+            "removed_job_ids": set(),
+            "job_group_changed_job_ids": {"group-only-1", "group-only-2"},
+            "conn": conn,
+        },
+    )
+    monkeypatch.setattr(pipeline, "step_load", lambda conn, **kwargs: captured.setdefault("kwargs", kwargs))
+
+    pipeline.main()
+
+    assert set(captured["kwargs"]["parsed_job_ids"]) == {"group-only-1", "group-only-2"}
 
 
 def test_build_meili_location_uses_remote_applicant_geography():
