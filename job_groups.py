@@ -31,6 +31,17 @@ def content_similarity(text_a: str, text_b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _length_similarity_upper_bound(text_a: str, text_b: str) -> float:
+    """Return a safe upper bound on SequenceMatcher ratio from string lengths alone."""
+    len_a = len(text_a)
+    len_b = len(text_b)
+    if len_a == 0 and len_b == 0:
+        return 1.0
+    if len_a == 0 or len_b == 0:
+        return 0.0
+    return (2 * min(len_a, len_b)) / (len_a + len_b)
+
+
 def _cluster_candidate_jobs(candidate_ids: list[str], hashes: dict[str, str], texts: dict[str, str]) -> list[list[str]]:
     """Build connected components for duplicate candidates.
 
@@ -42,36 +53,67 @@ def _cluster_candidate_jobs(candidate_ids: list[str], hashes: dict[str, str], te
     if len(candidate_ids) < 2:
         return []
 
-    adjacency: dict[str, set[str]] = {jid: set() for jid in candidate_ids}
+    parent: dict[str, str] = {jid: jid for jid in candidate_ids}
 
-    for idx, jid in enumerate(candidate_ids):
-        for other_jid in candidate_ids[idx + 1:]:
-            same_hash = hashes.get(jid) and hashes.get(jid) == hashes.get(other_jid)
-            similar = False
-            if not same_hash and jid in texts and other_jid in texts:
-                similar = content_similarity(texts[jid], texts[other_jid]) >= SIMILARITY_THRESHOLD
-            if same_hash or similar:
-                adjacency[jid].add(other_jid)
-                adjacency[other_jid].add(jid)
+    def find(jid: str) -> str:
+        root = jid
+        while parent[root] != root:
+            root = parent[root]
+        while parent[jid] != jid:
+            next_jid = parent[jid]
+            parent[jid] = root
+            jid = next_jid
+        return root
 
-    clusters: list[list[str]] = []
-    visited: set[str] = set()
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    hash_buckets: dict[str, list[str]] = defaultdict(list)
     for jid in candidate_ids:
-        if jid in visited or not adjacency[jid]:
-            continue
-        stack = [jid]
-        component: list[str] = []
-        while stack:
-            current = stack.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            component.append(current)
-            stack.extend(sorted(adjacency[current] - visited))
-        if len(component) > 1:
-            clusters.append(sorted(component))
+        group_hash = hashes.get(jid) or ""
+        if group_hash:
+            hash_buckets[group_hash].append(jid)
+    for bucket in hash_buckets.values():
+        first = bucket[0]
+        for other_jid in bucket[1:]:
+            union(first, other_jid)
 
-    return clusters
+    comparison_ids = [jid for jid in candidate_ids if jid in texts]
+    if len(comparison_ids) >= 2:
+        stripped_texts = {jid: strip_metadata_lines(texts[jid]) for jid in comparison_ids}
+        exact_text_buckets: dict[str, list[str]] = defaultdict(list)
+        for jid in comparison_ids:
+            exact_text_buckets[stripped_texts[jid]].append(jid)
+
+        representatives: list[str] = []
+        for bucket in exact_text_buckets.values():
+            first = bucket[0]
+            representatives.append(first)
+            for other_jid in bucket[1:]:
+                union(first, other_jid)
+
+        for idx, jid in enumerate(representatives):
+            stripped_jid = stripped_texts[jid]
+            for other_jid in representatives[idx + 1:]:
+                if find(jid) == find(other_jid):
+                    continue
+                stripped_other = stripped_texts[other_jid]
+                if _length_similarity_upper_bound(stripped_jid, stripped_other) < SIMILARITY_THRESHOLD:
+                    continue
+                if content_similarity(texts[jid], texts[other_jid]) >= SIMILARITY_THRESHOLD:
+                    union(jid, other_jid)
+
+    clusters_by_root: dict[str, list[str]] = defaultdict(list)
+    for jid in candidate_ids:
+        clusters_by_root[find(jid)].append(jid)
+
+    return sorted(
+        (sorted(cluster) for cluster in clusters_by_root.values() if len(cluster) > 1),
+        key=lambda cluster: cluster[0],
+    )
 
 
 def _board_scope_sql(boards: list[tuple[str, str]] | None) -> tuple[str, list[str]]:
@@ -117,16 +159,38 @@ def compute_job_groups(conn, boards: list[tuple[str, str]] | None = None) -> tup
             group_stats["singletons"] += 1
             continue
 
-        # Prepare texts and collect content hashes
+        # Only prepare text for representatives that may need text similarity.
         texts = {}
         hashes = {}
+        raw_by_id: dict[str, dict] = {}
+        seen_non_empty_hashes: set[str] = set()
+        non_empty_hash_representatives = 0
+        empty_hash_candidates = 0
         for job_id, raw_json, stored_hash in candidates:
+            group_hash = stored_hash or ""
+            hashes[job_id] = group_hash
             if raw_json:
-                texts[job_id] = prepare_job_text(raw_json)
-            hashes[job_id] = stored_hash or ""
+                raw_by_id[job_id] = raw_json
+            if group_hash:
+                if group_hash not in seen_non_empty_hashes:
+                    non_empty_hash_representatives += 1
+                    seen_non_empty_hashes.add(group_hash)
+            else:
+                empty_hash_candidates += 1
 
-        if len(texts) < 2:
-            continue
+        needs_text_similarity = empty_hash_candidates > 0 or non_empty_hash_representatives > 1
+        if needs_text_similarity:
+            seen_non_empty_hashes.clear()
+            for job_id, _, stored_hash in candidates:
+                raw_json = raw_by_id.get(job_id)
+                if not raw_json:
+                    continue
+                group_hash = stored_hash or ""
+                if group_hash:
+                    if group_hash in seen_non_empty_hashes:
+                        continue
+                    seen_non_empty_hashes.add(group_hash)
+                texts[job_id] = prepare_job_text(raw_json)
 
         merged_clusters = _cluster_candidate_jobs(
             [job_id for job_id, _, _ in candidates],

@@ -165,6 +165,9 @@ class GeoResolver:
         city = _clean_str(resolved.get("city"))
         state = _clean_str(resolved.get("state"))
         country_code = _normalize_country_code(resolved.get("country_code"))
+        if country_code and len(country_code) != 2:
+            country_match = self._resolve_country(country_code)
+            country_code = country_match["country_code"] if country_match else None
 
         if label and REMOTEISH_RE.search(label) and not city:
             return None

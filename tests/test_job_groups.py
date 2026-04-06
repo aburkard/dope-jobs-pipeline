@@ -32,6 +32,40 @@ def test_cluster_candidate_jobs_groups_identical_hashes_without_text():
     assert clusters == [["a", "b"]]
 
 
+def test_cluster_candidate_jobs_skips_similarity_when_length_upper_bound_is_too_low(monkeypatch):
+    def fail_similarity(*_args, **_kwargs):
+        raise AssertionError("content_similarity should not be called")
+
+    monkeypatch.setattr("job_groups.content_similarity", fail_similarity)
+
+    clusters = _cluster_candidate_jobs(
+        ["a", "b"],
+        {"a": "", "b": ""},
+        {"a": "m1\nm2\nm3\nm4\nm5\n" + ("x" * 100), "b": "m1\nm2\nm3\nm4\nm5\n" + ("y" * 2)},
+    )
+
+    assert clusters == []
+
+
+def test_cluster_candidate_jobs_uses_hash_representative_for_similarity(monkeypatch):
+    similarities = {
+        ("rep-a", "c"): 0.99,
+    }
+
+    def fake_similarity(text_a, text_b):
+        return similarities[tuple(sorted((text_a, text_b)))]
+
+    monkeypatch.setattr("job_groups.content_similarity", fake_similarity)
+
+    clusters = _cluster_candidate_jobs(
+        ["a", "b", "c"],
+        {"a": "same", "b": "same", "c": ""},
+        {"a": "rep-a", "c": "c"},
+    )
+
+    assert clusters == [["a", "b", "c"]]
+
+
 def test_compute_job_groups_scopes_by_ats_and_board():
     rows = [
         (
@@ -82,6 +116,56 @@ def test_compute_job_groups_scopes_by_ats_and_board():
 
     assert groups["greenhouse__shared__1"] == groups["greenhouse__shared__2"]
     assert "lever__shared__3" not in groups
+    assert stats["groups"] == 1
+    assert stats["grouped_jobs"] == 2
+
+
+def test_compute_job_groups_avoids_prepare_text_for_pure_hash_duplicates(monkeypatch):
+    rows = [
+        (
+            "greenhouse__shared__1",
+            "greenhouse",
+            "shared",
+            "Engineer",
+            {"title": "Engineer", "description": "Same content", "location": "San Francisco, CA"},
+            "same-hash",
+        ),
+        (
+            "greenhouse__shared__2",
+            "greenhouse",
+            "shared",
+            "Engineer",
+            {"title": "Engineer", "description": "Same content", "location": "New York, NY"},
+            "same-hash",
+        ),
+    ]
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.query = query
+            self.params = params
+
+        def fetchall(self):
+            return rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    def fail_prepare(*_args, **_kwargs):
+        raise AssertionError("prepare_job_text should not be called for pure hash duplicates")
+
+    monkeypatch.setattr("job_groups.prepare_job_text", fail_prepare)
+
+    groups, stats = compute_job_groups(FakeConn(), boards=[("greenhouse", "shared")])
+
+    assert groups["greenhouse__shared__1"] == groups["greenhouse__shared__2"]
     assert stats["groups"] == 1
     assert stats["grouped_jobs"] == 2
 

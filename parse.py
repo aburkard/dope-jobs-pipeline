@@ -820,11 +820,21 @@ class OpenAIBackend:
 class GeminiBackend:
     """Backend using Google Gemini API with structured output."""
 
-    def __init__(self, model: str = "gemini-3.1-flash-lite-preview", api_key: str | None = None):
+    def __init__(
+        self,
+        model: str = "gemini-3.1-flash-lite-preview",
+        api_key: str | None = None,
+        service_tier: str | None = None,
+        timeout_seconds: int | None = None,
+        max_retries: int | None = None,
+    ):
         import requests
         self._session = requests.Session()
         self._model = model
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self._service_tier = (service_tier or os.environ.get("GEMINI_SERVICE_TIER", "flex")).strip().lower() or None
+        self._timeout_seconds = timeout_seconds or int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "900"))
+        self._max_retries = max_retries or int(os.environ.get("GEMINI_MAX_RETRIES", "5"))
         self._schema = {
             "type": "OBJECT",
             "properties": {
@@ -890,7 +900,7 @@ class GeminiBackend:
 
     def build_request(self, job_text: str, max_tokens: int = 2000) -> dict:
         prompt = f"{SYSTEM_PROMPT}\n\n{build_user_prompt(job_text)}"
-        return {
+        request = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
@@ -899,6 +909,9 @@ class GeminiBackend:
                 "responseSchema": self._schema,
             },
         }
+        if self._service_tier:
+            request["service_tier"] = self._service_tier
+        return request
 
 
     def _extract_text(self, data: dict) -> str | None:
@@ -936,25 +949,58 @@ class GeminiBackend:
         return parsed, None
 
     def extract_batch(self, job_texts: list[str], max_tokens: int = 2000) -> list[JobMetadata | None]:
+        import random
+        import time
+
         results = []
         for text in job_texts:
-            try:
-                resp = self._session.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}",
-                    json=self.build_request(text, max_tokens=max_tokens),
-                    timeout=60,
-                )
-                if not resp.ok:
-                    print(f"  Gemini HTTP {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+            request_json = self.build_request(text, max_tokens=max_tokens)
+            headers = {}
+            if self._service_tier == "flex":
+                headers["X-Server-Timeout"] = str(min(self._timeout_seconds, 900))
+
+            for attempt in range(self._max_retries):
+                try:
+                    resp = self._session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}",
+                        json=request_json,
+                        headers=headers or None,
+                        timeout=self._timeout_seconds,
+                    )
+                    if resp.ok:
+                        parsed, error = self.parse_response_payload(resp.json())
+                        if error:
+                            print(f"  {error}", file=sys.stderr)
+                        results.append(parsed)
+                        break
+
+                    body = resp.text[:500]
+                    if self._service_tier == "flex" and resp.status_code in (429, 503) and attempt < self._max_retries - 1:
+                        delay = min(60, 5 * (2 ** attempt)) + random.uniform(0, 1)
+                        print(
+                            f"  Gemini Flex HTTP {resp.status_code}; retrying in {delay:.1f}s "
+                            f"(attempt {attempt + 1}/{self._max_retries}): {body}",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    print(f"  Gemini HTTP {resp.status_code}: {body}", file=sys.stderr)
                     results.append(None)
-                    continue
-                parsed, error = self.parse_response_payload(resp.json())
-                if error:
-                    print(f"  {error}", file=sys.stderr)
-                results.append(parsed)
-            except Exception as e:
-                print(f"  Gemini error: {e}", file=sys.stderr)
-                results.append(None)
+                    break
+                except Exception as e:
+                    if self._service_tier == "flex" and attempt < self._max_retries - 1:
+                        delay = min(60, 5 * (2 ** attempt)) + random.uniform(0, 1)
+                        print(
+                            f"  Gemini Flex error; retrying in {delay:.1f}s "
+                            f"(attempt {attempt + 1}/{self._max_retries}): {e}",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
+                        continue
+                    print(f"  Gemini error: {e}", file=sys.stderr)
+                    results.append(None)
+                    break
         return results
 
 
@@ -1111,6 +1157,16 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         else:
             merged["equity"] = {"offered": True, "min_pct": None, "max_pct": None}
 
+    if not merged.get("experience_level"):
+        structured_experience_level = _derive_structured_experience_level(raw_job)
+        if structured_experience_level:
+            merged["experience_level"] = structured_experience_level
+
+    if not merged.get("education_level"):
+        structured_education_level = _derive_structured_education_level(raw_job)
+        if structured_education_level:
+            merged["education_level"] = structured_education_level
+
     # --- Applicant geography for remote roles ---
     ats_requirements, ats_requirements_source = _derive_remote_applicant_location_requirements_with_source(
         raw_job,
@@ -1196,7 +1252,48 @@ _COUNTRY_CODE_ALIASES = {
     "COLOMBIA": "CO",
     "PANAMA": "PA",
     "PERU": "PE",
+    "PORTUGAL": "PT",
 }
+
+
+def _derive_structured_experience_level(raw_job: dict) -> str | None:
+    value = _to_str(raw_job.get("experience"))
+    if not value:
+        return None
+
+    normalized = value.strip().lower()
+    if any(token in normalized for token in ("executive", "vp", "vice president", "chief", "c-suite")):
+        return "executive"
+    if "principal" in normalized:
+        return "principal"
+    if "staff" in normalized:
+        return "staff"
+    if any(token in normalized for token in ("director", "lead", "senior", "mid-senior")):
+        return "senior"
+    if any(token in normalized for token in ("mid", "intermediate")):
+        return "mid"
+    if any(token in normalized for token in ("entry", "junior", "associate", "intern")):
+        return "entry"
+    return None
+
+
+def _derive_structured_education_level(raw_job: dict) -> str | None:
+    value = _to_str(raw_job.get("education"))
+    if not value:
+        return None
+
+    normalized = value.strip().lower()
+    if any(token in normalized for token in ("phd", "doctorate", "doctoral")):
+        return "phd"
+    if any(token in normalized for token in ("master", "mba", "m.s", "msc", "m.a")):
+        return "masters"
+    if any(token in normalized for token in ("bachelor", "b.s", "ba ", "b.a", "undergraduate")):
+        return "bachelors"
+    if "high school" in normalized:
+        return "high-school"
+    if any(token in normalized for token in ("no degree", "none required", "no education")):
+        return "none"
+    return None
 
 
 def _derive_posting_language(raw_job: dict) -> str | None:

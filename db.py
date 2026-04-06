@@ -16,6 +16,8 @@ from psycopg2.extras import execute_values, Json
 from public_ids import derive_company_slug_map, short_public_job_id
 from utils.html_utils import remove_html_markup
 
+MEILI_DOC_SCHEMA_VERSION = "2026-04-05-ats-geo-v2"
+
 
 def get_connection():
     """Get a Postgres connection using DATABASE_URL from environment."""
@@ -34,7 +36,7 @@ def current_meili_doc_version(
     """Compute a version hash for fields that materially shape the Meili doc."""
     effective_group = job_group or job_id_value
     parsed_at = last_parsed_at.isoformat() if last_parsed_at is not None else ""
-    payload = f"{content_hash or ''}|{parsed_at}|{effective_group}"
+    payload = f"{MEILI_DOC_SCHEMA_VERSION}|{content_hash or ''}|{parsed_at}|{effective_group}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
@@ -536,6 +538,29 @@ def get_parsed_jobs(conn, include_removed: bool = False, job_ids: list[str] | No
         ]
 
 
+def get_active_jobs_for_meili(conn, include_removed: bool = False, job_ids: list[str] | None = None) -> list[dict]:
+    """Get active jobs for Meili loading, including ATS-only rows without parsed_json."""
+    query = """
+        SELECT id, public_job_id, ats, board_token, title, parsed_json, job_group, raw_json
+        FROM pipeline_jobs
+        WHERE raw_json IS NOT NULL
+    """
+    params = []
+    if not include_removed:
+        query += " AND removed_at IS NULL"
+    if job_ids is not None:
+        if not job_ids:
+            return []
+        query += " AND id = ANY(%s)"
+        params.append(job_ids)
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return [
+            {"id": r[0], "public_job_id": r[1], "ats": r[2], "board_token": r[3], "title": r[4], "parsed_json": r[5], "job_group": r[6], "raw_json": r[7]}
+            for r in cur.fetchall()
+        ]
+
+
 def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
     """Get IDs of jobs that have been removed (for MeiliSearch deletion)."""
     query = "SELECT id FROM pipeline_jobs WHERE removed_at IS NOT NULL"
@@ -551,12 +576,12 @@ def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
 
 
 def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int | None = None) -> list[str]:
-    """Return parsed active jobs whose current parsed version is not yet loaded into Meili."""
+    """Return active jobs whose current ATS/enriched version is not yet loaded into Meili."""
     query = """
         SELECT id
         FROM pipeline_jobs
         WHERE removed_at IS NULL
-          AND parsed_json IS NOT NULL
+          AND raw_json IS NOT NULL
           AND (
               (
                   meili_loaded_doc_version IS NULL
@@ -570,6 +595,7 @@ def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int
                   AND meili_loaded_doc_version IS DISTINCT FROM md5(
                       concat_ws(
                           '|',
+                          COALESCE(%s, ''),
                           COALESCE(content_hash, ''),
                           COALESCE(last_parsed_at::text, ''),
                           COALESCE(job_group, id)
@@ -578,7 +604,7 @@ def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int
               )
           )
     """
-    params: list[object] = []
+    params: list[object] = [MEILI_DOC_SCHEMA_VERSION]
     if batch_id is not None:
         query += " AND parse_params->>'batch_id' = %s"
         params.append(batch_id)
@@ -605,6 +631,7 @@ def mark_jobs_meili_loaded(conn, job_ids: list[str]) -> None:
                 meili_loaded_doc_version = md5(
                     concat_ws(
                         '|',
+                        COALESCE(%s, ''),
                         COALESCE(content_hash, ''),
                         COALESCE(last_parsed_at::text, ''),
                         COALESCE(job_group, id)
@@ -612,7 +639,7 @@ def mark_jobs_meili_loaded(conn, job_ids: list[str]) -> None:
                 )
             WHERE id = ANY(%s)
             """,
-            (job_ids,),
+            (MEILI_DOC_SCHEMA_VERSION, job_ids),
         )
     conn.commit()
 

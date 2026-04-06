@@ -612,6 +612,25 @@ def test_build_primary_geo_uses_first_valid_point():
     assert pipeline._build_primary_geo(parsed) == {"lat": 40.7128, "lng": -74.006}
 
 
+def test_build_job_geo_fields_normalizes_country_names():
+    parsed = {
+        "locations": [
+            {"label": "Lisbon", "country_code": "Portugal"},
+        ],
+        "applicant_location_requirements": [
+            {"scope": "country", "country_code": "United States"},
+        ],
+    }
+
+    assert pipeline._build_job_geo_fields(parsed, {}) == {
+        "work_geoname_ids": [],
+        "work_country_codes": ["PT"],
+        "work_admin1_keys": [],
+        "applicant_country_codes": ["US"],
+        "applicant_admin1_keys": [],
+    }
+
+
 def test_build_job_geojson_includes_all_unique_points():
     parsed = {
         "locations": [
@@ -655,6 +674,12 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
     class FakeConn:
         def cursor(self):
             return FakeCursor()
+
+        def commit(self):
+            return None
+
+        def commit(self):
+            return None
 
     class FakeTask:
         def __init__(self, task_uid):
@@ -714,7 +739,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
 
     monkeypatch.setattr(
         pipeline,
-        "get_parsed_jobs",
+        "get_active_jobs_for_meili",
         lambda conn, job_ids=None, include_removed=False: [
             {
                 "id": "greenhouse__figma__123",
@@ -810,6 +835,9 @@ def test_step_load_full_reload_refreshes_index_settings(monkeypatch):
         def cursor(self):
             return FakeCursor()
 
+        def commit(self):
+            return None
+
     class FakeTask:
         def __init__(self, task_uid):
             self.task_uid = task_uid
@@ -868,7 +896,7 @@ def test_step_load_full_reload_refreshes_index_settings(monkeypatch):
 
     monkeypatch.setattr(
         pipeline,
-        "get_parsed_jobs",
+        "get_active_jobs_for_meili",
         lambda conn, job_ids=None, include_removed=False: [
             {
                 "id": "greenhouse__figma__123",
@@ -989,9 +1017,15 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
 
     fake_meili = types.SimpleNamespace(Client=FakeClient)
     monkeypatch.setitem(sys.modules, "meilisearch", fake_meili)
+    import geo_resolver
+    monkeypatch.setattr(
+        geo_resolver,
+        "GeoResolver",
+        lambda conn: types.SimpleNamespace(resolve_parsed_geo=lambda parsed: parsed),
+    )
     monkeypatch.setattr(
         pipeline,
-        "get_parsed_jobs",
+        "get_active_jobs_for_meili",
         lambda conn, job_ids=None, include_removed=False: [
             {
                 "id": f"greenhouse__figma__{i}",
@@ -1054,3 +1088,133 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
         raise AssertionError("Expected step_load to stop after a timed-out Meili task")
 
     assert captured["client"]._index.add_calls == 1
+
+
+def test_step_load_includes_unparsed_active_jobs_with_ats_metadata(monkeypatch):
+    captured = {}
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.query = query
+            self.params = params
+
+        def fetchone(self):
+            return ([],)
+
+        def fetchall(self):
+            if "FROM pipeline_companies" in self.query:
+                return [("ashby", "acme", "Acme", "acme", "acme.com", "https://example.com/logo.png")]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            return None
+
+    class FakeTask:
+        def __init__(self, task_uid):
+            self.task_uid = task_uid
+
+    class FakeIndex:
+        def __init__(self):
+            self.primary_key = "meili_id"
+
+        def get_primary_key(self):
+            return self.primary_key
+
+        def add_documents(self, docs, primary_key="id"):
+            self.docs = docs
+            self.primary_key_arg = primary_key
+            return FakeTask(1)
+
+        def get_stats(self):
+            return types.SimpleNamespace(number_of_documents=1)
+
+    class FakeClient:
+        def __init__(self, host, key):
+            self._index = FakeIndex()
+            captured["client"] = self
+
+        def get_index(self, uid):
+            return self._index
+
+        def index(self, name):
+            return self._index
+
+        def wait_for_task(self, task_uid, timeout_in_ms=0):
+            return {"uid": task_uid, "status": "succeeded"}
+
+    fake_meili = types.SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "meilisearch", fake_meili)
+    import geo_resolver
+    monkeypatch.setattr(
+        geo_resolver,
+        "GeoResolver",
+        lambda conn: types.SimpleNamespace(resolve_parsed_geo=lambda parsed: parsed),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_active_jobs_for_meili",
+        lambda conn, job_ids=None, include_removed=False: [
+            {
+                "id": "ashby__acme__1",
+                "public_job_id": "pub1",
+                "ats": "ashby",
+                "board_token": "acme",
+                "title": "Backend Engineer",
+                "parsed_json": None,
+                "job_group": None,
+                "raw_json": {
+                    "description": "Build APIs for our platform.",
+                    "employmentType": "full-time",
+                    "workplaceType": "remote",
+                    "locationName": "United States",
+                    "locationCountry": "United States",
+                    "allLocations": ["United States"],
+                    "compensationSalarySummary": "$150K - $190K",
+                    "compensationTierSummary": "Base salary plus equity",
+                    "experience": "Mid-Senior level",
+                    "education": "Bachelor's Degree",
+                    "jobUrl": "https://jobs.example.com/1",
+                    "publishedDate": "2026-04-01T12:30:00Z",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda conn, job_ids=None: [])
+    monkeypatch.setattr(pipeline, "get_latest_fx_rates", lambda conn: ({}, None))
+    monkeypatch.setattr(pipeline, "_load_geo_place_lookup", lambda conn, ids: {})
+    monkeypatch.setattr(pipeline, "_build_primary_geo", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geojson", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geo_fields", lambda parsed, lookup: {})
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: None)
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: None)
+
+    pipeline.step_load(
+        FakeConn(),
+        meili_host="http://example.com",
+        meili_key="key",
+        parsed_job_ids=["ashby__acme__1"],
+        removed_job_ids=[],
+    )
+
+    doc = captured["client"]._index.docs[0]
+    assert doc["id"] == "ashby__acme__1"
+    assert doc["is_enriched"] is False
+    assert doc["office_type"] == "remote"
+    assert doc["job_type"] == "full-time"
+    assert doc["experience_level"] == "senior"
+    assert doc["education_level"] == "bachelors"
+    assert doc["salary_min"] == 150000.0
+    assert doc["salary_max"] == 190000.0
+    assert doc["equity_offered"] is True
+    assert doc["location"] == "United States"
+    assert doc["apply_url"] == "https://jobs.example.com/1"

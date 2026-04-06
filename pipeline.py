@@ -36,7 +36,7 @@ from scrapers.workable_scraper import WorkableScraper
 from db import (
     get_connection, init_schema, upsert_scraped_jobs, mark_removed,
     job_id, upsert_company, get_jobs_needing_parse, save_parsed_result,
-    record_parse_error, get_parsed_jobs, get_removed_job_ids, get_companies_to_scrape,
+    record_parse_error, get_active_jobs_for_meili, get_removed_job_ids, get_companies_to_scrape,
     get_companies_to_scrape_by_status,
     get_existing_jobs_for_board, get_latest_fx_rates, mark_jobs_meili_deleted,
     mark_jobs_meili_loaded,
@@ -624,6 +624,26 @@ def _dedupe_nonempty(values: list[str | int | None]) -> list[str | int]:
     return ordered
 
 
+def _normalize_country_code_for_filters(value) -> str | None:
+    if value in (None, ""):
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if len(cleaned) == 2:
+        return cleaned.upper()
+
+    try:
+        from parse import _country_code_from_value
+    except Exception:
+        return None
+
+    normalized = _country_code_from_value(cleaned)
+    if isinstance(normalized, str) and len(normalized) == 2:
+        return normalized
+    return None
+
+
 def _location_point(location: dict) -> dict[str, float] | None:
     if not isinstance(location, dict):
         return None
@@ -685,7 +705,9 @@ def _build_job_geo_fields(parsed_json: dict, geo_lookup: dict[int, dict]) -> dic
     for location in parsed_json.get("locations", []) or []:
         geoname_id = location.get("geoname_id")
         place = geo_lookup.get(geoname_id) if geoname_id else None
-        country_code = (place or {}).get("country_code") or location.get("country_code")
+        country_code = _normalize_country_code_for_filters(
+            (place or {}).get("country_code") or location.get("country_code")
+        )
         admin1_code = (place or {}).get("admin1_code")
         work_geoname_ids.append(geoname_id)
         work_country_codes.append(country_code)
@@ -695,7 +717,9 @@ def _build_job_geo_fields(parsed_json: dict, geo_lookup: dict[int, dict]) -> dic
         geoname_id = requirement.get("geoname_id")
         place = geo_lookup.get(geoname_id) if geoname_id else None
         scope = requirement.get("scope")
-        country_code = (place or {}).get("country_code") or requirement.get("country_code")
+        country_code = _normalize_country_code_for_filters(
+            (place or {}).get("country_code") or requirement.get("country_code")
+        )
         admin1_code = (place or {}).get("admin1_code")
 
         if scope == "country":
@@ -822,19 +846,22 @@ def _build_years_experience_buckets(parsed_json: dict) -> list[str]:
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False, meili_batch_size: int = 1000):
-    """Load parsed jobs from DB into MeiliSearch."""
+    """Load active jobs from DB into MeiliSearch, using ATS-only metadata when needed."""
     import meilisearch
+    from parse import merge_api_data
+    from geo_resolver import GeoResolver
 
-    parsed_rows = get_parsed_jobs(conn, job_ids=None if full_reload else parsed_job_ids)
+    active_rows = get_active_jobs_for_meili(conn, job_ids=None if full_reload else parsed_job_ids)
     removed_ids = get_removed_job_ids(conn, job_ids=None if full_reload else removed_job_ids)
 
-    if not parsed_rows and not removed_ids:
+    if not active_rows and not removed_ids:
         print("\n--- LOAD (nothing to update) ---")
         return
 
-    print(f"\n--- LOAD ({len(parsed_rows)} active, {len(removed_ids)} removed) ---")
+    print(f"\n--- LOAD ({len(active_rows)} active, {len(removed_ids)} removed) ---")
     fx_rates, fx_as_of_date = get_latest_fx_rates(conn)
     fx_as_of = fx_as_of_date.isoformat() if fx_as_of_date else None
+    geo_resolver = GeoResolver(conn)
 
     # Load company metadata for names, domains, logos
     company_lookup = {}
@@ -852,14 +879,22 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         for r in cur.fetchall():
             company_lookup[(r[0], r[1])] = {"name": r[2], "slug": r[3], "domain": r[4], "logo_url": r[5]}
 
+    metadata_by_job_id: dict[str, dict] = {}
     geoname_ids: set[int] = set()
-    for row in parsed_rows:
-        parsed = row.get("parsed_json") or {}
-        for location in parsed.get("locations", []) or []:
+    for row in active_rows:
+        metadata = row.get("parsed_json")
+        if metadata:
+            metadata_by_job_id[row["id"]] = metadata
+        else:
+            metadata_by_job_id[row["id"]] = geo_resolver.resolve_parsed_geo(
+                merge_api_data(row.get("raw_json") or {}, {})
+            )
+        metadata = metadata_by_job_id[row["id"]]
+        for location in metadata.get("locations", []) or []:
             geoname_id = location.get("geoname_id")
             if isinstance(geoname_id, int):
                 geoname_ids.add(geoname_id)
-        for requirement in parsed.get("applicant_location_requirements", []) or []:
+        for requirement in metadata.get("applicant_location_requirements", []) or []:
             geoname_id = requirement.get("geoname_id")
             if isinstance(geoname_id, int):
                 geoname_ids.add(geoname_id)
@@ -867,7 +902,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     # Count locations per job_group for "Also in N locations" display
     group_counts = {}
-    for row in parsed_rows:
+    for row in active_rows:
         g = row.get("job_group")
         if g:
             group_counts[g] = group_counts.get(g, 0) + 1
@@ -876,10 +911,10 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     # Build MeiliSearch documents
     docs = []
-    for row in parsed_rows:
-        m = row["parsed_json"]
-        if not m:
-            continue
+    for row in active_rows:
+        raw = row.get("raw_json") or {}
+        is_enriched = bool(row.get("parsed_json"))
+        m = metadata_by_job_id[row["id"]]
 
         board = row["board_token"]
         co = company_lookup.get((row["ats"], board), {})
@@ -902,7 +937,6 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         geo_fields = _build_job_geo_fields(m, geo_lookup)
 
         # Build description from raw_json — raw content only, no metadata injection
-        raw = row.get("raw_json") or {}
         raw_desc = (
             raw.get("description", "")
             or raw.get("descriptionPlain", "")
@@ -964,6 +998,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             "job_type": m.get("job_type", ""),
             "experience_level": m.get("experience_level", ""),
             "is_manager": m.get("is_manager", False),
+            "is_enriched": is_enriched,
             "industry": primary_industry,
             "industry_tags": all_industry_tags,
             "salary_min": sal["min"] if sal else None,
@@ -1004,7 +1039,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     client = meilisearch.Client(meili_host, key)
 
     filterable_attributes = [
-        "office_type", "job_type", "experience_level", "is_manager",
+        "office_type", "job_type", "experience_level", "is_manager", "is_enriched",
         "industry", "industry_tags", "company_slug", "ats_type",
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
         "company_stage", "benefits_categories", "salary_transparency",
