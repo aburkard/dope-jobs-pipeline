@@ -1039,6 +1039,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     client = meilisearch.Client(meili_host, key)
 
     filterable_attributes = [
+        "id", "public_job_id",
         "office_type", "job_type", "experience_level", "is_manager", "is_enriched",
         "industry", "industry_tags", "company_slug", "ats_type",
         "cool_factor", "vibe_tags", "visa_sponsorship", "equity_offered",
