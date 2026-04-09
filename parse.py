@@ -1051,6 +1051,1071 @@ class LocalBackend:
 
 
 # ---------------------------------------------------------------------------
+# Description-based salary extraction
+# ---------------------------------------------------------------------------
+
+# Keywords near a dollar amount that signal salary/compensation.
+_SALARY_SIGNAL_RE = re.compile(
+    r'salary|base pay|pay range|compensation[:\s]|hourly rate|'
+    r'pay rate|starting pay|base hourly|annual base|annualized base|'
+    r'target.*?compensation|on.?target earnings|ote\b|'
+    r'comp\s+range|starting\s+at\s+\$|earnings\b|'
+    r'per\s+(?:hour|annum|year|month|week)|/\s*(?:hr|hour|yr|year)|'
+    r'hourly|annually|USD|usd|'
+    r'minimum\s+\$.*maximum\s+\$',
+    re.IGNORECASE,
+)
+
+# Keywords that indicate the dollar amount is NOT salary.
+_SALARY_REJECT_RE = re.compile(
+    r'revenue|(?<!\w)arr\b|funding|raised|valuation|market\s*cap|'
+    r'billion|trillion|assets?\s+under|aum\b|gmv\b|'
+    r'series\s+[a-f]\b|processing|customers?|'
+    r'stipend|reimbursement|tuition|fsa\b|hsa\b|'
+    r'sign.?on\s+bonus|signing\s+bonus|relocation|'
+    r'learning.{0,20}budget|development.{0,20}budget|'
+    r'work.?from.?home.{0,15}stipend|home\s+office.{0,15}stipend|'
+    r'401\s*\(?k\)?|retirement\s+match',
+    re.IGNORECASE,
+)
+
+# Matches dollar amounts like $150,000  $150,000.00  $150K  $150k  $1.5M
+_USD_AMOUNT_RE = re.compile(
+    r'\$\s*([\d,]+(?:\.[\d]{1,2})?)\s*([KkMm])?'
+)
+
+# --- Non-USD currency support ---
+
+# Map currency symbols to ISO codes
+_CURRENCY_SYMBOLS = {
+    '€': 'EUR',
+    '£': 'GBP',
+    '¥': 'JPY',
+    '₹': 'INR',
+    '₪': 'ILS',
+    'zł': 'PLN',
+}
+
+# Prefixed currency symbols/codes: €X, £X, C$X, A$X, R$X, NZ$X, CHF X, etc.
+_NON_USD_PREFIX_RE = re.compile(
+    r'(?:([€£¥₹₪]|(?:zł))\s*([\d.,]+)\s*([KkMm])?|'                      # symbol + number
+    r'([CRA]|NZ)\$([\d,]+(?:\.[\d]{1,2})?)\s*([KkMm])?|'                  # C$/R$/A$/NZ$ + number
+    r'(EUR|GBP|CAD|AUD|CHF|SEK|NOK|DKK|PLN|BRL|MXN|SGD|NZD|INR|JPY|CZK|HUF)'
+    r'\s*([\d.,]+)\s*([KkMm])?)',                                          # CODE + number
+    re.IGNORECASE,
+)
+
+# Suffixed currency: X EUR, X€, X£, X CAD, X PLN, X Kč, etc.
+_NON_USD_SUFFIX_RE = re.compile(
+    r'([\d.,]+)\s*([KkMm])?\s*'
+    r'(EUR|GBP|CAD|AUD|CHF|SEK|NOK|DKK|PLN|BRL|MXN|SGD|NZD|INR|JPY|CZK|HUF|Kč|[€£¥₹₪])',
+    re.IGNORECASE,
+)
+
+# $X CAD / $X AUD etc. — dollar sign but non-USD currency code after
+_DOLLAR_WITH_CURRENCY_RE = re.compile(
+    r'\$\s*([\d,]+(?:\.[\d]{1,2})?)\s*([KkMm])?\s*'
+    r'(CAD|AUD|NZD|SGD|MXN|HKD)\b',
+    re.IGNORECASE,
+)
+
+_PREFIX_SYMBOL_CODES = {'C': 'CAD', 'R': 'BRL', 'NZ': 'NZD', 'A': 'AUD'}  # maps C$/R$/NZ$/A$ prefixes
+
+# Matches a salary range: two amounts separated by dash/to
+_RANGE_SEP_RE = re.compile(
+    r'[-–—]\s*|to\s+',
+    re.IGNORECASE,
+)
+
+
+def _parse_number_intl(num_str: str) -> float | None:
+    """Parse a number that may use European formatting (period as thousands sep).
+
+    Heuristic: if the string has periods and the last group after a period is
+    exactly 3 digits with no comma, treat periods as thousands separators.
+    e.g. '25.500' -> 25500, '25.500,00' -> 25500.00
+    But '25.50' -> 25.50 (normal decimal).
+    """
+    num_str = num_str.strip()
+    if not num_str:
+        return None
+
+    # European format: 25.500 or 25.500,00 or 158.400
+    # Has period(s) AND last segment after period is exactly 3 digits
+    # AND no commas before the period (or commas used as decimal sep at end)
+    if '.' in num_str:
+        parts = num_str.split('.')
+        # Check if it looks European: e.g. "25.500" or "158.400"
+        if len(parts) == 2 and len(parts[1]) == 3 and parts[1].isdigit():
+            # Could be European thousands sep — check for trailing comma decimal
+            base = num_str.replace('.', '')
+            if ',' in base:
+                # "25.500,00" -> base="25500,00" -> "25500.00"
+                base = base.replace(',', '.')
+            try:
+                return float(base)
+            except ValueError:
+                return None
+
+    # Standard format: commas as thousands, period as decimal
+    cleaned = num_str.replace(',', '')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _parse_dollar_amount(s: str) -> float | None:
+    """Parse a string like '$150,000', '$150K', '$1.5M' into a float."""
+    m = _USD_AMOUNT_RE.search(s)
+    if not m:
+        return None
+    num_str = m.group(1).replace(',', '')
+    suffix = (m.group(2) or '').upper()
+    try:
+        value = float(num_str)
+    except ValueError:
+        return None
+    if suffix == 'K':
+        value *= 1_000
+    elif suffix == 'M':
+        value *= 1_000_000
+    return value
+
+
+def _apply_suffix(value: float, suffix: str | None) -> float:
+    s = (suffix or '').upper()
+    if s == 'K':
+        return value * 1_000
+    if s == 'M':
+        return value * 1_000_000
+    return value
+
+
+def _parse_non_usd_amount(s: str) -> tuple[float | None, str | None]:
+    """Parse a non-USD currency amount. Returns (value, currency_code).
+
+    Handles:
+      - Symbol prefix: €75,000  £65,000  ¥30,000  ₹32,000
+      - Country-prefix dollar: C$90,000  R$10,000  A$85,000  NZ$75,000
+      - Code prefix: EUR 150,000  CAD 90,000  PLN 9,550
+      - Code suffix: 25,500 EUR  160,000 PLN  9,550 PLN
+      - Dollar + code suffix: $90,000 CAD  $85,000 AUD
+      - European number format: 25.500€  158.400 EUR
+    """
+    # Try $X CAD/AUD/etc. first (most specific)
+    m = _DOLLAR_WITH_CURRENCY_RE.search(s)
+    if m:
+        value = _parse_number_intl(m.group(1))
+        if value is not None:
+            return _apply_suffix(value, m.group(2)), m.group(3).upper()
+
+    # Try prefix patterns: €X, C$X, EUR X
+    m = _NON_USD_PREFIX_RE.search(s)
+    if m:
+        if m.group(1):  # Symbol form: €/£/¥/₹/₪/zł
+            symbol = m.group(1)
+            value = _parse_number_intl(m.group(2))
+            suffix = m.group(3)
+            currency = _CURRENCY_SYMBOLS.get(symbol)
+            if value is not None and currency:
+                return _apply_suffix(value, suffix), currency
+        elif m.group(4):  # C$/R$/NZ$/A$
+            prefix = m.group(4).upper()
+            value = _parse_number_intl(m.group(5))
+            suffix = m.group(6)
+            currency = _PREFIX_SYMBOL_CODES.get(prefix)
+            if value is not None and currency:
+                return _apply_suffix(value, suffix), currency
+        elif m.group(7):  # CODE + number
+            currency = m.group(7).upper()
+            value = _parse_number_intl(m.group(8))
+            suffix = m.group(9)
+            if value is not None:
+                return _apply_suffix(value, suffix), currency
+
+    # Try suffix pattern: X EUR, X PLN, X Kč, X€, X£
+    m = _NON_USD_SUFFIX_RE.search(s)
+    if m:
+        value = _parse_number_intl(m.group(1))
+        suffix = m.group(2)
+        code = m.group(3)
+        currency = _CURRENCY_SYMBOLS.get(code) or ('CZK' if code == 'Kč' else code.upper())
+        if value is not None:
+            return _apply_suffix(value, suffix), currency
+
+    return None, None
+
+
+# Keep backward compat for any direct callers
+_EUR_GBP_AMOUNT_RE = _NON_USD_PREFIX_RE
+
+def _parse_eur_gbp_amount(s: str) -> tuple[float | None, str | None]:
+    """Parse non-USD currency amount. Legacy name kept for compatibility."""
+    return _parse_non_usd_amount(s)
+
+
+def _infer_salary_period(line: str, amount: float) -> str:
+    """Infer salary period from context clues or amount magnitude."""
+    lower = line.lower()
+    # Explicit period markers — these are unambiguous
+    if re.search(r'/\s*(?:hr|hour)|per\s+hour|hourly|per\s+visit', lower):
+        return 'hourly'
+    if re.search(r'/\s*(?:wk|week)|per\s+week|weekly', lower):
+        return 'weekly'
+    if re.search(r'/\s*(?:mo|month)|per\s+month|monthly', lower):
+        return 'monthly'
+    if re.search(r'/\s*(?:yr|year|annum)|per\s+year|annual', lower):
+        return 'annually'
+    # Magnitude heuristic when no explicit period word
+    if amount < 300:
+        return 'hourly'
+    if amount >= 10_000:
+        return 'annually'
+    # Ambiguous zone ($300-$10k) — could be weekly/monthly/annual, default annually
+    return 'annually'
+
+
+def _is_salary_plausible(min_val: float, max_val: float, period: str) -> bool:
+    """Sanity-check extracted salary values."""
+    if min_val <= 0 and max_val <= 0:
+        return False
+    if min_val < 0 or max_val < 0:
+        return False
+    # Max should be >= min (allow equal for single values)
+    if max_val < min_val:
+        return False
+    # Range shouldn't be absurdly wide (max > 5x min is suspicious)
+    if min_val > 0 and max_val > min_val * 5:
+        return False
+
+    if period == 'hourly':
+        return 7 <= min_val <= 500 and max_val <= 500
+    elif period == 'weekly':
+        return 200 <= min_val <= 20_000 and max_val <= 20_000
+    elif period == 'monthly':
+        return 1_000 <= min_val <= 100_000 and max_val <= 100_000
+    else:  # annually
+        return 15_000 <= min_val <= 1_000_000 and max_val <= 1_000_000
+
+
+def _extract_salary_from_description(raw_job: dict) -> dict | None:
+    """Extract salary information from job description text using regex.
+
+    Returns a dict with 'salary' and 'salary_transparency' keys, or None
+    if no plausible salary is found.
+
+    This is a fallback for when structured ATS salary fields are absent.
+    It searches each line of the description for dollar/currency amounts,
+    filters out false positives (funding, benefits, stipends), and
+    validates the result.
+    """
+    desc = (
+        raw_job.get('description', '')
+        or raw_job.get('content', '')
+        or raw_job.get('descriptionPlain', '')
+        or ''
+    )
+    if '<' in desc:
+        desc = remove_html_markup(desc, double_unescape=True)
+    if not desc:
+        return None
+
+    best: dict | None = None
+    best_score = -1
+
+    for line in desc.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Skip lines that are clearly not salary
+        if _SALARY_REJECT_RE.search(line):
+            continue
+
+        has_signal = bool(_SALARY_SIGNAL_RE.search(line))
+
+        # --- Try USD amounts first (but skip if line uses a non-USD currency code) ---
+        usd_amounts = _USD_AMOUNT_RE.findall(line)
+        # Check if line has $ amounts alongside a non-USD currency code
+        _non_usd_codes_in_line = re.search(
+            r'\b(CAD|AUD|NZD|SGD|MXN|HKD)\b', line, re.IGNORECASE,
+        ) if usd_amounts else None
+        if usd_amounts and not _non_usd_codes_in_line:
+            # Try to find a range pattern: $X - $Y or $X to $Y
+            # $X / hour - $Y / hour  (period marker between amounts)
+            range_match = re.search(
+                r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                r'\s*/\s*(?:hr|hour|yr|year|mo|month|wk|week)\s*'
+                r'[-–—‑]\s*'
+                r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                line,
+                re.IGNORECASE,
+            )
+            # $X - $Y  or  $X – $Y  or  $X — $Y  or  $X ‑ $Y (non-breaking hyphen)
+            if not range_match:
+                range_match = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]\s*'
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                    line,
+                )
+            # $X to $Y  or  $X ‑to‑ $Y
+            if not range_match:
+                range_match = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]?\s*to\s*[-–—‑]?\s*'
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                    line,
+                    re.IGNORECASE,
+                )
+            # $X and $Y (e.g. "between $130k and $150k")
+            if not range_match:
+                range_match = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s+and\s+'
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                    line,
+                    re.IGNORECASE,
+                )
+            # "minimum $X – maximum $Y" (words before each amount)
+            if not range_match:
+                range_match = re.search(
+                    r'minimum\s+(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]\s*'
+                    r'maximum\s+(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                    line,
+                    re.IGNORECASE,
+                )
+            # $X- Y/hour (second missing $, followed by period marker)
+            no_dollar_match = None
+            if not range_match:
+                no_dollar_match = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]\s*'
+                    r'([\d,]+(?:\.[\d]{1,2})?)\s*(?=[/]|\s*per\s)',
+                    line,
+                )
+            # $X - Y (second missing $, salary signal present for confidence)
+            if not range_match and not no_dollar_match and has_signal:
+                no_dollar_match = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]\s*'
+                    r'([\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)',
+                    line,
+                )
+            if not range_match and no_dollar_match:
+                min_val = _parse_dollar_amount(no_dollar_match.group(1))
+                raw_max = no_dollar_match.group(2).strip().replace(',', '')
+                suffix = ''
+                if raw_max.upper().endswith('K'):
+                    suffix = 'K'
+                    raw_max = raw_max[:-1]
+                elif raw_max.upper().endswith('M'):
+                    suffix = 'M'
+                    raw_max = raw_max[:-1]
+                try:
+                    max_val = float(raw_max)
+                except ValueError:
+                    max_val = None
+                if max_val is not None:
+                    if suffix == 'K':
+                        max_val *= 1_000
+                    elif suffix == 'M':
+                        max_val *= 1_000_000
+                if min_val is not None and max_val is not None:
+                    period = _infer_salary_period(line, min_val)
+                    if _is_salary_plausible(min_val, max_val, period):
+                        score = 10 + (5 if has_signal else 0)
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'salary': {
+                                    'min': min_val,
+                                    'max': max_val,
+                                    'currency': 'USD',
+                                    'period': period,
+                                },
+                                'salary_transparency': 'full_range',
+                            }
+
+            if range_match:
+                min_val = _parse_dollar_amount(range_match.group(1))
+                max_val = _parse_dollar_amount(range_match.group(2))
+                if min_val is not None and max_val is not None:
+                    period = _infer_salary_period(line, min_val)
+                    if _is_salary_plausible(min_val, max_val, period):
+                        # Score: ranges with signal words are best
+                        score = 10 + (5 if has_signal else 0)
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'salary': {
+                                    'min': min_val,
+                                    'max': max_val,
+                                    'currency': 'USD',
+                                    'period': period,
+                                },
+                                'salary_transparency': 'full_range',
+                            }
+            elif has_signal and len(usd_amounts) == 1:
+                # Single amount with salary-signal context
+                val = _parse_dollar_amount(line)
+                if val is not None:
+                    period = _infer_salary_period(line, val)
+                    if _is_salary_plausible(val, val, period):
+                        score = 5
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'salary': {
+                                    'min': val,
+                                    'max': val,
+                                    'currency': 'USD',
+                                    'period': period,
+                                },
+                                'salary_transparency': 'minimum_only',
+                            }
+
+        # --- Try non-USD currencies if no strong USD match yet ---
+        if best_score < 10:
+            val1, cur1 = _parse_non_usd_amount(line)
+            if val1 is not None and cur1:
+                # Try to find a range by looking for two non-USD amounts
+                # separated by dash/to/and. We search for the pattern directly
+                # rather than splitting (splitting hits word-hyphens like "full-time").
+                range_val = None
+                # Find all non-USD amounts in the line with their positions
+                non_usd_finds = []
+                for pat in [_NON_USD_PREFIX_RE, _NON_USD_SUFFIX_RE, _DOLLAR_WITH_CURRENCY_RE]:
+                    for m in pat.finditer(line):
+                        v, c = _parse_non_usd_amount(m.group(0))
+                        if v is not None and c:
+                            non_usd_finds.append((m.start(), m.end(), v, c))
+                # Dedupe by position and sort
+                non_usd_finds = sorted(set(non_usd_finds), key=lambda x: x[0])
+                # Check if two consecutive finds are separated by a range separator
+                if len(non_usd_finds) >= 2:
+                    for i in range(len(non_usd_finds) - 1):
+                        _, end1, v1, c1 = non_usd_finds[i]
+                        start2, _, v2, c2 = non_usd_finds[i + 1]
+                        between = line[end1:start2]
+                        if re.fullmatch(r'\s*[-–—‑]+\s*', between) or re.fullmatch(r'\s+to\s+', between, re.I) or re.fullmatch(r'\s+and\s+', between, re.I):
+                            cur = c1 or c2
+                            if cur:
+                                range_val = (v1, v2, cur)
+                                break
+
+                # If only one match, check for a bare number on the other side of a separator
+                # e.g. "160,000 - 265,000 PLN" or "SGD 165,000 - 195,000"
+                if not range_val and len(non_usd_finds) == 1:
+                    start1, end1, v1_found, c1_found = non_usd_finds[0]
+
+                    # Look for "NUMBER sep" BEFORE the matched amount
+                    prefix = line[:start1]
+                    bare_before = re.search(
+                        r'([\d.,]+\s*[KkMm]?)\s*[-–—‑]\s*$', prefix,
+                    ) or re.search(
+                        r'([\d.,]+\s*[KkMm]?)\s+to\s+$', prefix, re.I,
+                    )
+                    if bare_before:
+                        raw_num = bare_before.group(1).strip()
+                        suffix_char = raw_num[-1] if raw_num[-1] in 'KkMm' else ''
+                        num_part = raw_num.rstrip('KkMm')
+                        v_bare = _parse_number_intl(num_part)
+                        if v_bare is not None and suffix_char:
+                            v_bare = _apply_suffix(v_bare, suffix_char)
+                        if v_bare is not None:
+                            range_val = (v_bare, v1_found, c1_found)
+
+                    # Look for "sep NUMBER" AFTER the matched amount
+                    if not range_val:
+                        suffix_text = line[end1:]
+                        bare_after = re.search(
+                            r'^\s*[-–—‑]\s*([\d.,]+\s*[KkMm]?)', suffix_text,
+                        ) or re.search(
+                            r'^\s+to\s+([\d.,]+\s*[KkMm]?)', suffix_text, re.I,
+                        )
+                        if bare_after:
+                            raw_num = bare_after.group(1).strip()
+                            suffix_char = raw_num[-1] if raw_num[-1] in 'KkMm' else ''
+                            num_part = raw_num.rstrip('KkMm')
+                            v_bare = _parse_number_intl(num_part)
+                            if v_bare is not None and suffix_char:
+                                v_bare = _apply_suffix(v_bare, suffix_char)
+                            if v_bare is not None:
+                                range_val = (v1_found, v_bare, c1_found)
+
+                if range_val:
+                    min_val, max_val, currency = range_val
+                    period = _infer_salary_period(line, min_val)
+                    if _is_salary_plausible(min_val, max_val, period):
+                        score = 10 + (5 if has_signal else 0)
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'salary': {
+                                    'min': min_val,
+                                    'max': max_val,
+                                    'currency': currency,
+                                    'period': period,
+                                },
+                                'salary_transparency': 'full_range',
+                            }
+                elif has_signal:
+                    period = _infer_salary_period(line, val1)
+                    if _is_salary_plausible(val1, val1, period):
+                        score = 5
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'salary': {
+                                    'min': val1,
+                                    'max': val1,
+                                    'currency': cur1,
+                                    'period': period,
+                                },
+                                'salary_transparency': 'minimum_only',
+                            }
+
+            # Also check for $X CAD/AUD patterns (dollar sign + currency code nearby)
+            if best_score < 10:
+                # Range: $X - $Y CAD  or  $X - Y CAD  or  $X CAD - $Y CAD
+                dollar_range = re.search(
+                    r'(\$\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*[-–—‑]\s*'
+                    r'(\$?\s*[\d,]+(?:\.[\d]{1,2})?\s*[KkMm]?)'
+                    r'\s*(CAD|AUD|NZD|SGD|MXN|HKD)\b',
+                    line,
+                    re.IGNORECASE,
+                )
+                if dollar_range:
+                    min_val = _parse_dollar_amount(dollar_range.group(1))
+                    max_s = dollar_range.group(2).strip()
+                    if not max_s.startswith('$'):
+                        max_s = '$' + max_s
+                    max_val = _parse_dollar_amount(max_s)
+                    currency = dollar_range.group(3).upper()
+                    if min_val is not None and max_val is not None:
+                        period = _infer_salary_period(line, min_val)
+                        if _is_salary_plausible(min_val, max_val, period):
+                            score = 10 + (5 if has_signal else 0)
+                            if score > best_score:
+                                best_score = score
+                                best = {
+                                    'salary': {
+                                        'min': min_val,
+                                        'max': max_val,
+                                        'currency': currency,
+                                        'period': period,
+                                    },
+                                    'salary_transparency': 'full_range',
+                                }
+                # Single: $X CAD
+                if best_score < 10:
+                    m = _DOLLAR_WITH_CURRENCY_RE.search(line)
+                    if m and has_signal:
+                        val = _parse_dollar_amount('$' + m.group(1))
+                        currency = m.group(3).upper()
+                        if val is not None:
+                            period = _infer_salary_period(line, val)
+                            if _is_salary_plausible(val, val, period):
+                                score = 5
+                                if score > best_score:
+                                    best_score = score
+                                    best = {
+                                        'salary': {
+                                            'min': val,
+                                            'max': val,
+                                            'currency': currency,
+                                            'period': period,
+                                        },
+                                        'salary_transparency': 'minimum_only',
+                                    }
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Description-based years-of-experience extraction
+# ---------------------------------------------------------------------------
+
+# Context words that indicate the number is about required experience, not age/history.
+_EXPERIENCE_CONTEXT_RE = re.compile(
+    r'experience|experiencia|expérience|erfahrung',
+    re.IGNORECASE,
+)
+
+# Lines that mention years but are NOT about required experience.
+_YEARS_REJECT_RE = re.compile(
+    r'years?\s+(?:old|of\s+age|in\s+(?:a\s+row|business|operation|the\s+(?:industry|market|field|making)))'
+    r'|(?:founded|serving|established|operating|running)\s+(?:for\s+)?\d+'
+    r'|over\s+\d+\s+years?\s+(?:of\s+)?(?:experience\s+)?(?:serving|helping|providing|building|delivering|protecting|connecting)'
+    r'|(?:company|firm|organization|we)\s+(?:has|have)\s+(?:been\s+)?(?:\w+\s+){0,3}for\s+(?:over\s+)?\d+\s+years?'
+    r'|(?:more\s+than|over)\s+\d+\s+years?\s+(?:of\s+)?(?:history|heritage|tradition)'
+    r'|\d+\s+years?\s+(?:of\s+)?(?:age|old)\b',
+    re.IGNORECASE,
+)
+
+# The main extraction patterns, ordered by specificity.
+# Each returns (min_years, max_years) or None.
+_YEARS_PATTERNS = [
+    # "5-10 years" / "5–10 years" / "5 - 10 years"
+    re.compile(r'(\d{1,2})\s*[-–—]\s*(\d{1,2})\+?\s*years?', re.I),
+    # "5 to 10 years"
+    re.compile(r'(\d{1,2})\s+to\s+(\d{1,2})\+?\s*years?', re.I),
+    # "5+ years"
+    re.compile(r'(\d{1,2})\+\s*years?', re.I),
+    # "at least 5 years" / "minimum of 5 years" / "minimum 5 years"
+    re.compile(r'(?:at\s+least|minimum\s+(?:of\s+)?|min\.?\s+)\s*(\d{1,2})\s*years?', re.I),
+    # "5 years of experience" / "5 years experience" / "5 years' experience"
+    re.compile(r"(\d{1,2})\s*years?['\u2018\u2019]?\s+(?:of\s+)?(?:\w+\s+){0,3}experience", re.I),
+]
+
+
+def _extract_years_experience_from_description(raw_job: dict) -> dict | None:
+    """Extract years of experience requirement from job description text.
+
+    Returns a dict like {"min": 5, "max": 10} or {"min": 5, "max": None},
+    or None if no plausible requirement is found.
+    """
+    desc = (
+        raw_job.get('description', '')
+        or raw_job.get('content', '')
+        or raw_job.get('descriptionPlain', '')
+        or ''
+    )
+    if '<' in desc:
+        desc = remove_html_markup(desc, double_unescape=True)
+    if not desc:
+        return None
+
+    best: dict | None = None
+    best_score = -1
+
+    for line in desc.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Skip lines that are clearly not about required experience
+        if _YEARS_REJECT_RE.search(line):
+            continue
+
+        for i, pattern in enumerate(_YEARS_PATTERNS):
+            m = pattern.search(line)
+            if not m:
+                continue
+
+            groups = m.groups()
+            if len(groups) == 2:
+                min_years = int(groups[0])
+                max_years = int(groups[1])
+            else:
+                min_years = int(groups[0])
+                max_years = None
+
+            # Sanity checks — cap at 20 years; higher values are usually
+            # age requirements or company history, not experience requirements
+            if min_years > 20:
+                continue
+            if max_years is not None and max_years > 20:
+                continue
+            if max_years is not None and max_years < min_years:
+                continue
+
+            # For bare "N years" (last pattern), require experience context
+            if i == len(_YEARS_PATTERNS) - 1:
+                # Already has "experience" in the pattern
+                pass
+            elif i >= 3:
+                # "at least N years" — strong signal
+                pass
+            else:
+                # Range or N+ patterns — check that the line mentions experience
+                # or is in a requirements-like context
+                has_exp_context = bool(_EXPERIENCE_CONTEXT_RE.search(line))
+                has_req_context = bool(re.search(
+                    r'require|qualif|must\s+have|minimum|at\s+least|ideally|prefer',
+                    line, re.I,
+                ))
+                if not has_exp_context and not has_req_context:
+                    continue
+
+            # Score: ranges > N+ > bare N. Earlier patterns = more specific.
+            score = (len(_YEARS_PATTERNS) - i) * 10
+            # Prefer higher min_years (more specific requirement)
+            score += min_years
+
+            if score > best_score:
+                best_score = score
+                best = {"min": min_years, "max": max_years}
+
+            break  # Only take first pattern match per line
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Description-based visa sponsorship detection
+# ---------------------------------------------------------------------------
+
+_VISA_YES_RE = re.compile(
+    r'(?:visa\s+sponsorship\s+(?:is\s+)?(?:available|offered|provided|possible))'
+    r'|(?:(?:we|will|can|do)\s+(?:offer|provide|sponsor)\s+(?:\w+\s+)?visa)'
+    r'|(?:sponsorship\s+(?:is\s+)?available)'
+    r'|(?:open\s+to\s+sponsoring)'
+    r'|(?:we\s+sponsor\s+visas)',
+    re.IGNORECASE,
+)
+
+_VISA_NO_RE = re.compile(
+    r'(?:(?:no|not|unable|cannot|doesn?.t|does\s+not|will\s+not|won.t|do\s+not)\s+'
+    r'(?:\w+\s+){0,2}(?:sponsor|sponsorship|visa\s+sponsor))'
+    r'|(?:visa\s+sponsorship\s+(?:is\s+)?(?:not|unavailable))'
+    r'|(?:must\s+be\s+(?:legally\s+)?(?:authorized|eligible)\s+to\s+work)'
+    r'|(?:(?:legally\s+)?authorized\s+to\s+work\s+in)'
+    r'|(?:work\s+authorization\s+(?:is\s+)?required)'
+    r'|(?:without\s+(?:the\s+need\s+for|requiring)\s+(?:\w+\s+)?sponsorship)'
+    r'|(?:not\s+(?:able|in\s+a\s+position)\s+to\s+(?:\w+\s+)?sponsor)'
+    r'|(?:proof\s+of\s+(?:right|eligibility)\s+to\s+work)',
+    re.IGNORECASE,
+)
+
+
+def _detect_visa_sponsorship(raw_job: dict) -> str | None:
+    """Detect visa sponsorship status from description text.
+
+    Returns 'yes', 'no', or None (unknown).
+    """
+    desc = (
+        raw_job.get('description', '')
+        or raw_job.get('content', '')
+        or raw_job.get('descriptionPlain', '')
+        or ''
+    )
+    if '<' in desc:
+        desc = remove_html_markup(desc, double_unescape=True)
+    if not desc:
+        return None
+
+    has_yes = bool(_VISA_YES_RE.search(desc))
+    has_no = bool(_VISA_NO_RE.search(desc))
+
+    # "No" is more specific/authoritative — if both present, trust "no"
+    if has_no:
+        return 'no'
+    if has_yes:
+        return 'yes'
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Description-based education level extraction
+# ---------------------------------------------------------------------------
+
+_EDUCATION_PATTERNS = [
+    # PhD / Doctorate
+    (re.compile(
+        r'\b(?:ph\.?d|doctorate|doctoral)\b'
+        r'(?:\s+(?:degree|required|preferred|in\b))?',
+        re.I,
+    ), 'phd'),
+    # Master's / MBA
+    (re.compile(
+        r"\b(?:master'?s?\s+(?:degree|of)|mba|m\.?s\.?\s+(?:in|degree)|m\.?a\.?\s+(?:in|degree))\b",
+        re.I,
+    ), 'masters'),
+    # Bachelor's
+    (re.compile(
+        r"\b(?:bachelor'?s?\s+(?:degree|of)|b\.?s\.?\s+(?:in|degree)|b\.?a\.?\s+(?:in|degree)"
+        r"|undergraduate\s+degree)\b",
+        re.I,
+    ), 'bachelors'),
+    # Associate's
+    (re.compile(
+        r"\b(?:associate'?s?\s+degree)\b",
+        re.I,
+    ), 'associates'),
+    # High school / GED
+    (re.compile(
+        r'\b(?:high\s+school\s+(?:diploma|degree|graduate|education)|ged)\b',
+        re.I,
+    ), 'high-school'),
+    # No degree required
+    (re.compile(
+        r'\b(?:no\s+degree\s+(?:required|necessary|needed)|degree\s+not\s+required)\b',
+        re.I,
+    ), 'none'),
+]
+
+# Context words that distinguish required vs preferred education
+_EDUCATION_REQUIRED_RE = re.compile(
+    r'require|must\s+have|minimum|needed|necessary|mandatory',
+    re.IGNORECASE,
+)
+_EDUCATION_PREFERRED_RE = re.compile(
+    r'prefer|ideal|nice\s+to\s+have|desired|bonus|plus|advantage|asset',
+    re.IGNORECASE,
+)
+
+
+def _extract_education_from_description(raw_job: dict) -> str | None:
+    """Extract minimum education requirement from description.
+
+    Strategy: find education levels with "required" context first. If none,
+    fall back to any mentioned level. When multiple levels are mentioned,
+    pick the LOWEST required level (that's the minimum requirement).
+    e.g. "Bachelor's required, Master's preferred" -> "bachelors"
+    """
+    desc = (
+        raw_job.get('description', '')
+        or raw_job.get('content', '')
+        or raw_job.get('descriptionPlain', '')
+        or ''
+    )
+    if '<' in desc:
+        desc = remove_html_markup(desc, double_unescape=True)
+    if not desc:
+        return None
+
+    level_priority = {'phd': 6, 'masters': 5, 'bachelors': 4, 'associates': 3, 'high-school': 2, 'none': 1}
+
+    required_levels = []  # Levels with "required" context
+    mentioned_levels = []  # All mentioned levels
+
+    for line in desc.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        for pattern, level in _EDUCATION_PATTERNS:
+            if pattern.search(line):
+                # "no degree" only counts with explicit requirement context
+                if level == 'none' and not _EDUCATION_REQUIRED_RE.search(line):
+                    continue
+
+                is_required = bool(_EDUCATION_REQUIRED_RE.search(line))
+                is_preferred = bool(_EDUCATION_PREFERRED_RE.search(line))
+
+                if is_required and not is_preferred:
+                    required_levels.append(level)
+                else:
+                    # "preferred" or neutral context — lower confidence
+                    mentioned_levels.append(level)
+
+    # Pick the minimum required level if any; otherwise minimum mentioned level
+    candidates = required_levels or mentioned_levels
+    if not candidates:
+        return None
+
+    # Return the lowest level (the minimum requirement)
+    return min(candidates, key=lambda l: level_priority.get(l, 0))
+
+
+# ---------------------------------------------------------------------------
+# Workable industry field mapping
+# ---------------------------------------------------------------------------
+
+_WORKABLE_INDUSTRY_MAP = {
+    'information technology and services': 'enterprise_software',
+    'computer software': 'enterprise_software',
+    'internet': 'enterprise_software',
+    'computer & network security': 'cybersecurity',
+    'hospital & health care': 'healthcare_services',
+    'mental health care': 'healthcare_services',
+    'health, wellness and fitness': 'healthcare_services',
+    'medical devices': 'biotech_life_sciences',
+    'biotechnology': 'biotech_life_sciences',
+    'pharmaceuticals': 'pharma',
+    'financial services': 'payments_banking',
+    'banking': 'payments_banking',
+    'insurance': 'insurance',
+    'investment management': 'investing_trading',
+    'capital markets': 'investing_trading',
+    'venture capital & private equity': 'investing_trading',
+    'marketing and advertising': 'advertising_marketing',
+    'market research': 'advertising_marketing',
+    'public relations and communications': 'advertising_marketing',
+    'retail': 'commerce_marketplaces',
+    'e-commerce': 'commerce_marketplaces',
+    'consumer goods': 'consumer_goods_brands',
+    'luxury goods & jewelry': 'consumer_goods_brands',
+    'food & beverages': 'food_beverage',
+    'restaurants': 'food_beverage',
+    'food production': 'food_beverage',
+    'hospitality': 'travel_hospitality',
+    'leisure, travel & tourism': 'travel_hospitality',
+    'education management': 'education_edtech',
+    'e-learning': 'education_edtech',
+    'primary/secondary education': 'education_edtech',
+    'higher education': 'education_edtech',
+    'entertainment': 'media_entertainment',
+    'media production': 'media_entertainment',
+    'online media': 'media_entertainment',
+    'broadcast media': 'media_entertainment',
+    'computer games': 'gaming',
+    'consumer electronics': 'semiconductors_hardware',
+    'semiconductors': 'semiconductors_hardware',
+    'electrical/electronic manufacturing': 'semiconductors_hardware',
+    'automotive': 'transportation_logistics',
+    'transportation/trucking/railroad': 'transportation_logistics',
+    'logistics and supply chain': 'transportation_logistics',
+    'construction': 'construction_built_environment',
+    'building materials': 'construction_built_environment',
+    'architecture & planning': 'construction_built_environment',
+    'real estate': 'real_estate_proptech',
+    'renewables & environment': 'climate_sustainability',
+    'environmental services': 'climate_sustainability',
+    'oil & energy': 'energy_utilities',
+    'utilities': 'energy_utilities',
+    'mining & metals': 'energy_utilities',
+    'defense & space': 'defense_public_safety',
+    'military': 'defense_public_safety',
+    'government administration': 'government_public_sector',
+    'government relations': 'government_public_sector',
+    'law practice': 'legal',
+    'legal services': 'legal',
+    'management consulting': 'consulting_professional_services',
+    'professional training & coaching': 'consulting_professional_services',
+    'human resources': 'staffing_recruiting',
+    'staffing and recruiting': 'staffing_recruiting',
+    'nonprofit organization management': 'nonprofit_philanthropy',
+    'philanthropy': 'nonprofit_philanthropy',
+    'telecommunications': 'telecommunications_networking',
+    'wireless': 'telecommunications_networking',
+    'farming': 'agriculture',
+    'manufacturing': 'manufacturing_industrials',
+    'industrial automation': 'manufacturing_industrials',
+    'mechanical or industrial engineering': 'manufacturing_industrials',
+    'machinery': 'manufacturing_industrials',
+    'facilities services': 'manufacturing_industrials',
+    'aviation & aerospace': 'space_aerospace',
+    'outsourcing/offshoring': 'bpo_outsourcing',
+    'sports': 'media_entertainment',
+}
+
+
+def _map_workable_industry(raw_job: dict) -> str | None:
+    """Map Workable 'industry' field to our industry enum value."""
+    industry = raw_job.get('industry')
+    if not isinstance(industry, str) or not industry.strip():
+        return None
+    return _WORKABLE_INDUSTRY_MAP.get(industry.strip().lower())
+
+
+# ---------------------------------------------------------------------------
+# Title/description-based manager detection
+# ---------------------------------------------------------------------------
+
+# Title patterns that strongly indicate a people-management role.
+_MANAGER_TITLE_POSITIVE_RE = re.compile(
+    r'\b(?:'
+    # DOMAIN + manager/director/lead: "Engineering Manager", "Data Science Director"
+    # Only domains where "X Manager" reliably means people management.
+    # Excluded: product, content, brand, growth, analytics, performance — often IC roles.
+    r'(?:engineering|software|design|data|QA|platform|infrastructure|'
+    r'DevOps|SRE|machine\s+learning|ML|AI|frontend|backend|mobile|security|'
+    r'science|research|creative|'
+    r'revenue|finance|accounting|legal|people|talent|recruiting|'
+    r'clinical|nursing|operations|supply\s+chain|logistics|manufacturing|'
+    r'quality|facilities|IT|support|delivery)\s+'
+    r'(?:manager|mgr|director|dir|lead|leader|head)'
+    # "Senior/Associate Manager, DOMAIN": "Senior Manager, AI Engineering"
+    r'|(?:senior|associate|assistant|principal|staff|group)\s+(?:manager|mgr|director),?\s+\w+'
+    # "Director/Head/VP of X" or "Director, X"
+    r'|(?:director|head|vp|vice\s+president)(?:\s+of\b|,)'
+    # Physical-location managers: "Store Manager", "Restaurant Manager"
+    r'|(?:store|restaurant|warehouse|plant|site|branch|district|regional|general|'
+    r'assistant\s+(?:store|site|general))\s+manager'
+    # "Team Lead", "Department Head"
+    r'|(?:team|group|department|division|section)\s+(?:lead|leader|manager|head)'
+    # C-suite, Managing Director
+    r'|(?:managing\s+director|chief\s+\w+\s+officer|c[a-z]o)\b'
+    r'|supervisor\b'
+    r'|superintendent\b'
+    r')',
+    re.IGNORECASE,
+)
+
+# Title patterns that use "manager/lead/director" but are NOT people management.
+_MANAGER_TITLE_NEGATIVE_RE = re.compile(
+    r'\b(?:'
+    r'(?:account|customer\s+success|partner(?:ship)?|relationship|client(?:\s+success)?|'
+    r'project|program|product\s+marketing|product|event|community|social\s+media|'
+    r'office|case|care|property|campaign|vendor|compliance|risk|'
+    r'(?:implementation|integration|migration|onboarding)|'
+    r'analytics|digital\s+analytics|devrel|developer\s+relations)\s+'
+    r'(?:manager|mgr|lead|director)'
+    r'|(?:technical|solution|field)\s+(?:lead|manager)'
+    r'|lead\s+(?:engineer|developer|designer|scientist|analyst|architect|counsel|therapist|nurse|technician|mechanic)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Description signals that indicate people management.
+_MANAGER_DESC_SIGNALS = [
+    re.compile(r'(?:manage|lead|mentor|grow|build)\s+(?:a\s+)?team\s+of\b', re.I),
+    re.compile(r'\b\d+\s*[-–—+]\s*direct\s+reports?\b', re.I),
+    re.compile(r'\bdirect\s+reports?\b', re.I),
+    re.compile(r'\bpeople\s+management\b', re.I),
+    re.compile(r'\bsupervis(?:e|ing)\s+(?:a\s+)?(?:team|staff|employees|workers)\b', re.I),
+    re.compile(r'\bhire\s+and\s+(?:develop|train|mentor)\b', re.I),
+    re.compile(r'\bbuild\s+and\s+lead\b', re.I),
+    re.compile(r'\bteam\s+of\s+\d+\b', re.I),
+    re.compile(r'\breporting\s+to\s+you\b', re.I),
+]
+
+
+def _detect_is_manager(raw_job: dict) -> bool | None:
+    """Detect whether a job is a people-management role from title and description.
+
+    Returns True if strong manager signal, False if strong IC signal, None if ambiguous.
+    """
+    title = raw_job.get('title', '') or ''
+
+    # Check title patterns
+    has_positive_title = bool(_MANAGER_TITLE_POSITIVE_RE.search(title))
+    has_negative_title = bool(_MANAGER_TITLE_NEGATIVE_RE.search(title))
+
+    # If title is clearly positive and not contradicted by a negative pattern, it's a manager
+    if has_positive_title and not has_negative_title:
+        return True
+
+    # If title has a negative pattern (Account Manager, Project Manager, etc.), not a manager
+    # unless description has strong people-management signals
+    if has_negative_title and not has_positive_title:
+        # Check description for overriding signals
+        desc = (
+            raw_job.get('description', '')
+            or raw_job.get('content', '')
+            or raw_job.get('descriptionPlain', '')
+            or ''
+        )
+        if '<' in desc:
+            desc = remove_html_markup(desc, double_unescape=True)
+        signal_count = sum(1 for pat in _MANAGER_DESC_SIGNALS if pat.search(desc))
+        if signal_count >= 2:
+            return True
+        return False
+
+    # Title doesn't match either pattern — check description
+    desc = (
+        raw_job.get('description', '')
+        or raw_job.get('content', '')
+        or raw_job.get('descriptionPlain', '')
+        or ''
+    )
+    if '<' in desc:
+        desc = remove_html_markup(desc, double_unescape=True)
+    signal_count = sum(1 for pat in _MANAGER_DESC_SIGNALS if pat.search(desc))
+    if signal_count >= 2:
+        return True
+
+    return None  # Ambiguous — don't override
+
+
+# ---------------------------------------------------------------------------
 # Job loading helpers
 # ---------------------------------------------------------------------------
 
@@ -1121,6 +2186,13 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
             except (ValueError, IndexError):
                 pass
 
+    # --- Salary: description text fallback ---
+    if not (merged.get("salary") or {}).get("min"):
+        desc_salary = _extract_salary_from_description(raw_job)
+        if desc_salary:
+            merged["salary"] = desc_salary["salary"]
+            merged["salary_transparency"] = desc_salary["salary_transparency"]
+
     # --- Office type: structured ATS data is strong for remote/hybrid, softer for onsite ---
     merged["office_type"] = _choose_office_type(raw_job, merged)
     if merged.get("office_type") != "hybrid":
@@ -1166,6 +2238,37 @@ def merge_api_data(raw_job: dict, llm_metadata: dict) -> dict:
         structured_education_level = _derive_structured_education_level(raw_job)
         if structured_education_level:
             merged["education_level"] = structured_education_level
+
+    # --- Years of experience: description text fallback ---
+    if not (merged.get("years_experience") or {}).get("min"):
+        desc_years = _extract_years_experience_from_description(raw_job)
+        if desc_years:
+            merged["years_experience"] = desc_years
+
+    # --- Manager detection: title + description fallback ---
+    if "is_manager" not in merged:
+        detected = _detect_is_manager(raw_job)
+        if detected is not None:
+            merged["is_manager"] = detected
+
+    # --- Visa sponsorship: description fallback ---
+    if merged.get("visa_sponsorship", "unknown") == "unknown":
+        visa = _detect_visa_sponsorship(raw_job)
+        if visa:
+            merged["visa_sponsorship"] = visa
+
+    # --- Education level: description fallback ---
+    if not merged.get("education_level"):
+        desc_edu = _extract_education_from_description(raw_job)
+        if desc_edu:
+            merged["education_level"] = desc_edu
+
+    # --- Industry: Workable industry field mapping ---
+    if not merged.get("industry_primary"):
+        mapped = _map_workable_industry(raw_job)
+        if mapped:
+            merged["industry_primary"] = mapped
+            _canonicalize_industry_fields(merged)
 
     # --- Applicant geography for remote roles ---
     ats_requirements, ats_requirements_source = _derive_remote_applicant_location_requirements_with_source(
