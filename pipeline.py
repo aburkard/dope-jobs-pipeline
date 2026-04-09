@@ -1302,7 +1302,13 @@ def main():
         if args.load_pending:
             # Standalone load: query DB for all jobs needing a Meili refresh
             jobs_to_load = get_job_ids_pending_meili_load(conn, limit=args.load_limit)
-            removed_to_load = get_removed_job_ids(conn)
+            # Only delete removed jobs that were previously loaded into Meili
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM pipeline_jobs
+                    WHERE removed_at IS NOT NULL AND meili_loaded_at IS NOT NULL
+                """)
+                removed_to_load = [r[0] for r in cur.fetchall()]
             print(f"\n--- LOAD-PENDING: {len(jobs_to_load)} stale, {len(removed_to_load)} removed ---")
         else:
             jobs_to_load = list(set(parsed_job_ids) | set(scrape_result.get("job_group_changed_job_ids", set())))

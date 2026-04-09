@@ -33,26 +33,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Test MeiliSearch connectivity
-        env:
-          MEILISEARCH_HOST: https://search-internal.dopejobs.xyz
-          MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-        run: |
-          echo "MEILI_KEY length: ${#MEILISEARCH_MASTER_KEY}, starts: ${MEILISEARCH_MASTER_KEY:0:4}"
-          echo "Test 1: health with CF + auth"
-          curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" \
-            "$MEILISEARCH_HOST/health" \
-            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
-            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
-            -H "Authorization: Bearer $MEILISEARCH_MASTER_KEY"
-          echo "Test 2: health with CF only (no auth)"
-          curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" \
-            "$MEILISEARCH_HOST/health" \
-            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
-            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET"
-
       - name: Load pending jobs to MeiliSearch
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
