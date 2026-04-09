@@ -1152,25 +1152,28 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     print(f"  Loaded {total_loaded} documents")
 
     # Delete removed jobs in batches
+    total_deleted = 0
     if removed_ids and active_index_uid == target_index_uid:
         for i in range(0, len(removed_ids), BATCH_SIZE):
             batch = removed_ids[i:i + BATCH_SIZE]
             task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
-            print(f"  Deleting batch ({len(batch)} removed jobs)...")
-            if wait_for_task(task.task_uid, timeout_in_ms=30000):
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(removed_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"  Deleting batch {batch_num}/{total_batches} ({len(batch)} removed jobs)... (task {task.task_uid})")
+            if wait_for_task(task.task_uid, timeout_in_ms=120000):
                 mark_jobs_meili_deleted(conn, batch)
+                total_deleted += len(batch)
             else:
-                raise RuntimeError(
-                    f"Timed out waiting for Meili delete task {task.task_uid}; "
-                    "stopping further deletions to avoid overloading the queue"
-                )
+                print(f"  Warning: timed out on delete task {task.task_uid}, stopping deletes ({total_deleted} deleted so far)")
+                break
+        print(f"  Deleted {total_deleted}/{len(removed_ids)} removed jobs")
 
     if recreate_index:
         swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])
         if not wait_for_task(swap_task.task_uid):
             raise RuntimeError("Timed out swapping Meili jobs indexes")
         delete_task = client.delete_index(active_index_uid)
-        wait_for_task(delete_task.task_uid, timeout_in_ms=30000)
+        wait_for_task(delete_task.task_uid, timeout_in_ms=120000)
         # For full reload, all active jobs were already marked in the chunked loop above
         if removed_ids:
             mark_jobs_meili_deleted(conn, removed_ids)
