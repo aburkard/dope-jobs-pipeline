@@ -1,0 +1,37 @@
+name: Load to MeiliSearch
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Pipeline"]
+    types: [completed]
+
+concurrency:
+  group: dopejobs-meili-load
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Load pending jobs to MeiliSearch
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
+          MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: uv run python pipeline.py --load-pending

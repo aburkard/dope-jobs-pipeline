@@ -39,7 +39,7 @@ from db import (
     record_parse_error, get_active_jobs_for_meili, get_removed_job_ids, get_companies_to_scrape,
     get_companies_to_scrape_by_status,
     get_existing_jobs_for_board, get_latest_fx_rates, mark_jobs_meili_deleted,
-    mark_jobs_meili_loaded,
+    mark_jobs_meili_loaded, get_job_ids_pending_meili_load,
 )
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
@@ -1139,6 +1139,8 @@ def main():
     source_group.add_argument("--companies", help="Companies file (ats:token per line)")
     source_group.add_argument("--companies-from-db", action="store_true",
                               help="Select companies from pipeline_companies instead of a file")
+    source_group.add_argument("--load-pending", action="store_true",
+                              help="Standalone load: push all stale/removed jobs to MeiliSearch (no scrape or parse)")
     parser.add_argument("--db-company-limit", type=int, default=None,
                         help="Required safety cap when using --companies-from-db")
     parser.add_argument("--ats-filter", nargs="+", default=None,
@@ -1180,33 +1182,40 @@ def main():
     if args.companies_from_db and not args.skip_load and not args.allow_load:
         parser.error("--skip-load or --allow-load is required with --companies-from-db")
 
+    # --load-pending is a standalone mode: skip scrape/parse, go straight to load
+    if args.load_pending:
+        args.skip_scrape = True
+        args.skip_parse = True
+
     conn = get_connection()
     init_schema(conn)
 
-    try:
-        companies = resolve_companies(
-            conn,
-            companies_path=args.companies,
-            companies_from_db=args.companies_from_db,
-            db_company_limit=args.db_company_limit,
-            ats_filter=args.ats_filter,
-            ats_exclude_filter=args.ats_exclude_filter,
-            scrape_status_filter=args.scrape_status_filter,
-        )
-    except ValueError as e:
-        parser.error(str(e))
+    selected_companies = []
+    if not args.load_pending:
+        try:
+            companies = resolve_companies(
+                conn,
+                companies_path=args.companies,
+                companies_from_db=args.companies_from_db,
+                db_company_limit=args.db_company_limit,
+                ats_filter=args.ats_filter,
+                ats_exclude_filter=args.ats_exclude_filter,
+                scrape_status_filter=args.scrape_status_filter,
+            )
+        except ValueError as e:
+            parser.error(str(e))
 
-    if args.companies_from_db:
-        if args.db_company_limit is None:
-            print(f"Using DB company selection: {len(companies)} companies (no company cap)")
+        if args.companies_from_db:
+            if args.db_company_limit is None:
+                print(f"Using DB company selection: {len(companies)} companies (no company cap)")
+            else:
+                print(f"Using DB company selection: {len(companies)} companies (cap {args.db_company_limit})")
         else:
-            print(f"Using DB company selection: {len(companies)} companies (cap {args.db_company_limit})")
-    else:
-        print(f"Using file company selection: {len(companies)} companies from {args.companies}")
+            print(f"Using file company selection: {len(companies)} companies from {args.companies}")
 
-    selected_companies = filter_companies_for_shard(companies, args.shard_index, args.total_shards)
-    if args.total_shards is not None:
-        print(f"Using shard {args.shard_index}/{args.total_shards}: {len(selected_companies)} of {len(companies)} companies")
+        selected_companies = filter_companies_for_shard(companies, args.shard_index, args.total_shards)
+        if args.total_shards is not None:
+            print(f"Using shard {args.shard_index}/{args.total_shards}: {len(selected_companies)} of {len(companies)} companies")
 
     scrape_result = {"touched_job_ids": set(), "removed_job_ids": set(), "job_group_changed_job_ids": set()}
     parsed_job_ids = []
@@ -1241,13 +1250,20 @@ def main():
     # Step 3: Load to MeiliSearch
     if not args.skip_load:
         meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
-        jobs_to_load = list(set(parsed_job_ids) | set(scrape_result.get("job_group_changed_job_ids", set())))
+        if args.load_pending:
+            # Standalone load: query DB for all jobs needing a Meili refresh
+            jobs_to_load = get_job_ids_pending_meili_load(conn)
+            removed_to_load = get_removed_job_ids(conn)
+            print(f"\n--- LOAD-PENDING: {len(jobs_to_load)} stale, {len(removed_to_load)} removed ---")
+        else:
+            jobs_to_load = list(set(parsed_job_ids) | set(scrape_result.get("job_group_changed_job_ids", set())))
+            removed_to_load = list(scrape_result["removed_job_ids"])
         step_load(
             conn,
             meili_host=meili_host,
             meili_key=args.meili_key,
             parsed_job_ids=jobs_to_load,
-            removed_job_ids=list(scrape_result["removed_job_ids"]),
+            removed_job_ids=removed_to_load,
             full_reload=args.full_load,
         )
     else:
