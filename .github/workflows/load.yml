@@ -31,7 +31,9 @@ jobs:
       - name: Load pending jobs to MeiliSearch
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          MEILISEARCH_HOST: ${{ secrets.MEILISEARCH_HOST }}
+          MEILISEARCH_HOST: https://search-internal.dopejobs.xyz
           MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           PYTHONUNBUFFERED: "1"
         run: uv run python pipeline.py --load-pending

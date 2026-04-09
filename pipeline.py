@@ -995,7 +995,14 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         docs.append(doc)
 
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
-    client = meilisearch.Client(meili_host, key)
+    custom_headers = {}
+    cf_client_id = os.environ.get("CF_ACCESS_CLIENT_ID")
+    cf_client_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    if cf_client_id:
+        custom_headers["CF-Access-Client-Id"] = cf_client_id
+    if cf_client_secret:
+        custom_headers["CF-Access-Client-Secret"] = cf_client_secret
+    client = meilisearch.Client(meili_host, key, custom_headers=custom_headers or None)
 
     filterable_attributes = [
         "id", "public_job_id",

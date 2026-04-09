@@ -717,7 +717,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
             return types.SimpleNamespace(number_of_documents=1)
 
     class FakeClient:
-        def __init__(self, host, key):
+        def __init__(self, host, key, **kwargs):
             self.host = host
             self.key = key
             self._index = FakeIndex()
@@ -874,7 +874,7 @@ def test_step_load_full_reload_refreshes_index_settings(monkeypatch):
             return types.SimpleNamespace(number_of_documents=1)
 
     class FakeClient:
-        def __init__(self, host, key):
+        def __init__(self, host, key, **kwargs):
             self.host = host
             self.key = key
             self._index = FakeIndex()
@@ -1002,7 +1002,7 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
             return types.SimpleNamespace(number_of_documents=1)
 
     class FakeClient:
-        def __init__(self, host, key):
+        def __init__(self, host, key, **kwargs):
             self._index = FakeIndex()
             captured["client"] = self
 
@@ -1139,7 +1139,7 @@ def test_step_load_includes_unparsed_active_jobs_with_ats_metadata(monkeypatch):
             return types.SimpleNamespace(number_of_documents=1)
 
     class FakeClient:
-        def __init__(self, host, key):
+        def __init__(self, host, key, **kwargs):
             self._index = FakeIndex()
             captured["client"] = self
 
