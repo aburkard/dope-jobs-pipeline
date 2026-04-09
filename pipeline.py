@@ -802,198 +802,224 @@ def _build_years_experience_buckets(parsed_json: dict) -> list[str]:
     return buckets
 
 
+
+def _build_docs_for_chunk(rows, merge_api_data, geo_resolver, company_lookup,
+                          fx_rates, fx_as_of, geo_lookup, group_counts,
+                          boilerplate_cache, conn) -> list[dict]:
+    """Build Meili docs for a chunk of DB rows, resolving metadata and geo."""
+    docs = []
+    # Collect geoname_ids for this chunk, then extend geo_lookup
+    chunk_geoname_ids: set[int] = set()
+    metadata_by_id: dict[str, dict] = {}
+    for row in rows:
+        parsed = row.get("parsed_json")
+        if parsed:
+            metadata_by_id[row["id"]] = parsed
+        else:
+            metadata_by_id[row["id"]] = geo_resolver.resolve_parsed_geo(
+                merge_api_data(row.get("raw_json") or {}, {})
+            )
+        m = metadata_by_id[row["id"]]
+        for loc in m.get("locations", []) or []:
+            gid = loc.get("geoname_id")
+            if isinstance(gid, int):
+                chunk_geoname_ids.add(gid)
+        for req in m.get("applicant_location_requirements", []) or []:
+            gid = req.get("geoname_id")
+            if isinstance(gid, int):
+                chunk_geoname_ids.add(gid)
+
+    # Load any new geoname_ids not already in the lookup
+    missing_geonames = chunk_geoname_ids - set(geo_lookup.keys())
+    if missing_geonames:
+        geo_lookup.update(_load_geo_place_lookup(conn, missing_geonames))
+
+    for row in rows:
+        doc = _build_meili_doc(row, metadata_by_id[row["id"]], company_lookup, fx_rates,
+                               fx_as_of, geo_lookup, group_counts, boilerplate_cache, conn)
+        docs.append(doc)
+    return docs
+
+
+def _build_meili_doc(row: dict, metadata: dict, company_lookup: dict, fx_rates: dict,
+                     fx_as_of: str | None, geo_lookup: dict, group_counts: dict,
+                     boilerplate_cache: dict, conn) -> dict:
+    """Build a single MeiliSearch document from a DB row and its metadata."""
+    raw = row.get("raw_json") or {}
+    is_enriched = bool(row.get("parsed_json"))
+    m = metadata
+
+    board = row["board_token"]
+    co = company_lookup.get((row["ats"], board), {})
+    company = co.get("name") or board.replace("-", " ").replace("_", " ").title()
+    company_slug = co.get("slug") or board
+    company_domain = co.get("domain", "")
+    company_logo = co.get("logo_url", "") or _fallback_company_logo(company_domain, company_slug)
+
+    location_str = _build_meili_location(m)
+    sal = m.get("salary")
+    normalized_salary = normalize_salary_annual_usd(sal, fx_rates)
+    geo = _build_primary_geo(m)
+    geojson = _build_job_geojson(m)
+    geo_fields = _build_job_geo_fields(m, geo_lookup)
+
+    raw_desc = raw.get("description", "") or raw.get("descriptionPlain", "") or ""
+    if not raw_desc and raw.get("content"):
+        from utils.html_utils import remove_html_markup
+        raw_desc = remove_html_markup(raw["content"], double_unescape=True)
+    if raw_desc:
+        from detect_boilerplate import get_boilerplate_hashes, remove_boilerplate
+        bp_hashes = boilerplate_cache.get(board)
+        if bp_hashes is None:
+            bp_hashes = get_boilerplate_hashes(conn, board)
+            boilerplate_cache[board] = bp_hashes
+        description = remove_boilerplate(raw_desc, bp_hashes)
+    else:
+        description = ""
+
+    apply_url = _extract_apply_url(raw)
+    posted_at, posted_at_ts = _extract_posted_at(raw)
+    sal_text = ""
+    if sal and sal.get("min"):
+        sal_text = f"${sal['min']:,.0f}"
+        if sal.get("max") and sal["max"] != sal["min"]:
+            sal_text += f"-${sal['max']:,.0f}"
+        sal_text += f" {sal.get('period', 'annually')}"
+
+    primary_industry = m.get("industry_primary") or m.get("industry", "")
+    secondary_industry_tags = m.get("industry_tags") or []
+    all_industry_tags = []
+    for value in [primary_industry, *secondary_industry_tags]:
+        if isinstance(value, str) and value and value not in all_industry_tags:
+            all_industry_tags.append(value)
+    years_experience = m.get("years_experience") or {}
+    years_experience_buckets = _build_years_experience_buckets(m)
+
+    doc = {
+        "meili_id": meili_safe_job_id(row["id"]),
+        "id": row["id"],
+        "public_job_id": row.get("public_job_id"),
+        "title": row["title"],
+        "tagline": m.get("tagline", ""),
+        "company": company,
+        "company_slug": company_slug,
+        "company_domain": company_domain,
+        "company_logo": company_logo,
+        "apply_url": apply_url,
+        "posted_at": posted_at,
+        "posted_at_ts": posted_at_ts,
+        "description": description[:3000],
+        "location": location_str,
+        "locations_all": _build_meili_locations_all(m),
+        **geo_fields,
+        "office_type": m.get("office_type", ""),
+        "job_type": m.get("job_type", ""),
+        "experience_level": m.get("experience_level", ""),
+        "is_manager": m.get("is_manager", False),
+        "is_enriched": is_enriched,
+        "industry": primary_industry,
+        "industry_tags": all_industry_tags,
+        "salary_min": sal["min"] if sal else None,
+        "salary_max": sal["max"] if sal else None,
+        "salary_currency": sal["currency"] if sal else None,
+        "salary_period": sal["period"] if sal else None,
+        "salary_annual_min_usd": normalized_salary["salary_annual_min_usd"] if normalized_salary else None,
+        "salary_annual_max_usd": normalized_salary["salary_annual_max_usd"] if normalized_salary else None,
+        "salary_fx_currency": normalized_salary["salary_fx_currency"] if normalized_salary else None,
+        "salary_fx_usd_per_unit": normalized_salary["salary_fx_usd_per_unit"] if normalized_salary else None,
+        "salary_fx_as_of": fx_as_of,
+        "salary_transparency": m.get("salary_transparency", "not_disclosed"),
+        "years_experience_min": years_experience.get("min"),
+        "years_experience_max": years_experience.get("max"),
+        "years_experience_buckets": years_experience_buckets,
+        "education_level": m.get("education_level"),
+        "hard_skills": m.get("hard_skills", []),
+        "soft_skills": m.get("soft_skills", []),
+        "cool_factor": m.get("cool_factor", "standard"),
+        "vibe_tags": [v for v in m.get("vibe_tags", [])],
+        "visa_sponsorship": m.get("visa_sponsorship", "unknown"),
+        "equity_offered": m.get("equity", {}).get("offered", False),
+        "company_stage": m.get("company_stage"),
+        "benefits_categories": [b for b in m.get("benefits_categories", [])],
+        "benefits_highlights": m.get("benefits_highlights", []),
+        "reports_to": m.get("reports_to"),
+        "ats_type": row["ats"],
+        "job_group": row.get("job_group") or row["id"],
+        "location_count": group_counts.get(row.get("job_group"), 1),
+    }
+    if geo is not None:
+        doc["_geo"] = geo
+    if geojson is not None:
+        doc["_geojson"] = geojson
+    return doc
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False, meili_batch_size: int = 1000):
-    """Load active jobs from DB into MeiliSearch, using ATS-only metadata when needed."""
+    """Load active jobs from DB into MeiliSearch, using ATS-only metadata when needed.
+
+    Processes jobs in chunks to avoid loading all raw_json blobs into memory at once.
+    """
     import meilisearch
     from parse import merge_api_data
     from geo_resolver import GeoResolver
 
-    active_rows = get_active_jobs_for_meili(conn, job_ids=None if full_reload else parsed_job_ids)
+    # Determine which job IDs to load (lightweight — no raw_json)
+    if full_reload:
+        # Get all active job IDs (just the IDs, no blobs)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM pipeline_jobs WHERE raw_json IS NOT NULL AND removed_at IS NULL ORDER BY id")
+            all_job_ids = [r[0] for r in cur.fetchall()]
+    elif parsed_job_ids is not None:
+        all_job_ids = parsed_job_ids
+    else:
+        all_job_ids = []
+
     removed_ids = get_removed_job_ids(conn, job_ids=None if full_reload else removed_job_ids)
 
-    if not active_rows and not removed_ids:
+    if not all_job_ids and not removed_ids:
         print("\n--- LOAD (nothing to update) ---")
         return
 
-    print(f"\n--- LOAD ({len(active_rows)} active, {len(removed_ids)} removed) ---")
+    total_active = len(all_job_ids)
+
+    print(f"\n--- LOAD ({total_active} active, {len(removed_ids)} removed) ---")
+
+    # Load shared lookups (small, load once)
     fx_rates, fx_as_of_date = get_latest_fx_rates(conn)
     fx_as_of = fx_as_of_date.isoformat() if fx_as_of_date else None
     geo_resolver = GeoResolver(conn)
 
-    # Load company metadata for names, domains, logos
     company_lookup = {}
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT
-                ats,
-                board_token,
-                company_name,
-                company_slug,
-                domain,
-                COALESCE(logo_url, scraped_logo_url) AS effective_logo_url
+            SELECT ats, board_token, company_name, company_slug, domain,
+                   COALESCE(logo_url, scraped_logo_url) AS effective_logo_url
             FROM pipeline_companies
         """)
         for r in cur.fetchall():
             company_lookup[(r[0], r[1])] = {"name": r[2], "slug": r[3], "domain": r[4], "logo_url": r[5]}
 
-    metadata_by_job_id: dict[str, dict] = {}
-    geoname_ids: set[int] = set()
-    for row in active_rows:
-        metadata = row.get("parsed_json")
-        if metadata:
-            metadata_by_job_id[row["id"]] = metadata
-        else:
-            metadata_by_job_id[row["id"]] = geo_resolver.resolve_parsed_geo(
-                merge_api_data(row.get("raw_json") or {}, {})
-            )
-        metadata = metadata_by_job_id[row["id"]]
-        for location in metadata.get("locations", []) or []:
-            geoname_id = location.get("geoname_id")
-            if isinstance(geoname_id, int):
-                geoname_ids.add(geoname_id)
-        for requirement in metadata.get("applicant_location_requirements", []) or []:
-            geoname_id = requirement.get("geoname_id")
-            if isinstance(geoname_id, int):
-                geoname_ids.add(geoname_id)
-    geo_lookup = _load_geo_place_lookup(conn, geoname_ids)
-
-    # Count locations per job_group for "Also in N locations" display
+    # Load job_group counts (lightweight query, no raw_json)
     group_counts = {}
-    for row in active_rows:
-        g = row.get("job_group")
-        if g:
-            group_counts[g] = group_counts.get(g, 0) + 1
+    with conn.cursor() as cur:
+        if all_job_ids is None:
+            cur.execute("""
+                SELECT job_group, COUNT(*) FROM pipeline_jobs
+                WHERE removed_at IS NULL AND job_group IS NOT NULL
+                GROUP BY job_group
+            """)
+        elif all_job_ids:
+            cur.execute("""
+                SELECT job_group, COUNT(*) FROM pipeline_jobs
+                WHERE removed_at IS NULL AND job_group IS NOT NULL AND id = ANY(%s)
+                GROUP BY job_group
+            """, (all_job_ids,))
+        for r in cur.fetchall():
+            group_counts[r[0]] = r[1]
 
-    boilerplate_cache: dict[str, set[str]] = {}
-
-    # Build MeiliSearch documents
-    docs = []
-    for row in active_rows:
-        raw = row.get("raw_json") or {}
-        is_enriched = bool(row.get("parsed_json"))
-        m = metadata_by_job_id[row["id"]]
-
-        board = row["board_token"]
-        co = company_lookup.get((row["ats"], board), {})
-        company = co.get("name") or board.replace("-", " ").replace("_", " ").title()
-        company_slug = co.get("slug") or board
-        company_domain = co.get("domain", "")
-        company_logo = co.get("logo_url", "") or _fallback_company_logo(company_domain, company_slug)
-
-        # Location string from parsed metadata / remote applicant geography
-        locs = m.get("locations", [])
-        location_str = _build_meili_location(m)
-
-        # Salary
-        sal = m.get("salary")
-        normalized_salary = normalize_salary_annual_usd(sal, fx_rates)
-
-        # Geo
-        geo = _build_primary_geo(m)
-        geojson = _build_job_geojson(m)
-        geo_fields = _build_job_geo_fields(m, geo_lookup)
-
-        # Build description from raw_json — raw content only, no metadata injection
-        raw_desc = (
-            raw.get("description", "")
-            or raw.get("descriptionPlain", "")
-            or ""
-        )
-        if not raw_desc and raw.get("content"):
-            from utils.html_utils import remove_html_markup
-            raw_desc = remove_html_markup(raw["content"], double_unescape=True)
-        # Remove boilerplate
-        if raw_desc:
-            from detect_boilerplate import get_boilerplate_hashes, remove_boilerplate
-            bp_hashes = boilerplate_cache.get(board)
-            if bp_hashes is None:
-                bp_hashes = get_boilerplate_hashes(conn, board)
-                boilerplate_cache[board] = bp_hashes
-            description = remove_boilerplate(raw_desc, bp_hashes)
-        else:
-            description = ""
-
-        # String versions of arrays for embedding template
-        apply_url = _extract_apply_url(raw)
-        skills_text = ', '.join(m.get("hard_skills", []) + m.get("soft_skills", []))
-        vibes_text = ', '.join(v.replace('_', ' ') for v in m.get("vibe_tags", []))
-        posted_at, posted_at_ts = _extract_posted_at(raw)
-        sal_text = ""
-        if sal and sal.get("min"):
-            sal_text = f"${sal['min']:,.0f}"
-            if sal.get("max") and sal["max"] != sal["min"]:
-                sal_text += f"-${sal['max']:,.0f}"
-            sal_text += f" {sal.get('period', 'annually')}"
-
-        primary_industry = m.get("industry_primary") or m.get("industry", "")
-        secondary_industry_tags = m.get("industry_tags") or []
-        all_industry_tags = []
-        for value in [primary_industry, *secondary_industry_tags]:
-            if isinstance(value, str) and value and value not in all_industry_tags:
-                all_industry_tags.append(value)
-        years_experience = m.get("years_experience") or {}
-        years_experience_buckets = _build_years_experience_buckets(m)
-
-        doc = {
-            "meili_id": meili_safe_job_id(row["id"]),
-            "id": row["id"],
-            "public_job_id": row.get("public_job_id"),
-            "title": row["title"],
-            "tagline": m.get("tagline", ""),
-            "company": company,
-            "company_slug": company_slug,
-            "company_domain": company_domain,
-            "company_logo": company_logo,
-            "apply_url": apply_url,
-            "posted_at": posted_at,
-            "posted_at_ts": posted_at_ts,
-            "description": description[:3000],
-            "location": location_str,
-            "locations_all": _build_meili_locations_all(m),
-            **geo_fields,
-            "office_type": m.get("office_type", ""),
-            "job_type": m.get("job_type", ""),
-            "experience_level": m.get("experience_level", ""),
-            "is_manager": m.get("is_manager", False),
-            "is_enriched": is_enriched,
-            "industry": primary_industry,
-            "industry_tags": all_industry_tags,
-            "salary_min": sal["min"] if sal else None,
-            "salary_max": sal["max"] if sal else None,
-            "salary_currency": sal["currency"] if sal else None,
-            "salary_period": sal["period"] if sal else None,
-            "salary_annual_min_usd": normalized_salary["salary_annual_min_usd"] if normalized_salary else None,
-            "salary_annual_max_usd": normalized_salary["salary_annual_max_usd"] if normalized_salary else None,
-            "salary_fx_currency": normalized_salary["salary_fx_currency"] if normalized_salary else None,
-            "salary_fx_usd_per_unit": normalized_salary["salary_fx_usd_per_unit"] if normalized_salary else None,
-            "salary_fx_as_of": fx_as_of,
-            "salary_transparency": m.get("salary_transparency", "not_disclosed"),
-            "years_experience_min": years_experience.get("min"),
-            "years_experience_max": years_experience.get("max"),
-            "years_experience_buckets": years_experience_buckets,
-            "education_level": m.get("education_level"),
-            "hard_skills": m.get("hard_skills", []),
-            "soft_skills": m.get("soft_skills", []),
-            "cool_factor": m.get("cool_factor", "standard"),
-            "vibe_tags": [v for v in m.get("vibe_tags", [])],
-            "visa_sponsorship": m.get("visa_sponsorship", "unknown"),
-            "equity_offered": m.get("equity", {}).get("offered", False),
-            "company_stage": m.get("company_stage"),
-            "benefits_categories": [b for b in m.get("benefits_categories", [])],
-            "benefits_highlights": m.get("benefits_highlights", []),
-            "reports_to": m.get("reports_to"),
-            "ats_type": row["ats"],
-            "job_group": row.get("job_group") or row["id"],  # ungrouped jobs use their own ID
-            "location_count": group_counts.get(row.get("job_group"), 1),
-        }
-        if geo is not None:
-            doc["_geo"] = geo
-        if geojson is not None:
-            doc["_geojson"] = geojson
-        docs.append(doc)
-
+    # Set up Meili client
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
     custom_headers = {}
     cf_client_id = os.environ.get("CF_ACCESS_CLIENT_ID")
@@ -1097,19 +1123,33 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"Failed to submit documents for batch of {len(batch)} docs") from last_error
 
+    # Process active jobs in chunks: fetch from DB → build docs → submit to Meili
     BATCH_SIZE = max(1, int(meili_batch_size))
-    if docs:
-        for i in range(0, len(docs), BATCH_SIZE):
-            batch = docs[i:i + BATCH_SIZE]
-            task = _add_documents_with_retry(batch)
-            print(f"  Upserting batch {i//BATCH_SIZE + 1} ({len(batch)} docs)... (task {task.task_uid})")
+    boilerplate_cache: dict[str, set[str]] = {}
+    geo_lookup: dict = {}
+    total_loaded = 0
+
+    for i in range(0, len(all_job_ids), BATCH_SIZE):
+        chunk_ids = all_job_ids[i:i + BATCH_SIZE]
+        chunk_rows = get_active_jobs_for_meili(conn, job_ids=chunk_ids)
+        if not chunk_rows:
+            continue
+        docs = _build_docs_for_chunk(chunk_rows, merge_api_data, geo_resolver, company_lookup,
+                                     fx_rates, fx_as_of, geo_lookup, group_counts, boilerplate_cache, conn)
+        if docs:
+            task = _add_documents_with_retry(docs)
+            batch_num = i // BATCH_SIZE + 1
+            print(f"  Upserting batch {batch_num} ({len(docs)} docs)... (task {task.task_uid})")
             if wait_for_task(task.task_uid):
-                mark_jobs_meili_loaded(conn, [doc["id"] for doc in batch])
+                mark_jobs_meili_loaded(conn, [doc["id"] for doc in docs])
+                total_loaded += len(docs)
             else:
                 raise RuntimeError(
                     f"Timed out waiting for Meili task {task.task_uid}; "
                     "stopping further document submissions to avoid overloading the queue"
                 )
+
+    print(f"  Loaded {total_loaded} documents")
 
     # Delete removed jobs in batches
     if removed_ids and active_index_uid == target_index_uid:
@@ -1131,7 +1171,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             raise RuntimeError("Timed out swapping Meili jobs indexes")
         delete_task = client.delete_index(active_index_uid)
         wait_for_task(delete_task.task_uid, timeout_in_ms=30000)
-        mark_jobs_meili_loaded(conn, [row["id"] for row in parsed_rows])
+        # For full reload, all active jobs were already marked in the chunked loop above
         if removed_ids:
             mark_jobs_meili_deleted(conn, removed_ids)
         index = client.index(target_index_uid)
@@ -1170,6 +1210,8 @@ def main():
     parser.add_argument("--meili-host", default=None, help="MeiliSearch host (default: MEILISEARCH_HOST env var or localhost)")
     parser.add_argument("--meili-key", default=None, help="MeiliSearch master key (default: MEILISEARCH_MASTER_KEY env var)")
     parser.add_argument("--full-load", action="store_true", help="Rebuild and upsert all parsed jobs into MeiliSearch")
+    parser.add_argument("--load-limit", type=int, default=None,
+                        help="Max number of jobs to load into MeiliSearch (for testing)")
     parser.add_argument("--allow-load", action="store_true",
                         help="Allow MeiliSearch load step when using --companies-from-db")
     parser.add_argument("--shard-index", type=int, default=None, help="0-based shard index for company selection")
@@ -1259,7 +1301,7 @@ def main():
         meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
         if args.load_pending:
             # Standalone load: query DB for all jobs needing a Meili refresh
-            jobs_to_load = get_job_ids_pending_meili_load(conn)
+            jobs_to_load = get_job_ids_pending_meili_load(conn, limit=args.load_limit)
             removed_to_load = get_removed_job_ids(conn)
             print(f"\n--- LOAD-PENDING: {len(jobs_to_load)} stale, {len(removed_to_load)} removed ---")
         else:

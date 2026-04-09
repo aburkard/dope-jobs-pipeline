@@ -823,6 +823,10 @@ def test_step_load_full_reload_refreshes_index_settings(monkeypatch):
         def fetchall(self):
             if "FROM pipeline_companies" in self.query:
                 return [("greenhouse", "figma", "Figma", "figma", "figma.com", "https://example.com/logo.png")]
+            if "SELECT id FROM pipeline_jobs" in self.query:
+                return [("greenhouse__figma__123",)]
+            if "job_group" in self.query and "GROUP BY" in self.query:
+                return []
             return []
 
         def __enter__(self):
