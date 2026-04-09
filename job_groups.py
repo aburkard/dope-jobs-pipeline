@@ -215,11 +215,6 @@ def save_job_groups(conn, groups: dict, boards: list[tuple[str, str]] | None = N
 
     Returns job ids whose persisted job_group changed.
     """
-    # Add job_group column if not exists
-    with conn.cursor() as cur:
-        cur.execute("ALTER TABLE pipeline_jobs ADD COLUMN IF NOT EXISTS job_group TEXT")
-    conn.commit()
-
     where_scope, params = _board_scope_sql(boards)
     existing_query = f"""
         SELECT id, job_group
