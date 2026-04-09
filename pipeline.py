@@ -55,47 +55,6 @@ ATS_SCRAPERS = {
 }
 
 
-def _jobs_embedders_settings() -> dict:
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not gemini_api_key:
-        return {}
-
-    return {
-        "default": {
-            "source": "rest",
-            "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
-            "distribution": {
-                "mean": 0.83,
-                "sigma": 0.04,
-            },
-            "headers": {
-                "Content-Type": "application/json",
-                "x-goog-api-key": gemini_api_key,
-            },
-            "request": {
-                "requests": [
-                    {
-                        "model": "models/gemini-embedding-001",
-                        "content": {
-                            "parts": [
-                                {"text": "{{text}}"},
-                            ]
-                        },
-                    },
-                    "{{..}}",
-                ],
-            },
-            "response": {
-                "embeddings": [
-                    {"values": "{{embedding}}"},
-                    "{{..}}",
-                ]
-            },
-            "dimensions": 3072,
-            "documentTemplateMaxBytes": 10000,
-        }
-    }
-
 
 def _connection_is_closed(conn) -> bool:
     closed = getattr(conn, "closed", 0)
@@ -1068,10 +1027,9 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         index.update_filterable_attributes(filterable_attributes)
         index.update_searchable_attributes(searchable_attributes)
         index.update_sortable_attributes(sortable_attributes)
+        # Embedder settings are managed externally via apply_perplexity_meili_embedder.py
+        # — don't touch them here to avoid clobbering the composite Perplexity config.
         settings = {"pagination": {"maxTotalHits": 500000}}
-        embedders = _jobs_embedders_settings()
-        if embedders:
-            settings["embedders"] = embedders
         index.update_settings(settings)
 
     def wait_for_task(task_uid: int, timeout_in_ms: int = 120000) -> bool:
