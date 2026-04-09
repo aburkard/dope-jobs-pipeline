@@ -1,4 +1,5 @@
 import html as html_lib
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
@@ -124,38 +125,82 @@ class LeverScraper(BaseScraper):
                 timeout=5,
                 headers=headers)
             self._cached_html = response.text
+            self._cached_html_status = response.status_code
         return self._cached_html
+
+    def _get_cached_soup(self):
+        if not hasattr(self, "_cached_soup"):
+            raw_html = self._fetch_html()
+            self._cached_soup = BeautifulSoup(raw_html, 'html.parser')
+        return self._cached_soup
+
+    def _get_page_title(self):
+        soup = self._get_cached_soup()
+        title_tag = soup.find("title")
+        return title_tag.text.strip() if title_tag and title_tag.text else None
+
+    def _is_invalid_board_page(self):
+        status = getattr(self, "_cached_html_status", None)
+        if isinstance(status, int) and status >= 400:
+            return True
+
+        title = (self._get_page_title() or "").strip().lower()
+        return bool(title) and (
+            "not found" in title
+            or "404 error" in title
+            or "job seeker support" in title
+        )
+
+    def _company_link_candidates(self):
+        soup = self._get_cached_soup()
+        for link in soup.find_all("a", href=True):
+            href = link["href"].strip()
+            if not href.startswith("http"):
+                continue
+            parsed = urlparse(href)
+            host = (parsed.hostname or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if not host:
+                continue
+            if host.endswith("lever.co"):
+                continue
+            yield href
 
     def get_company_name(self):
         if not hasattr(self, '_cached_company_name'):
-            raw_html = self._fetch_html()
-            soup = BeautifulSoup(raw_html, 'html.parser')
-            self._cached_company_name = soup.find('title').text.strip()
+            if self._is_invalid_board_page():
+                self._cached_company_name = None
+            else:
+                title = self._get_page_title()
+                if not title:
+                    self._cached_company_name = None
+                else:
+                    cleaned = title
+                    for suffix in [" - Jobs", " | Jobs", " Careers", " - Careers", " | Careers"]:
+                        if cleaned.endswith(suffix):
+                            cleaned = cleaned[: -len(suffix)].strip()
+                            break
+                    self._cached_company_name = cleaned or None
         return self._cached_company_name
 
     def get_company_domain(self):
         if not hasattr(self, '_cached_company_domain'):
-            raw_html = self._fetch_html()
-            soup = BeautifulSoup(raw_html, 'html.parser')
-            main_footer_text = soup.find("div", class_="main-footer-text")
-            if main_footer_text:
-                company_domain_link = main_footer_text.find("a")
-                if company_domain_link and company_domain_link.has_attr(
-                        'href'):
-                    self._cached_company_domain = company_domain_link['href']
-                else:
-                    self._cached_company_domain = None
-            else:
+            if self._is_invalid_board_page():
                 self._cached_company_domain = None
+            else:
+                self._cached_company_domain = next(self._company_link_candidates(), None)
         return self._cached_company_domain
 
     def get_company_logo_url(self):
         if not hasattr(self, '_cached_company_logo_url'):
-            raw_html = self._fetch_html()
-            soup = BeautifulSoup(raw_html, 'html.parser')
-            og_image = soup.find('meta', property='og:image')
-            if og_image and og_image.get('content'):
-                self._cached_company_logo_url = og_image['content'].split('?')[0]
-            else:
+            if self._is_invalid_board_page():
                 self._cached_company_logo_url = None
+            else:
+                soup = self._get_cached_soup()
+                og_image = soup.find('meta', property='og:image')
+                if og_image and og_image.get('content'):
+                    self._cached_company_logo_url = og_image['content'].split('?')[0]
+                else:
+                    self._cached_company_logo_url = None
         return self._cached_company_logo_url
