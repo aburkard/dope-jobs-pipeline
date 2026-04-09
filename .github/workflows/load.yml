@@ -35,16 +35,22 @@ jobs:
 
       - name: Test MeiliSearch connectivity
         env:
+          MEILISEARCH_HOST: https://search-internal.dopejobs.xyz
           MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          echo "CF_ACCESS_CLIENT_ID starts with: ${CF_ACCESS_CLIENT_ID:0:8}"
-          echo "CF_ACCESS_CLIENT_SECRET length: ${#CF_ACCESS_CLIENT_SECRET}"
-          curl -sv -m 15 "https://search-internal.dopejobs.xyz/health" \
+          curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" \
+            "$MEILISEARCH_HOST/health" \
             -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
             -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
-            -H "Authorization: Bearer $MEILISEARCH_MASTER_KEY" 2>&1 | head -30
+            -H "Authorization: Bearer $MEILISEARCH_MASTER_KEY"
+          echo "---"
+          curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" \
+            "$MEILISEARCH_HOST/indexes/jobs" \
+            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            -H "Authorization: Bearer $MEILISEARCH_MASTER_KEY" | head -200
 
       - name: Load pending jobs to MeiliSearch
         env:
