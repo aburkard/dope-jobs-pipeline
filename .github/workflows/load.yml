@@ -42,8 +42,9 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           PYTHONUNBUFFERED: "1"
         run: |
+          LOAD_LIMIT="${{ inputs.load_limit }}"
           ARGS=(--load-pending)
-          if [ -n "${{ inputs.load_limit }}" ]; then
-            ARGS+=(--load-limit "${{ inputs.load_limit }}")
+          if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
+            ARGS+=(--load-limit "$LOAD_LIMIT")
           fi
           uv run python pipeline.py "${ARGS[@]}"

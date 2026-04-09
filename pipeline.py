@@ -1065,7 +1065,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         settings = {"pagination": {"maxTotalHits": 500000}}
         index.update_settings(settings)
 
-    def wait_for_task(task_uid: int, timeout_in_ms: int = 120000) -> bool:
+    def wait_for_task(task_uid: int, timeout_in_ms: int = 300000) -> bool:
         try:
             result = client.wait_for_task(task_uid, timeout_in_ms=timeout_in_ms)
             status = getattr(result, "status", None)
