@@ -2,6 +2,11 @@ name: Load to MeiliSearch
 
 on:
   workflow_dispatch:
+    inputs:
+      load_limit:
+        description: "Max jobs to load (empty = all pending)"
+        required: false
+        default: ""
   workflow_run:
     workflows: ["Pipeline", "Workable Pipeline"]
     types: [completed]
@@ -36,4 +41,9 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           PYTHONUNBUFFERED: "1"
-        run: uv run python pipeline.py --load-pending
+        run: |
+          ARGS=(--load-pending)
+          if [ -n "${{ inputs.load_limit }}" ]; then
+            ARGS+=(--load-limit "${{ inputs.load_limit }}")
+          fi
+          uv run python pipeline.py "${ARGS[@]}"
