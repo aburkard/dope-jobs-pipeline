@@ -1145,8 +1145,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     print(f"  Loaded {total_loaded} documents")
 
-    # Delete removed jobs in batches (larger batches than upserts since no embeddings needed)
-    DELETE_BATCH_SIZE = max(BATCH_SIZE, 10000)
+    # Delete removed jobs in batches (larger than upsert batches since no embeddings needed)
+    DELETE_BATCH_SIZE = max(BATCH_SIZE, 2000)
     total_deleted = 0
     if removed_ids and active_index_uid == target_index_uid:
         for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
