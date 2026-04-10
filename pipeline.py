@@ -1145,21 +1145,27 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     print(f"  Loaded {total_loaded} documents")
 
-    # Delete removed jobs in batches (larger than upsert batches since no embeddings needed)
+    # Delete removed jobs: submit all delete batches, then wait for the final one.
+    # Meili processes tasks sequentially so waiting on the last task confirms all are done.
     DELETE_BATCH_SIZE = max(BATCH_SIZE, 2000)
     total_deleted = 0
     if removed_ids and active_index_uid == target_index_uid:
+        total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
+        submitted_batches: list[tuple[object, list[str]]] = []
         for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
             batch = removed_ids[i:i + DELETE_BATCH_SIZE]
             task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
             batch_num = i // DELETE_BATCH_SIZE + 1
-            total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
-            print(f"  Deleting batch {batch_num}/{total_batches} ({len(batch)} removed jobs)... (task {task.task_uid})")
-            if wait_for_task(task.task_uid, timeout_in_ms=120000):
+            print(f"  Submitted delete batch {batch_num}/{total_batches} ({len(batch)} jobs, task {task.task_uid})")
+            submitted_batches.append((task, batch))
+
+        # Wait for each task in order and mark as deleted
+        for task, batch in submitted_batches:
+            if wait_for_task(task.task_uid):
                 mark_jobs_meili_deleted(conn, batch)
                 total_deleted += len(batch)
             else:
-                print(f"  Warning: timed out on delete task {task.task_uid}, stopping deletes ({total_deleted} deleted so far)")
+                print(f"  Warning: timed out on delete task {task.task_uid}, ({total_deleted} deleted so far)")
                 break
         print(f"  Deleted {total_deleted}/{len(removed_ids)} removed jobs")
 
