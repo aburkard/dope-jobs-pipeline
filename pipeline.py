@@ -1003,21 +1003,15 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     # Load job_group counts (lightweight query, no raw_json)
     group_counts = {}
-    with conn.cursor() as cur:
-        if all_job_ids is None:
-            cur.execute("""
-                SELECT job_group, COUNT(*) FROM pipeline_jobs
-                WHERE removed_at IS NULL AND job_group IS NOT NULL
-                GROUP BY job_group
-            """)
-        elif all_job_ids:
+    if all_job_ids:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT job_group, COUNT(*) FROM pipeline_jobs
                 WHERE removed_at IS NULL AND job_group IS NOT NULL AND id = ANY(%s)
                 GROUP BY job_group
             """, (all_job_ids,))
-        for r in cur.fetchall():
-            group_counts[r[0]] = r[1]
+            for r in cur.fetchall():
+                group_counts[r[0]] = r[1]
 
     # Set up Meili client
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
