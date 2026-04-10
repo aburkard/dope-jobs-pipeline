@@ -1151,14 +1151,15 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
 
     print(f"  Loaded {total_loaded} documents")
 
-    # Delete removed jobs in batches
+    # Delete removed jobs in batches (larger batches than upserts since no embeddings needed)
+    DELETE_BATCH_SIZE = max(BATCH_SIZE, 10000)
     total_deleted = 0
     if removed_ids and active_index_uid == target_index_uid:
-        for i in range(0, len(removed_ids), BATCH_SIZE):
-            batch = removed_ids[i:i + BATCH_SIZE]
+        for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
+            batch = removed_ids[i:i + DELETE_BATCH_SIZE]
             task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
-            batch_num = i // BATCH_SIZE + 1
-            total_batches = (len(removed_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+            batch_num = i // DELETE_BATCH_SIZE + 1
+            total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
             print(f"  Deleting batch {batch_num}/{total_batches} ({len(batch)} removed jobs)... (task {task.task_uid})")
             if wait_for_task(task.task_uid, timeout_in_ms=120000):
                 mark_jobs_meili_deleted(conn, batch)
