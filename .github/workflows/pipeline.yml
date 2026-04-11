@@ -1,6 +1,8 @@
 name: Pipeline
 
 on:
+  schedule:
+    - cron: "0 6 * * *"  # Daily at 6am UTC
   workflow_dispatch:
     inputs:
       db_company_limit:
@@ -13,8 +15,8 @@ on:
         default: ""
       total_shards:
         description: "Total shard count for this rollout"
-        required: true
-        default: "8"
+        required: false
+        default: "25"
       jobvite_refetch_existing_detail:
         description: "For Jobvite, backfill missing stored detail HTML/date metadata on existing jobs"
         type: boolean
@@ -55,8 +57,11 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
-          if [ "${{ matrix.shard_index }}" -ge "${{ inputs.total_shards }}" ]; then
-            echo "Skipping shard ${{ matrix.shard_index }} because total_shards=${{ inputs.total_shards }}"
+          TOTAL_SHARDS="${{ inputs.total_shards }}"
+          TOTAL_SHARDS="${TOTAL_SHARDS:-25}"
+
+          if [ "${{ matrix.shard_index }}" -ge "$TOTAL_SHARDS" ]; then
+            echo "Skipping shard ${{ matrix.shard_index }} because total_shards=$TOTAL_SHARDS"
             exit 0
           fi
 
@@ -64,7 +69,7 @@ jobs:
             --companies-from-db
             --ats-exclude-filter workable
             --shard-index "${{ matrix.shard_index }}"
-            --total-shards "${{ inputs.total_shards }}"
+            --total-shards "$TOTAL_SHARDS"
             --skip-parse
             --skip-load
           )

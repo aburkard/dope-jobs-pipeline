@@ -1,11 +1,13 @@
 name: Workable Pipeline
 
 on:
+  schedule:
+    - cron: "0 7 * * *"  # Daily at 7am UTC (1hr after main pipeline)
   workflow_dispatch:
     inputs:
       total_shards:
         description: "Total shard count for this rollout"
-        required: true
+        required: false
         default: "20"
       companies_per_shard:
         description: "Approximate number of Workable companies each shard should process"
@@ -35,7 +37,7 @@ jobs:
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
-          total_shards = int("${{ inputs.total_shards }}")
+          total_shards = int("${{ inputs.total_shards }}" or "20")
           print(f"shard_matrix={json.dumps(list(range(total_shards)))}")
           PY
 
@@ -69,9 +71,14 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
+          TOTAL_SHARDS="${{ inputs.total_shards }}"
+          TOTAL_SHARDS="${TOTAL_SHARDS:-20}"
+          COMPANIES_PER_SHARD="${{ inputs.companies_per_shard }}"
+          COMPANIES_PER_SHARD="${COMPANIES_PER_SHARD:-50}"
+
           DB_COMPANY_LIMIT="${{ inputs.db_company_limit }}"
           if [ -z "$DB_COMPANY_LIMIT" ]; then
-            DB_COMPANY_LIMIT=$(( ${{ inputs.total_shards }} * ${{ inputs.companies_per_shard }} ))
+            DB_COMPANY_LIMIT=$(( TOTAL_SHARDS * COMPANIES_PER_SHARD ))
           fi
 
           ARGS=(
@@ -79,7 +86,7 @@ jobs:
             --ats-filter workable
             --scrape-status-filter pending blocked error empty active
             --shard-index "${{ matrix.shard_index }}"
-            --total-shards "${{ inputs.total_shards }}"
+            --total-shards "$TOTAL_SHARDS"
             --db-company-limit "$DB_COMPANY_LIMIT"
             --skip-parse
             --skip-load
