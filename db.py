@@ -1294,15 +1294,17 @@ def get_companies_to_scrape(
     ats_filter: list[str] | None = None,
     ats_exclude_filter: list[str] | None = None,
 ) -> list[tuple[str, str]]:
-    """Select a bounded set of active companies for scraping.
+    """Select companies for scraping.
 
-    Prioritize companies that have never been scraped, then oldest scrape times.
+    Includes active companies and pending/null ones that haven't been tried yet.
+    Skips companies already marked empty or error (dead boards).
+    Prioritizes never-scraped companies, then oldest scrape times.
     """
     with conn.cursor() as cur:
         query = """
             SELECT ats, board_token
             FROM pipeline_companies
-            WHERE active = TRUE
+            WHERE (active = TRUE OR scrape_status IS NULL OR scrape_status = 'pending')
         """
         params: list[object] = []
         if ats_filter:
