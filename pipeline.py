@@ -1246,7 +1246,7 @@ def main():
     init_schema(conn)
 
     selected_companies = []
-    if not args.load_pending:
+    if not args.load_pending and not args.reload_unparsed:
         try:
             companies = resolve_companies(
                 conn,
