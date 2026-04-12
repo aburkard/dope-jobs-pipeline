@@ -1192,6 +1192,8 @@ def main():
                               help="Select companies from pipeline_companies instead of a file")
     source_group.add_argument("--load-pending", action="store_true",
                               help="Standalone load: push all stale/removed jobs to MeiliSearch (no scrape or parse)")
+    source_group.add_argument("--reload-unparsed", action="store_true",
+                              help="Reload unparsed jobs to pick up new extraction fields (no scrape or parse)")
     parser.add_argument("--db-company-limit", type=int, default=None,
                         help="Required safety cap when using --companies-from-db")
     parser.add_argument("--ats-filter", nargs="+", default=None,
@@ -1235,8 +1237,8 @@ def main():
     if args.companies_from_db and not args.skip_load and not args.allow_load:
         parser.error("--skip-load or --allow-load is required with --companies-from-db")
 
-    # --load-pending is a standalone mode: skip scrape/parse, go straight to load
-    if args.load_pending:
+    # Standalone load modes: skip scrape/parse, go straight to load
+    if args.load_pending or args.reload_unparsed:
         args.skip_scrape = True
         args.skip_parse = True
 
@@ -1303,7 +1305,23 @@ def main():
     # Step 3: Load to MeiliSearch
     if not args.skip_load:
         meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
-        if args.load_pending:
+        if args.reload_unparsed:
+            # Reload unparsed jobs that were loaded before the extraction code
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM pipeline_jobs
+                    WHERE removed_at IS NULL
+                      AND raw_json IS NOT NULL
+                      AND parsed_json IS NULL
+                      AND meili_loaded_at < '2026-04-09'
+                    ORDER BY id
+                """)
+                jobs_to_load = [r[0] for r in cur.fetchall()]
+            if args.load_limit:
+                jobs_to_load = jobs_to_load[:args.load_limit]
+            removed_to_load = []
+            print(f"\n--- RELOAD-UNPARSED: {len(jobs_to_load)} jobs to reload ---")
+        elif args.load_pending:
             # Standalone load: query DB for all jobs needing a Meili refresh
             jobs_to_load = get_job_ids_pending_meili_load(conn, limit=args.load_limit)
             # Only delete removed jobs that were previously loaded into Meili

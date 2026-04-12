@@ -7,6 +7,13 @@ on:
         description: "Max jobs to load (empty = all pending)"
         required: false
         default: ""
+      mode:
+        description: "Load mode"
+        type: choice
+        options:
+          - load-pending
+          - reload-unparsed
+        default: "load-pending"
   workflow_run:
     workflows: ["Pipeline", "Workable Pipeline"]
     types: [completed]
@@ -42,8 +49,11 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           PYTHONUNBUFFERED: "1"
         run: |
+          MODE="${{ inputs.mode }}"
+          MODE="${MODE:-load-pending}"
           LOAD_LIMIT="${{ inputs.load_limit }}"
-          ARGS=(--load-pending)
+
+          ARGS=(--"$MODE")
           if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
             ARGS+=(--load-limit "$LOAD_LIMIT")
           fi
