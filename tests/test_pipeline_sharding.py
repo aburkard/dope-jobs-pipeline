@@ -1077,21 +1077,60 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
     monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: None)
     monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: None)
 
-    try:
-        pipeline.step_load(
-            FakeConn(),
-            meili_host="http://example.com",
-            meili_key="key",
-            parsed_job_ids=["greenhouse__figma__0", "greenhouse__figma__1"],
-            removed_job_ids=[],
-            meili_batch_size=1,
-        )
-    except RuntimeError as exc:
-        assert "Timed out waiting for Meili task" in str(exc)
-    else:
-        raise AssertionError("Expected step_load to stop after a timed-out Meili task")
+    # Provide enough jobs to trigger the consecutive-timeout bail (3+)
+    parsed_ids = [f"greenhouse__figma__{i}" for i in range(5)]
+    monkeypatch.setattr(
+        pipeline,
+        "get_active_jobs_for_meili",
+        lambda conn, job_ids=None, include_removed=False: [
+            {
+                "id": jid,
+                "public_job_id": jid.split("__")[-1],
+                "ats": "greenhouse",
+                "board_token": "figma",
+                "title": f"Engineer {jid}",
+                "parsed_json": {
+                    "tagline": "Build product quality systems at Figma.",
+                    "locations": [],
+                    "applicant_location_requirements": [],
+                    "office_type": "remote",
+                    "job_type": "full_time",
+                    "experience_level": "senior",
+                    "is_manager": False,
+                    "industry_primary": "enterprise_software",
+                    "industry_tags": ["enterprise_software"],
+                    "salary": None,
+                    "salary_transparency": "not_disclosed",
+                    "years_experience": {"min": 3, "max": 5},
+                    "education_level": "bachelors",
+                    "hard_skills": [],
+                    "soft_skills": [],
+                    "cool_factor": "interesting",
+                    "vibe_tags": [],
+                    "visa_sponsorship": "unknown",
+                    "equity": {"offered": False},
+                    "company_stage": "public",
+                    "benefits_categories": [],
+                    "benefits_highlights": [],
+                    "reports_to": "",
+                },
+                "job_group": None,
+                "raw_json": {"first_published": "2026-04-01T12:30:00Z"},
+            }
+            for jid in (job_ids or parsed_ids)
+        ],
+    )
+    pipeline.step_load(
+        FakeConn(),
+        meili_host="http://example.com",
+        meili_key="key",
+        parsed_job_ids=parsed_ids,
+        removed_job_ids=[],
+        meili_batch_size=1,
+    )
 
-    assert captured["client"]._index.add_calls == 1
+    # Should bail after 3 consecutive timeouts, not all 5 batches
+    assert captured["client"]._index.add_calls == 3
 
 
 def test_step_load_includes_unparsed_active_jobs_with_ats_metadata(monkeypatch):

@@ -1123,6 +1123,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     geo_lookup: dict = {}
     total_loaded = 0
 
+    total_batches = (len(all_job_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+    consecutive_timeouts = 0
     for i in range(0, len(all_job_ids), BATCH_SIZE):
         chunk_ids = all_job_ids[i:i + BATCH_SIZE]
         chunk_rows = get_active_jobs_for_meili(conn, job_ids=chunk_ids)
@@ -1133,15 +1135,20 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         if docs:
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
-            print(f"  Upserting batch {batch_num} ({len(docs)} docs)... (task {task.task_uid})")
-            if wait_for_task(task.task_uid):
+            print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
+            # Longer timeout for upserts: embeddings can be slow when Meili queue is backed up
+            if wait_for_task(task.task_uid, timeout_in_ms=600000):
                 mark_jobs_meili_loaded(conn, [doc["id"] for doc in docs])
                 total_loaded += len(docs)
+                consecutive_timeouts = 0
             else:
-                raise RuntimeError(
-                    f"Timed out waiting for Meili task {task.task_uid}; "
-                    "stopping further document submissions to avoid overloading the queue"
-                )
+                consecutive_timeouts += 1
+                print(f"  Warning: timed out on task {task.task_uid} after 10min "
+                      f"({consecutive_timeouts} consecutive timeout{'s' if consecutive_timeouts > 1 else ''})")
+                # Bail after 3 in a row — Meili is probably stuck
+                if consecutive_timeouts >= 3:
+                    print(f"  Stopping after {consecutive_timeouts} consecutive timeouts; remainder will retry next run")
+                    break
 
     print(f"  Loaded {total_loaded} documents")
 
