@@ -1,5 +1,6 @@
 import sys
 import types
+import pytest
 from datetime import datetime, timezone
 
 import pipeline
@@ -652,7 +653,8 @@ def test_build_job_geojson_includes_all_unique_points():
     }
 
 
-def test_step_load_marks_loaded_and_deleted(monkeypatch):
+@pytest.mark.parametrize("drop_ack_connection", [False, True])
+def test_step_load_marks_loaded_and_deleted(monkeypatch, drop_ack_connection):
     captured = {}
 
     class FakeCursor:
@@ -676,10 +678,10 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
             return FakeCursor()
 
         def commit(self):
-            return None
+            self.committed = True
 
-        def commit(self):
-            return None
+        def close(self):
+            self.closed = True
 
     class FakeTask:
         def __init__(self, task_uid):
@@ -688,6 +690,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
     class FakeIndex:
         def __init__(self):
             self.primary_key = "meili_id"
+            self.add_calls = 0
 
         def update_filterable_attributes(self, attrs):
             self.filterable = attrs
@@ -705,6 +708,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
             return self.primary_key
 
         def add_documents(self, docs, primary_key="id"):
+            self.add_calls += 1
             self.docs = docs
             self.primary_key_arg = primary_key
             return FakeTask(1)
@@ -732,6 +736,7 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
             return self._index
 
         def wait_for_task(self, task_uid, timeout_in_ms=0):
+            assert initial_conn.committed, "Do not hold the lookup transaction while Meili runs"
             return {"uid": task_uid}
 
     fake_meili = types.SimpleNamespace(Client=FakeClient)
@@ -786,11 +791,20 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
 
     loaded_calls = []
     deleted_calls = []
-    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: loaded_calls.append(list(ids)))
+    initial_conn = FakeConn()
+    replacement = FakeConn()
+    ack_attempts = []
+    monkeypatch.setattr(pipeline, "get_connection", lambda: replacement)
+    def acknowledge(conn, ids):
+        ack_attempts.append(conn)
+        if drop_ack_connection and len(ack_attempts) == 1:
+            raise pipeline.OperationalError("SSL connection has been closed unexpectedly")
+        loaded_calls.append(list(ids))
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", acknowledge)
     monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: deleted_calls.append(list(ids)))
 
     pipeline.step_load(
-        FakeConn(),
+        initial_conn,
         meili_host="http://example.com",
         meili_key="key",
         parsed_job_ids=["greenhouse__figma__123"],
@@ -798,6 +812,11 @@ def test_step_load_marks_loaded_and_deleted(monkeypatch):
     )
 
     assert loaded_calls == [["greenhouse__figma__123"]]
+    assert captured["client"]._index.add_calls == 1
+    assert len(ack_attempts) == (2 if drop_ack_connection else 1)
+    if drop_ack_connection:
+        assert ack_attempts == [initial_conn, replacement]
+        assert replacement.closed is True
     assert deleted_calls == [["greenhouse__figma__gone"]]
     assert captured["client"]._index.primary_key_arg == "meili_id"
     assert captured["client"]._index.docs[0]["meili_id"] == meili_safe_job_id("greenhouse__figma__123")
@@ -983,6 +1002,9 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
     class FakeConn:
         def cursor(self):
             return FakeCursor()
+
+        def commit(self):
+            return None
 
     class FakeTask:
         def __init__(self, task_uid):

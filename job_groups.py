@@ -9,6 +9,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 load_dotenv()
 from psycopg2.extras import execute_values
+from psycopg2 import InterfaceError, OperationalError
 
 from db import get_connection
 from parse import prepare_job_text
@@ -145,6 +146,9 @@ def compute_job_groups(conn, boards: list[tuple[str, str]] | None = None) -> tup
         """, params)
         rows = cur.fetchall()
 
+    # Similarity grouping can take minutes; leave no read transaction open.
+    conn.commit()
+
     # Group candidates by ATS board + normalized title
     by_key = defaultdict(list)
     for job_id, ats_name, board, title, raw_json, stored_hash in rows:
@@ -210,7 +214,8 @@ def compute_job_groups(conn, boards: list[tuple[str, str]] | None = None) -> tup
     return groups, group_stats
 
 
-def save_job_groups(conn, groups: dict, boards: list[tuple[str, str]] | None = None) -> list[str]:
+def save_job_groups(conn, groups: dict, boards: list[tuple[str, str]] | None = None,
+                    changed_ids_out: list[str] | None = None) -> list[str]:
     """Save job_group assignments to DB for the selected scope.
 
     Returns job ids whose persisted job_group changed.
@@ -243,6 +248,11 @@ def save_job_groups(conn, groups: dict, boards: list[tuple[str, str]] | None = N
         new_count = new_counts.get(new_group, 1 if new_group is None else 0)
         if previous_group != new_group or previous_count != new_count:
             changed_ids.append(job_id)
+
+    # Preserve the intended refresh set even if COMMIT succeeds but its
+    # response is lost and the retry observes already-updated assignments.
+    if changed_ids_out is not None:
+        changed_ids_out.extend(changed_ids)
 
     clear_query = f"""
         UPDATE pipeline_jobs
@@ -279,7 +289,19 @@ def recompute_job_groups_for_boards(conn, boards: list[tuple[str, str]]) -> tupl
         return [], {"groups": 0, "grouped_jobs": 0, "singletons": 0}
 
     groups, stats = compute_job_groups(conn, boards=normalized)
-    changed_ids = save_job_groups(conn, groups, boards=normalized)
+    planned_changes: list[str] = []
+    try:
+        changed_ids = save_job_groups(conn, groups, boards=normalized, changed_ids_out=planned_changes)
+    except (InterfaceError, OperationalError):
+        # Reuse the expensive computed groups after an idle connection drops.
+        # Saving assignments is idempotent; no scrape or similarity replay.
+        conn.close()
+        replacement = get_connection()
+        try:
+            changed_ids = save_job_groups(replacement, groups, boards=normalized)
+            changed_ids = sorted(set(changed_ids) | set(planned_changes))
+        finally:
+            replacement.close()
     return changed_ids, stats
 
 

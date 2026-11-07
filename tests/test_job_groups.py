@@ -112,6 +112,9 @@ def test_compute_job_groups_scopes_by_ats_and_board():
         def cursor(self):
             return FakeCursor()
 
+        def commit(self):
+            pass
+
     groups, stats = compute_job_groups(FakeConn(), boards=[("greenhouse", "shared"), ("lever", "shared")])
 
     assert groups["greenhouse__shared__1"] == groups["greenhouse__shared__2"]
@@ -157,6 +160,9 @@ def test_compute_job_groups_avoids_prepare_text_for_pure_hash_duplicates(monkeyp
     class FakeConn:
         def cursor(self):
             return FakeCursor()
+
+        def commit(self):
+            pass
 
     def fail_prepare(*_args, **_kwargs):
         raise AssertionError("prepare_job_text should not be called for pure hash duplicates")
