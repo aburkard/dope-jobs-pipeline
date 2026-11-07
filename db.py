@@ -759,13 +759,25 @@ def replace_job_recommendations(
 
 
 def get_existing_jobs_for_board(conn, ats: str, board_token: str) -> dict[str, dict]:
-    """Get existing raw jobs for a board keyed by compound job ID."""
+    """Read only the stored fields this ATS reuses during scraping.
+
+    Keep historical jobs eligible for reuse when they reappear, without
+    transferring their full raw payloads on every daily scrape.
+    """
+    if ats == "greenhouse":
+        fields = ("pay_input_ranges",)
+    elif ats == "jobvite":
+        fields = ("description", "descriptionHtml", "datePosted", "validThrough", "inactive")
+    else:
+        return {}
+    projection = ", ".join("%s, raw_json -> %s" for _ in fields)
+    params = [part for field in fields for part in (field, field)]
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, raw_json
+        cur.execute(f"""
+            SELECT id, jsonb_strip_nulls(jsonb_build_object({projection}))
             FROM pipeline_jobs
             WHERE ats = %s AND board_token = %s
-        """, (ats, board_token))
+        """, (*params, ats, board_token))
         return {row[0]: (row[1] or {}) for row in cur.fetchall()}
 
 

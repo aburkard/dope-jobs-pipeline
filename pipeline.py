@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 load_dotenv()
 from psycopg2.extras import Json
+from psycopg2 import InterfaceError, OperationalError
 
 from scrapers.greenhouse_scraper import GreenhouseScraper
 from scrapers.lever_scraper import LeverScraper
@@ -954,7 +955,42 @@ def _build_meili_doc(row: dict, metadata: dict, company_lookup: dict, fx_rates: 
     return doc
 
 
+class _LoadDatabase:
+    """Recover a dropped DB connection without replaying a Meili submission."""
+
+    def __init__(self, conn):
+        self.original = self.conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.conn is not self.original:
+            self.conn.close()
+
+    def run(self, operation):
+        try:
+            return operation(self.conn)
+        except (InterfaceError, OperationalError):
+            # Only DB reads and idempotent load acknowledgements use this.
+            # Never retry add_documents: the external task may already exist.
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = get_connection()
+            return operation(self.conn)
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
+              parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
+              full_reload: bool = False, meili_batch_size: int = 1000):
+    with _LoadDatabase(conn) as database:
+        return _step_load(database, meili_host, meili_key, parsed_job_ids,
+                          removed_job_ids, full_reload, meili_batch_size)
+
+
+def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
               full_reload: bool = False, meili_batch_size: int = 1000):
     """Load active jobs from DB into MeiliSearch, using ATS-only metadata when needed.
@@ -964,6 +1000,8 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     import meilisearch
     from parse import merge_api_data
     from geo_resolver import GeoResolver
+
+    conn = database.conn
 
     # Determine which job IDs to load (lightweight — no raw_json)
     if full_reload:
@@ -1012,6 +1050,9 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
             """, (all_job_ids,))
             for r in cur.fetchall():
                 group_counts[r[0]] = r[1]
+
+    # Delete-only loads and index creation also wait on external tasks.
+    conn.commit()
 
     # Set up Meili client
     key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
@@ -1127,18 +1168,23 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
     consecutive_timeouts = 0
     for i in range(0, len(all_job_ids), BATCH_SIZE):
         chunk_ids = all_job_ids[i:i + BATCH_SIZE]
-        chunk_rows = get_active_jobs_for_meili(conn, job_ids=chunk_ids)
+        chunk_rows = database.run(lambda c: get_active_jobs_for_meili(c, job_ids=chunk_ids))
         if not chunk_rows:
+            database.conn.commit()
             continue
+        conn = database.conn
+        geo_resolver.conn = conn
         docs = _build_docs_for_chunk(chunk_rows, merge_api_data, geo_resolver, company_lookup,
                                      fx_rates, fx_as_of, geo_lookup, group_counts, boilerplate_cache, conn)
+        # End the read transaction before waiting minutes for embeddings.
+        conn.commit()
         if docs:
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
             print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
             # Longer timeout for upserts: embeddings can be slow when Meili queue is backed up
             if wait_for_task(task.task_uid, timeout_in_ms=600000):
-                mark_jobs_meili_loaded(conn, [doc["id"] for doc in docs])
+                database.run(lambda c: mark_jobs_meili_loaded(c, [doc["id"] for doc in docs]))
                 total_loaded += len(docs)
                 consecutive_timeouts = 0
             else:
@@ -1169,7 +1215,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         # Wait for each task in order and mark as deleted
         for task, batch in submitted_batches:
             if wait_for_task(task.task_uid):
-                mark_jobs_meili_deleted(conn, batch)
+                database.run(lambda c: mark_jobs_meili_deleted(c, batch))
                 total_deleted += len(batch)
             else:
                 print(f"  Warning: timed out on delete task {task.task_uid}, ({total_deleted} deleted so far)")
@@ -1184,7 +1230,7 @@ def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | 
         wait_for_task(delete_task.task_uid, timeout_in_ms=120000)
         # For full reload, all active jobs were already marked in the chunked loop above
         if removed_ids:
-            mark_jobs_meili_deleted(conn, removed_ids)
+            database.run(lambda c: mark_jobs_meili_deleted(c, removed_ids))
         index = client.index(target_index_uid)
 
     stats = index.get_stats()
