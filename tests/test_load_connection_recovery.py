@@ -31,7 +31,8 @@ def test_index_creation_wait_has_no_open_lookup_transaction(monkeypatch):
         pipeline.step_load(conn, parsed_job_ids=["job"])
 
 
-def test_delete_only_wait_has_no_open_lookup_transaction(monkeypatch):
+@pytest.mark.parametrize("timeout_batch", [None, 1, 2])
+def test_delete_batches_wait_and_acknowledge_before_submitting_more(monkeypatch, timeout_batch):
     class Connection:
         in_transaction = False
         def cursor(self):
@@ -43,25 +44,44 @@ def test_delete_only_wait_has_no_open_lookup_transaction(monkeypatch):
         def fetchall(self): return []
         def commit(self): self.in_transaction = False
     conn = Connection()
+    events = []
     class Index:
         def get_primary_key(self): return "meili_id"
-        def delete_documents(self, **kwargs): return SimpleNamespace(task_uid=1)
+        def delete_documents(self, **kwargs):
+            task_uid = 1 + sum(event[0] == "submit" for event in events)
+            events.append(("submit", task_uid))
+            return SimpleNamespace(task_uid=task_uid)
         def get_stats(self): return SimpleNamespace(number_of_documents=0)
     class Client:
         def __init__(self, *args, **kwargs): pass
         def get_index(self, *args): return Index()
         def index(self, *args): return Index()
-        def wait_for_task(self, *args, **kwargs):
+        def wait_for_task(self, task_uid, **kwargs):
             assert not conn.in_transaction
+            events.append(("wait", task_uid))
+            if task_uid == timeout_batch:
+                raise TimeoutError("index queue stalled")
             return {"status": "succeeded"}
     import sys
     monkeypatch.setitem(sys.modules, "meilisearch", SimpleNamespace(Client=Client))
     monkeypatch.setattr(pipeline, "get_latest_fx_rates", lambda c: ({}, None))
-    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda c, **kw: ["gone"])
+    removed_ids = [f"gone-{i}" for i in range(4001)]
+    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda c, **kw: removed_ids)
     deleted = []
-    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda c, ids: deleted.extend(ids))
-    pipeline.step_load(conn, parsed_job_ids=[], removed_job_ids=["gone"])
-    assert deleted == ["gone"]
+    def acknowledge(conn, ids):
+        deleted.extend(ids)
+        events.append(("ack", (len(deleted) + 1999) // 2000))
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", acknowledge)
+    pipeline.step_load(conn, parsed_job_ids=[], removed_job_ids=removed_ids)
+    expected = []
+    for task_uid in range(1, 4):
+        expected.extend([("submit", task_uid), ("wait", task_uid)])
+        if task_uid == timeout_batch:
+            break
+        expected.append(("ack", task_uid))
+    assert events == expected
+    successful_count = len(removed_ids) if timeout_batch is None else (timeout_batch - 1) * 2000
+    assert deleted == removed_ids[:successful_count]
 
 
 @pytest.mark.parametrize("commit_applied", [False, True])

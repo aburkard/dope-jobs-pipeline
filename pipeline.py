@@ -1198,22 +1198,17 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     print(f"  Loaded {total_loaded} documents")
 
-    # Delete removed jobs: submit all delete batches, then wait for the final one.
-    # Meili processes tasks sequentially so waiting on the last task confirms all are done.
+    # Confirm and acknowledge each delete batch before submitting more work.
+    # A stalled queue must not accumulate the entire backlog again on every run.
     DELETE_BATCH_SIZE = max(BATCH_SIZE, 2000)
     total_deleted = 0
     if removed_ids and active_index_uid == target_index_uid:
         total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
-        submitted_batches: list[tuple[object, list[str]]] = []
         for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
             batch = removed_ids[i:i + DELETE_BATCH_SIZE]
             task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
             batch_num = i // DELETE_BATCH_SIZE + 1
             print(f"  Submitted delete batch {batch_num}/{total_batches} ({len(batch)} jobs, task {task.task_uid})")
-            submitted_batches.append((task, batch))
-
-        # Wait for each task in order and mark as deleted
-        for task, batch in submitted_batches:
             if wait_for_task(task.task_uid):
                 database.run(lambda c: mark_jobs_meili_deleted(c, batch))
                 total_deleted += len(batch)
