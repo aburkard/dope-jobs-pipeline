@@ -8,7 +8,7 @@ usage:
   nano_bench.py http NAME URL tei|llama [--pid PID]  # running TEI (/embed) or llama-server (/v1/embeddings)
   nano_bench.py ort NAME MODEL.onnx                  # ONNX Runtime CPU, 4 threads
   nano_bench.py export OUT_DIR                       # own ONNX export (explicit bidirectional mask) + int8 variants
-  nano_bench.py torch NAME fp32|int8                 # sentence-transformers, optionally torch dynamic int8 Linear
+  nano_bench.py torch NAME fp32|bf16|int8                # sentence-transformers, optionally torch dynamic int8 Linear
 """
 import json, os, resource, statistics, sys, time
 import numpy as np
@@ -59,11 +59,15 @@ def report(res):
         f.write(f"### {res['name']}\n```\n{json.dumps(res, indent=1)}\n```\n")
 
 
-def st_model():
+def st_model(dtype="float32"):
+    # explicit dtype: config.json says bfloat16 and transformers 5 loads that by default ("auto"), which is NOT fp32
     import torch
     from sentence_transformers import SentenceTransformer
     torch.set_num_threads(4)
-    return SentenceTransformer(REPO, device="cpu", trust_remote_code=True, truncate_dim=DIM)
+    m = SentenceTransformer(REPO, device="cpu", trust_remote_code=True, truncate_dim=DIM,
+                            model_kwargs={"dtype": getattr(torch, dtype)})
+    print("loaded dtype:", next(m[0].auto_model.parameters()).dtype)
+    return m
 
 
 def main():
@@ -122,7 +126,7 @@ def main():
     elif mode == "torch":
         import torch
         kind = sys.argv[3]
-        m = st_model()
+        m = st_model("bfloat16" if kind == "bf16" else "float32")
         if kind == "int8":
             torch.backends.quantized.engine = "x86" if "x86" in torch.backends.quantized.supported_engines else "fbgemm"
             res["qengine"] = torch.backends.quantized.engine

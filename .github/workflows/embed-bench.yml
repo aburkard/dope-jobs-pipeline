@@ -135,6 +135,7 @@ jobs:
         run: |
           python bench/nano_bench.py torch torch_fp32_native fp32
           python bench/nano_bench.py torch torch_int8_native int8
+          python bench/nano_bench.py torch torch_bf16_native bf16
       - name: torch fp32 + dynamic int8, AVX2-restricted
         continue-on-error: true
         env:
@@ -145,6 +146,7 @@ jobs:
         run: |
           python bench/nano_bench.py torch torch_fp32_avx2 fp32
           python bench/nano_bench.py torch torch_int8_avx2 int8
+          python bench/nano_bench.py torch torch_bf16_avx2 bf16
 
   tei:
     runs-on: ubuntu-latest
