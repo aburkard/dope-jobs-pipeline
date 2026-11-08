@@ -56,6 +56,16 @@ jobs:
           docker stats --no-stream --format 'tei-pplx mem {{.MemUsage}}' tei-pplx | tee -a "$GITHUB_STEP_SUMMARY"
           docker rm -f tei-pplx
 
+      - name: TEI voyage-4-nano (fp32) - load, latency
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-nano --cpus 4 -p 8082:80 $TEI_IMAGE --model-id voyageai/voyage-4-nano --dtype float32
+          for i in $(seq 1 180); do curl -fs localhost:8082/health >/dev/null && break; sleep 5; done
+          docker logs tei-nano 2>&1 | tail -15
+          python bench/bench_tei.py tei_voyage4_nano_fp32 http://localhost:8082 --prefix "Represent the query for retrieving supporting documents: "
+          docker stats --no-stream --format 'tei-nano mem {{.MemUsage}}' tei-nano | tee -a "$GITHUB_STEP_SUMMARY"
+          docker rm -f tei-nano
+
       - name: ONNX Runtime pplx fp32 vs int8 (4 threads)
         continue-on-error: true
         run: |

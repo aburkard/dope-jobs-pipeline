@@ -27,13 +27,13 @@ def timed(fn, prefix=""):
 
 if variant.startswith("onnx"):
     import numpy as np, onnxruntime as ort
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
     repo = "perplexity-ai/pplx-embed-v1-0.6B"
     f = "onnx/model.onnx" if variant == "onnx_fp32" else "onnx/model_quantized.onnx"
-    path = hf_hub_download(repo, f)
-    for extra in (["onnx/model.onnx_data", "onnx/model.onnx_data_1"] if variant == "onnx_fp32" else ["onnx/model_quantized.onnx_data"]):
-        hf_hub_download(repo, extra)
+    # local_dir: real files, so ONNX Runtime accepts the external-data paths (cache symlinks are rejected)
+    local = snapshot_download(repo, allow_patterns=[f + "*", "*.json", "*.txt"], local_dir=f"/tmp/pplx-{variant}")
+    path = f"{local}/{f}"
     so = ort.SessionOptions(); so.intra_op_num_threads = 4; so.inter_op_num_threads = 1
     sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
     tok = AutoTokenizer.from_pretrained(repo, trust_remote_code=False)
