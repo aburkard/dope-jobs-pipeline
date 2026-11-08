@@ -45,6 +45,13 @@ from db import (
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
 from job_groups import recompute_job_groups_for_boards
+from meili_reconcile import (
+    cancel_enqueued_deletions,
+    make_meili_client,
+    print_meili_status,
+    reconcile_meili,
+)
+from frontend_revalidate import revalidate_changed_jobs
 
 
 ATS_SCRAPERS = {
@@ -1054,16 +1061,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
     # Delete-only loads and index creation also wait on external tasks.
     conn.commit()
 
-    # Set up Meili client
-    key = meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", "")
-    custom_headers = {}
-    cf_client_id = os.environ.get("CF_ACCESS_CLIENT_ID")
-    cf_client_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
-    if cf_client_id:
-        custom_headers["CF-Access-Client-Id"] = cf_client_id
-    if cf_client_secret:
-        custom_headers["CF-Access-Client-Secret"] = cf_client_secret
-    client = meilisearch.Client(meili_host, key, custom_headers=custom_headers or None)
+    client = make_meili_client(meili_host, meili_key)
 
     filterable_attributes = [
         "id", "public_job_id",
@@ -1158,8 +1156,33 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"Failed to submit documents for batch of {len(batch)} docs") from last_error
 
-    # Process active jobs in chunks: fetch from DB → build docs → submit to Meili
     BATCH_SIZE = max(1, int(meili_batch_size))
+
+    # Delete removed jobs before upserting: deletes are cheap, keep removed jobs
+    # out of search promptly, and must not queue behind slow embedding batches.
+    # Confirm and acknowledge each batch before submitting more work, so a
+    # stalled queue never accumulates the entire backlog again.
+    DELETE_BATCH_SIZE = max(BATCH_SIZE, 2000)
+    total_deleted = 0
+    deleted_job_ids: list[str] = []
+    if removed_ids and active_index_uid == target_index_uid:
+        total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
+        for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
+            batch = removed_ids[i:i + DELETE_BATCH_SIZE]
+            task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
+            batch_num = i // DELETE_BATCH_SIZE + 1
+            print(f"  Submitted delete batch {batch_num}/{total_batches} ({len(batch)} jobs, task {task.task_uid})")
+            if wait_for_task(task.task_uid):
+                database.run(lambda c: mark_jobs_meili_deleted(c, batch))
+                total_deleted += len(batch)
+                deleted_job_ids.extend(batch)
+            else:
+                print(f"  Warning: timed out on delete task {task.task_uid}, ({total_deleted} deleted so far)")
+                break
+        print(f"  Deleted {total_deleted}/{len(removed_ids)} removed jobs")
+
+    # Process active jobs in chunks: fetch from DB → build docs → submit to Meili
+    loaded_job_ids: list[str] = []
     boilerplate_cache: dict[str, set[str]] = {}
     geo_lookup: dict = {}
     total_loaded = 0
@@ -1186,6 +1209,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
             if wait_for_task(task.task_uid, timeout_in_ms=600000):
                 database.run(lambda c: mark_jobs_meili_loaded(c, [doc["id"] for doc in docs]))
                 total_loaded += len(docs)
+                loaded_job_ids.extend(doc["id"] for doc in docs)
                 consecutive_timeouts = 0
             else:
                 consecutive_timeouts += 1
@@ -1197,25 +1221,6 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
                     break
 
     print(f"  Loaded {total_loaded} documents")
-
-    # Confirm and acknowledge each delete batch before submitting more work.
-    # A stalled queue must not accumulate the entire backlog again on every run.
-    DELETE_BATCH_SIZE = max(BATCH_SIZE, 2000)
-    total_deleted = 0
-    if removed_ids and active_index_uid == target_index_uid:
-        total_batches = (len(removed_ids) + DELETE_BATCH_SIZE - 1) // DELETE_BATCH_SIZE
-        for i in range(0, len(removed_ids), DELETE_BATCH_SIZE):
-            batch = removed_ids[i:i + DELETE_BATCH_SIZE]
-            task = index.delete_documents(ids=[meili_safe_job_id(job_id) for job_id in batch])
-            batch_num = i // DELETE_BATCH_SIZE + 1
-            print(f"  Submitted delete batch {batch_num}/{total_batches} ({len(batch)} jobs, task {task.task_uid})")
-            if wait_for_task(task.task_uid):
-                database.run(lambda c: mark_jobs_meili_deleted(c, batch))
-                total_deleted += len(batch)
-            else:
-                print(f"  Warning: timed out on delete task {task.task_uid}, ({total_deleted} deleted so far)")
-                break
-        print(f"  Deleted {total_deleted}/{len(removed_ids)} removed jobs")
 
     if recreate_index:
         swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])
@@ -1231,6 +1236,10 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
     stats = index.get_stats()
     print(f"  Index: {stats.number_of_documents} documents")
 
+    # Full reloads rebuild search only; page caches expire via their backstop.
+    if not full_reload and (deleted_job_ids or loaded_job_ids):
+        database.run(lambda c: revalidate_changed_jobs(c, deleted_job_ids + loaded_job_ids))
+
 
 def main():
     parser = argparse.ArgumentParser(description="dopejobs pipeline")
@@ -1242,6 +1251,16 @@ def main():
                               help="Standalone load: push all stale/removed jobs to MeiliSearch (no scrape or parse)")
     source_group.add_argument("--reload-unparsed", action="store_true",
                               help="Reload unparsed jobs to pick up new extraction fields (no scrape or parse)")
+    source_group.add_argument("--meili-status", action="store_true",
+                              help="Print Meili index, task queue, and embedder status (read-only)")
+    source_group.add_argument("--reconcile-meili", action="store_true",
+                              help="Compare DB load flags with Meili documents and fix both sides")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --reconcile-meili: report the plan without changing anything")
+    parser.add_argument("--cancel-enqueued-deletes", action="store_true",
+                        help="With --reconcile-meili: cancel queued documentDeletion tasks first")
+    parser.add_argument("--backlog-max-age-days", type=int, default=None,
+                        help="With --load-pending: skip never-loaded jobs first seen more than N days ago")
     parser.add_argument("--db-company-limit", type=int, default=None,
                         help="Required safety cap when using --companies-from-db")
     parser.add_argument("--ats-filter", nargs="+", default=None,
@@ -1289,6 +1308,21 @@ def main():
     if args.load_pending or args.reload_unparsed:
         args.skip_scrape = True
         args.skip_parse = True
+
+    if args.meili_status or args.reconcile_meili:
+        meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
+        client = make_meili_client(meili_host, args.meili_key)
+        print_meili_status(client)
+        if args.reconcile_meili:
+            if args.cancel_enqueued_deletes and not args.dry_run:
+                cancel_enqueued_deletions(client)
+            conn = get_connection()
+            try:
+                reconcile_meili(conn, client, dry_run=args.dry_run)
+            finally:
+                conn.close()
+            print_meili_status(client)
+        return
 
     conn = get_connection()
     init_schema(conn)
@@ -1371,7 +1405,8 @@ def main():
             print(f"\n--- RELOAD-UNPARSED: {len(jobs_to_load)} jobs to reload ---")
         elif args.load_pending:
             # Standalone load: query DB for all jobs needing a Meili refresh
-            jobs_to_load = get_job_ids_pending_meili_load(conn, limit=args.load_limit)
+            jobs_to_load = get_job_ids_pending_meili_load(
+                conn, limit=args.load_limit, backlog_max_age_days=args.backlog_max_age_days)
             # Only delete removed jobs that were previously loaded into Meili
             with conn.cursor() as cur:
                 cur.execute("""

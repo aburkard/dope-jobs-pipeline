@@ -575,8 +575,13 @@ def get_removed_job_ids(conn, job_ids: list[str] | None = None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
-def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int | None = None) -> list[str]:
-    """Return active jobs whose current ATS/enriched version is not yet loaded into Meili."""
+def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int | None = None,
+                                   backlog_max_age_days: int | None = None) -> list[str]:
+    """Return active jobs whose current ATS/enriched version is not yet loaded into Meili.
+
+    backlog_max_age_days keeps refreshing jobs already in Meili and loading new
+    jobs, but skips never-loaded jobs first seen before that window (the backlog).
+    """
     query = """
         SELECT id
         FROM pipeline_jobs
@@ -596,6 +601,9 @@ def get_job_ids_pending_meili_load(conn, batch_id: str | None = None, limit: int
     if batch_id is not None:
         query += " AND parse_params->>'batch_id' = %s"
         params.append(batch_id)
+    if backlog_max_age_days is not None:
+        query += " AND (meili_loaded_at IS NOT NULL OR first_seen_at >= NOW() - make_interval(days => %s))"
+        params.append(backlog_max_age_days)
     query += " ORDER BY last_parsed_at ASC NULLS LAST, id"
     if limit is not None:
         query += " LIMIT %s"
