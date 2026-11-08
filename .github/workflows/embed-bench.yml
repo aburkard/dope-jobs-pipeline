@@ -1,0 +1,67 @@
+# Throwaway embedding benchmark on an x86 AMD EPYC runner (proxy for the Hetzner CPX31 box).
+# Runs only on pushes to the embed-bench branch; uses no secrets and no production data.
+name: Embedding benchmark (throwaway)
+
+on:
+  push:
+    branches: [embed-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TEI_IMAGE: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+      LEAF_PREFIX: "Represent this sentence for searching relevant passages: "
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU info
+        run: |
+          grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni|amx_int8" /proc/cpuinfo | sort | uniq -c
+          free -m | head -2
+          echo "### Runner CPU" >> "$GITHUB_STEP_SUMMARY"
+          lscpu | grep -E "Model name|^CPU\(s\)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps (CPU torch)
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q sentence-transformers onnxruntime transformers huggingface_hub requests numpy
+
+      - name: TEI leaf-ir (fp32) - load, parity, latency, doc throughput
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-leaf --cpus 4 -p 8080:80 $TEI_IMAGE --model-id MongoDB/mdbr-leaf-ir --dtype float32
+          for i in $(seq 1 120); do curl -fs localhost:8080/health >/dev/null && break; sleep 5; done
+          docker logs tei-leaf 2>&1 | tail -15
+          python bench/bench_tei.py tei_leaf_ir_fp32 http://localhost:8080 --prefix "$LEAF_PREFIX" --docs --reference-model MongoDB/mdbr-leaf-ir
+          docker stats --no-stream --format 'tei-leaf mem {{.MemUsage}}' tei-leaf | tee -a "$GITHUB_STEP_SUMMARY"
+          docker rm -f tei-leaf
+
+      - name: TEI pplx-embed-v1-0.6B (fp32, same flags as the box) - latency
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-pplx --cpus 4 -p 8081:80 $TEI_IMAGE --model-id perplexity-ai/pplx-embed-v1-0.6B \
+            --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
+          for i in $(seq 1 180); do curl -fs localhost:8081/health >/dev/null && break; sleep 5; done
+          docker logs tei-pplx 2>&1 | tail -10
+          python bench/bench_tei.py tei_pplx_fp32_boxflags http://localhost:8081
+          docker stats --no-stream --format 'tei-pplx mem {{.MemUsage}}' tei-pplx | tee -a "$GITHUB_STEP_SUMMARY"
+          docker rm -f tei-pplx
+
+      - name: ONNX Runtime pplx fp32 vs int8 (4 threads)
+        continue-on-error: true
+        run: |
+          python bench/bench_py.py onnx_fp32
+          python bench/bench_py.py onnx_int8
+
+      - name: leaf-ir sentence-transformers torch (Actions load-job doc path)
+        continue-on-error: true
+        run: python bench/bench_py.py leaf_torch
