@@ -54,6 +54,7 @@ def rss(pid="self"):
 
 def report(res):
     res["isa_env"] = ISA or "native"
+    res["cpu"] = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
     print(json.dumps(res))
     with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as f:
         f.write(f"### {res['name']}\n```\n{json.dumps(res, indent=1)}\n```\n")
@@ -130,7 +131,9 @@ def main():
         if kind == "int8":
             torch.backends.quantized.engine = "x86" if "x86" in torch.backends.quantized.supported_engines else "fbgemm"
             res["qengine"] = torch.backends.quantized.engine
-            m[0].auto_model = torch.ao.quantization.quantize_dynamic(m[0].auto_model, {torch.nn.Linear}, dtype=torch.qint8)
+            inner = m[0].auto_model  # quantize in place: reassigning the attribute is not picked up by sentence-transformers 6
+            torch.ao.quantization.quantize_dynamic(inner, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
+            res["quantized_linears"] = sum(1 for x in inner.modules() if "quantized" in type(x).__module__)
         enc = lambda q: m.encode([PROMPT + q])[0]
         res.update(cos(enc)); res.update(timed(enc))
         res.update(rss())
@@ -188,6 +191,14 @@ def export(out_dir):
     print(os.listdir(out_dir))
     quantize_dynamic(path, f"{out_dir}/model_int8.onnx", weight_type=QuantType.QInt8)
     quantize_dynamic(path, f"{out_dir}/model_int8rr.onnx", weight_type=QuantType.QInt8, per_channel=True, reduce_range=True)
+    quantize_dynamic(path, f"{out_dir}/model_int8pc.onnx", weight_type=QuantType.QInt8, per_channel=True)
+    quantize_dynamic(path, f"{out_dir}/model_int8u8.onnx", weight_type=QuantType.QUInt8, per_channel=True)
+    import onnx
+    g = onnx.load(path, load_external_data=False).graph
+    down = [n.name for n in g.node if n.op_type == "MatMul" and "down_proj" in n.name]
+    print("excluding down_proj MatMuls:", len(down))
+    quantize_dynamic(path, f"{out_dir}/model_int8nodown.onnx", weight_type=QuantType.QInt8, per_channel=True,
+                     reduce_range=True, nodes_to_exclude=down)
     print(os.listdir(out_dir))
 
 
