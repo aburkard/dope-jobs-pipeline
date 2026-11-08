@@ -13,7 +13,19 @@ on:
         options:
           - load-pending
           - reload-unparsed
+          - meili-status
+          - reconcile-meili-dry-run
+          - reconcile-meili
         default: "load-pending"
+      backlog_max_age_days:
+        description: "load-pending: skip never-loaded jobs first seen more than N days ago (empty = load the whole backlog)"
+        required: false
+        default: "2"
+      cancel_enqueued_deletes:
+        description: "reconcile-meili: cancel queued documentDeletion tasks first"
+        type: boolean
+        required: false
+        default: false
   workflow_run:
     workflows: ["Pipeline", "Workable Pipeline"]
     types: [completed]
@@ -47,14 +59,30 @@ jobs:
           MEILISEARCH_MASTER_KEY: ${{ secrets.MEILISEARCH_MASTER_KEY }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          REVALIDATE_URL: https://dopejobs.xyz/api/revalidate
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
           PYTHONUNBUFFERED: "1"
+          # Scheduled (workflow_run) loads have no inputs: hold the backlog by default.
+          BACKLOG_MAX_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.backlog_max_age_days || '2' }}
         run: |
           MODE="${{ inputs.mode }}"
           MODE="${MODE:-load-pending}"
           LOAD_LIMIT="${{ inputs.load_limit }}"
 
-          ARGS=(--"$MODE")
+          case "$MODE" in
+            reconcile-meili-dry-run) ARGS=(--reconcile-meili --dry-run) ;;
+            reconcile-meili)
+              ARGS=(--reconcile-meili)
+              if [ "${{ inputs.cancel_enqueued_deletes }}" = "true" ]; then
+                ARGS+=(--cancel-enqueued-deletes)
+              fi
+              ;;
+            *) ARGS=(--"$MODE") ;;
+          esac
           if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
             ARGS+=(--load-limit "$LOAD_LIMIT")
+          fi
+          if [ "$MODE" = "load-pending" ] && [ -n "$BACKLOG_MAX_AGE_DAYS" ]; then
+            ARGS+=(--backlog-max-age-days "$BACKLOG_MAX_AGE_DAYS")
           fi
           uv run python pipeline.py "${ARGS[@]}"
