@@ -99,4 +99,5 @@ jobs:
           if [ "$MODE" = "load-pending" ] && [ -n "$BACKLOG_MAX_AGE_DAYS" ]; then
             ARGS+=(--backlog-max-age-days "$BACKLOG_MAX_AGE_DAYS")
           fi
+          [ "$MODE" = "load-pending" ] && echo "Backlog gate: event=$EVENT_NAME max_age_days=${BACKLOG_MAX_AGE_DAYS:-none}"
           uv run python pipeline.py "${ARGS[@]}"
