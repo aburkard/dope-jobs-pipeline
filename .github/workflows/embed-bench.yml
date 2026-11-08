@@ -1,58 +1,191 @@
-# Throwaway embedding benchmark on an x86 AMD EPYC runner (proxy for the Hetzner CPX31 box).
-# Runs only on pushes to the embed-bench branch; uses no secrets and no production data.
-name: Embedding benchmark (throwaway)
+# Throwaway voyage-4-nano CPU serving benchmark on x86 AMD EPYC runners (proxy for the Hetzner CPX31 box).
+# Runs only on pushes to the embed-bench-nano branch; uses no secrets and no production data.
+name: Embedding benchmark nano (throwaway)
 
 on:
   push:
-    branches: [embed-bench]
+    branches: [embed-bench-nano]
 
 permissions:
   contents: read
 
+env:
+  HF_HUB_DISABLE_TELEMETRY: "1"
+
 jobs:
-  bench:
+  llamacpp:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      TEI_IMAGE: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
-      LEAF_PREFIX: "Represent this sentence for searching relevant passages: "
+      LLAMA_TAG: b12211
     steps:
       - uses: actions/checkout@v4
-
       - name: CPU info
         run: |
           grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni|amx_int8" /proc/cpuinfo | sort | uniq -c
-          free -m | head -2
-          echo "### Runner CPU" >> "$GITHUB_STEP_SUMMARY"
-          lscpu | grep -E "Model name|^CPU\(s\)" >> "$GITHUB_STEP_SUMMARY"
-
+          lscpu | grep -E "Model name|^CPU\(s\)" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Python deps (CPU torch)
+      - name: Python deps + reference embeddings
         run: |
           pip install -q --index-url https://download.pytorch.org/whl/cpu torch
-          pip install -q sentence-transformers onnxruntime transformers huggingface_hub requests numpy
-
-      - name: voyage-4-nano ONNX export + ORT fp32/int8 (4 threads)
+          pip install -q sentence-transformers transformers huggingface_hub requests numpy
+          python bench/nano_bench.py ref
+      - name: Build llama.cpp (AVX2 only, like the box)
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+          cd /tmp/llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_BACKEND_DL=OFF \
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+            -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF \
+            -DGGML_AMX_TILE=OFF -DGGML_AMX_INT8=OFF -DGGML_AMX_BF16=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /tmp/cmake.log
+          cmake --build build --target llama-server -j 4 2>&1 | tail -3
+          ls build/bin
+          echo "zmm (AVX-512) instructions in binaries (expect 0):"
+          for f in build/bin/llama-server build/bin/*.so; do [ -f "$f" ] && echo "$f $(objdump -d "$f" | grep -c zmm)"; done
+          ./build/bin/llama-server --version 2>&1 | tail -2
+      - name: Download official GGUFs (MongoDB/voyage-4-nano-GGUF)
+        run: |
+          python -c "from huggingface_hub import hf_hub_download as d; [print(d('MongoDB/voyage-4-nano-GGUF', f, local_dir='/tmp/gguf')) for f in ('voyage-4-nano-Q8_0.gguf','voyage-4-nano-F16.gguf')]"
+          ls -la /tmp/gguf
+      - name: llama-server AVX2 build, Q8_0 and F16
         continue-on-error: true
         run: |
-          pip install -q peft onnx onnxscript
-          python bench/nano_onnx.py onnx
-
-      - name: torch fp32, native ISA (nano vs pplx)
+          for q in Q8_0 F16; do
+            /tmp/llama.cpp/build/bin/llama-server -m /tmp/gguf/voyage-4-nano-$q.gguf --embedding --pooling mean \
+              -t 4 -tb 4 -c 2048 -b 2048 -ub 2048 --parallel 1 --port 8090 > /tmp/llama-$q.log 2>&1 &
+            PID=$!
+            for i in $(seq 1 60); do curl -sf localhost:8090/health > /dev/null && break; sleep 2; done
+            grep -iE "causal|pooling|n_embd|system_info|AVX" /tmp/llama-$q.log | head -12
+            python bench/nano_bench.py http llama_avx2_$q http://localhost:8090 llama --pid $PID || tail -30 /tmp/llama-$q.log
+            kill $PID; wait $PID 2>/dev/null || true
+          done
+      - name: llama-server prebuilt release (native ISA dispatch), Q8_0 and F16
         continue-on-error: true
         run: |
-          python bench/nano_onnx.py torch_nano
-          python bench/nano_onnx.py torch_pplx
+          curl -sL -o /tmp/llama-bin.tgz "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG/llama-$LLAMA_TAG-bin-ubuntu-x64.tar.gz"
+          mkdir -p /tmp/llama-bin && tar -xzf /tmp/llama-bin.tgz -C /tmp/llama-bin
+          SRV=$(find /tmp/llama-bin -name llama-server -type f | head -1); echo "$SRV"; ls "$(dirname "$SRV")" | head -40
+          for q in Q8_0 F16; do
+            "$SRV" -m /tmp/gguf/voyage-4-nano-$q.gguf --embedding --pooling mean \
+              -t 4 -tb 4 -c 2048 -b 2048 -ub 2048 --parallel 1 --port 8091 > /tmp/llamanat-$q.log 2>&1 &
+            PID=$!
+            for i in $(seq 1 60); do curl -sf localhost:8091/health > /dev/null && break; sleep 2; done
+            grep -iE "load_backend|system_info" /tmp/llamanat-$q.log | head -5
+            python bench/nano_bench.py http llama_native_$q http://localhost:8091 llama --pid $PID || tail -30 /tmp/llamanat-$q.log
+            kill $PID; wait $PID 2>/dev/null || true
+          done
 
-      - name: torch fp32, restricted to AVX2 like the box (nano vs pplx)
+  onnx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU info
+        run: |
+          grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni|amx_int8" /proc/cpuinfo | sort | uniq -c
+          lscpu | grep -E "Model name|^CPU\(s\)" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h / | tail -1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps + reference embeddings
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q sentence-transformers transformers huggingface_hub requests numpy onnx onnxscript onnxruntime
+          pip list 2>/dev/null | grep -iE "^(torch|transformers|onnx|onnxruntime|sentence)"
+          python bench/nano_bench.py ref
+      - name: onnx-community/voyage-4-nano-ONNX fp32 + quantized under ORT
+        continue-on-error: true
+        run: |
+          python -c "from huggingface_hub import snapshot_download as s; s('onnx-community/voyage-4-nano-ONNX', allow_patterns=['onnx/model.onnx*','onnx/model_quantized.onnx*','*.json'], local_dir='/tmp/oc')"
+          ls -la /tmp/oc/onnx
+          python bench/nano_bench.py ort ort_oc_fp32 /tmp/oc/onnx/model.onnx
+          python bench/nano_bench.py ort ort_oc_quantized /tmp/oc/onnx/model_quantized.onnx
+          rm -rf /tmp/oc
+      - name: Own ONNX export (explicit bidirectional mask) + dynamic int8
+        continue-on-error: true
+        run: |
+          python bench/nano_bench.py export /tmp/own
+          ls -la /tmp/own
+          python bench/nano_bench.py ort ort_own_fp32 /tmp/own/model.onnx
+          python bench/nano_bench.py ort ort_own_int8 /tmp/own/model_int8.onnx
+          python bench/nano_bench.py ort ort_own_int8_reducerange /tmp/own/model_int8rr.onnx
+
+  torch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU info
+        run: |
+          grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni|amx_int8" /proc/cpuinfo | sort | uniq -c
+          lscpu | grep -E "Model name|^CPU\(s\)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps + reference embeddings
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q sentence-transformers transformers huggingface_hub requests numpy
+          python bench/nano_bench.py ref
+      - name: torch fp32 + dynamic int8, native ISA
+        continue-on-error: true
+        run: |
+          python bench/nano_bench.py torch torch_fp32_native fp32
+          python bench/nano_bench.py torch torch_int8_native int8
+      - name: torch fp32 + dynamic int8, AVX2-restricted
         continue-on-error: true
         env:
           ATEN_CPU_CAPABILITY: avx2
           MKL_ENABLE_INSTRUCTIONS: AVX2
           ONEDNN_MAX_CPU_ISA: AVX2
+          FBGEMM_ENABLE_INSTRUCTIONS: AVX2
         run: |
-          python bench/nano_onnx.py torch_nano
-          python bench/nano_onnx.py torch_pplx
+          python bench/nano_bench.py torch torch_fp32_avx2 fp32
+          python bench/nano_bench.py torch torch_int8_avx2 int8
+
+  tei:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU info
+        run: |
+          grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni|amx_int8" /proc/cpuinfo | sort | uniq -c
+          lscpu | grep -E "Model name|^CPU\(s\)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps + reference embeddings
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q sentence-transformers transformers huggingface_hub requests numpy
+          python bench/nano_bench.py ref
+      - name: Calibration - TEI cpu-1.9 pplx-embed-v1-0.6B (box flags)
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-pplx --cpus 4 -p 8081:80 ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
+            --model-id perplexity-ai/pplx-embed-v1-0.6B --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
+          for i in $(seq 1 120); do curl -sf localhost:8081/health > /dev/null && break; sleep 5; done
+          docker logs tei-pplx 2>&1 | grep -iE "version|backend|onnx|ort|candle" | head -5
+          python bench/bench_tei.py tei_pplx_cpu19_calibration http://localhost:8081
+          docker stats --no-stream --format 'tei-pplx mem {{.MemUsage}}' tei-pplx | tee -a "$GITHUB_STEP_SUMMARY"
+          docker rm -f tei-pplx
+      - name: TEI cpu-1.9.4 voyage-4-nano (native, then MKL AVX2-restricted)
+        continue-on-error: true
+        run: |
+          for mode in native mklavx2; do
+            extra=""; [ "$mode" = mklavx2 ] && extra="-e MKL_ENABLE_INSTRUCTIONS=AVX2"
+            docker run -d --name tei-nano --cpus 4 -p 8082:80 $extra ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4 \
+              --model-id voyageai/voyage-4-nano --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
+            for i in $(seq 1 120); do curl -sf localhost:8082/health > /dev/null && break; sleep 5; \
+              [ "$(docker inspect -f '{{.State.Running}}' tei-nano)" = true ] || break; done
+            docker logs tei-nano 2>&1 | tail -15
+            PID=$(docker inspect -f '{{.State.Pid}}' tei-nano)
+            python bench/nano_bench.py http tei194_nano_$mode http://localhost:8082 tei --pid $PID || true
+            docker stats --no-stream --format "tei-nano-$mode mem {{.MemUsage}}" tei-nano | tee -a "$GITHUB_STEP_SUMMARY"
+            docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' tei-nano
+            docker rm -f tei-nano
+          done
