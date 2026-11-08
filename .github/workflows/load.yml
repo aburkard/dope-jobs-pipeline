@@ -67,8 +67,11 @@ jobs:
           # as user-provided _vectors; without this key Meili embeds as before.
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PYTHONUNBUFFERED: "1"
-          # Scheduled (workflow_run) loads have no inputs: hold the backlog by default.
-          BACKLOG_MAX_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.backlog_max_age_days || '2' }}
+          # Scheduled (workflow_run) loads have no inputs and keep the 2-day backlog gate.
+          # Decided in the shell: a GitHub `x && y || z` expression would turn an empty
+          # dispatch input into the fallback, making "empty = whole backlog" impossible.
+          EVENT_NAME: ${{ github.event_name }}
+          BACKLOG_INPUT: ${{ inputs.backlog_max_age_days }}
         run: |
           MODE="${{ inputs.mode }}"
           MODE="${MODE:-load-pending}"
@@ -87,6 +90,11 @@ jobs:
           esac
           if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
             ARGS+=(--load-limit "$LOAD_LIMIT")
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            BACKLOG_MAX_AGE_DAYS="$BACKLOG_INPUT"
+          else
+            BACKLOG_MAX_AGE_DAYS=2
           fi
           if [ "$MODE" = "load-pending" ] && [ -n "$BACKLOG_MAX_AGE_DAYS" ]; then
             ARGS+=(--backlog-max-age-days "$BACKLOG_MAX_AGE_DAYS")
