@@ -51,8 +51,8 @@ jobs:
               envs=""; [ $isa = avx2 ] && envs="-e MKL_ENABLE_INSTRUCTIONS=AVX2 -e ONEDNN_MAX_CPU_ISA=AVX2"
               docker run -d --name tei-st --cpus 4 $envs -v /tmp/models:/data -p 8082:80 ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
                 --model-id /data/st$L --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
-              for i in $(seq 1 60); do curl -sf localhost:8082/health > /dev/null && break; sleep 2; done
-              python bench/tiny/bench.py http tei19_st${L}_${isa} http://localhost:8082 --container tei-st --ref /tmp/models/st$L || docker logs tei-st | tail -30
+              for i in $(seq 1 90); do curl -sf localhost:8082/health > /dev/null && break; sleep 2; done; docker logs tei-st 2>&1 | tail -5
+              python bench/tiny/bench.py http tei19_st${L}_${isa} http://localhost:8082 --container tei-st --ref /tmp/models/st$L || docker logs tei-st 2>&1 | tail -40
               docker rm -f tei-st
             done
           done
@@ -68,10 +68,10 @@ jobs:
         continue-on-error: true
         run: |
           for L in 12 6; do for v in model model_int8; do for th in 1 4; do
-            python bench/tiny/bench.py ort ort_st${L}_${v}_t$th /tmp/models/st$L /tmp/models/st$L/$v.onnx --threads $th
+            python bench/tiny/bench.py ort ort_st${L}_${v}_t$th /tmp/models/st$L /tmp/models/st${L}_onnx/$v.onnx --threads $th
           done; done; done
           for v in model model_int8; do
-            python bench/tiny/shim.py /tmp/models/st12 /tmp/models/st12/$v.onnx 8090 4 & PID=$!
+            python bench/tiny/shim.py /tmp/models/st12 /tmp/models/st12_onnx/$v.onnx 8090 4 & PID=$!
             for i in $(seq 1 30); do curl -sf localhost:8090/health > /dev/null && break; sleep 1; done
             python bench/tiny/bench.py http shim_st12_$v http://localhost:8090
             echo "shim RSS: $(grep VmRSS /proc/$PID/status)" | tee -a "$GITHUB_STEP_SUMMARY"
