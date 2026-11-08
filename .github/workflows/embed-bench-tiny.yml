@@ -1,0 +1,84 @@
+# Throwaway CPU benchmark for a tiny distilled query encoder (dopejobs search) on x86 runners, as a proxy for the
+# Hetzner CPX31 box (EPYC Rome, AVX2 only). Runs only on pushes to the embed-bench-tiny branch; uses no secrets, no
+# production data and no trained weights (random weights with the trained model's exact shapes; latency and memory
+# do not depend on weight values). Replicated because ubuntu-latest lands on different EPYC generations
+# (7763 Milan = AVX2-only like the box; 9V74 = AVX-512).
+name: Embedding benchmark tiny (throwaway)
+
+on:
+  push:
+    branches: [embed-bench-tiny]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU info
+        run: |
+          grep -o -w -E "avx2|avx512f|avx512_vnni|avx_vnni" /proc/cpuinfo | sort | uniq -c
+          lscpu | grep -E "Model name|^CPU\(s\)" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker pull -q ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps + build random-weight students (12, 6, 4 layers)
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -q sentence-transformers transformers huggingface_hub requests numpy onnx onnxscript onnxruntime tokenizers safetensors
+          for L in 12 6 4; do python bench/tiny/build.py /tmp/models/st$L $L; done
+      - name: Calibration - TEI cpu-1.9 pplx-embed-v1-0.6B (box flags)
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-pplx --cpus 4 -p 8081:80 ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
+            --model-id perplexity-ai/pplx-embed-v1-0.6B --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
+          for i in $(seq 1 120); do curl -sf localhost:8081/health > /dev/null && break; sleep 5; done
+          python bench/tiny/bench.py http tei19_pplx_calibration http://localhost:8081 --container tei-pplx
+          docker rm -f tei-pplx
+      - name: TEI cpu-1.9 students (query latency, RSS, parity vs sentence-transformers incl. 2_Dense)
+        continue-on-error: true
+        run: |
+          for L in 12 6 4; do
+            for isa in native avx2; do
+              envs=""; [ $isa = avx2 ] && envs="-e MKL_ENABLE_INSTRUCTIONS=AVX2 -e ONEDNN_MAX_CPU_ISA=AVX2"
+              docker run -d --name tei-st --cpus 4 $envs -v /tmp/models:/data -p 8082:80 ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
+                --model-id /data/st$L --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
+              for i in $(seq 1 60); do curl -sf localhost:8082/health > /dev/null && break; sleep 2; done
+              python bench/tiny/bench.py http tei19_st${L}_${isa} http://localhost:8082 --container tei-st --ref /tmp/models/st$L || docker logs tei-st | tail -30
+              docker rm -f tei-st
+            done
+          done
+      - name: TEI cpu-1.9 student doc throughput (12 layers, batch 32)
+        continue-on-error: true
+        run: |
+          docker run -d --name tei-docs --cpus 4 -v /tmp/models:/data -p 8083:80 ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
+            --model-id /data/st12 --dtype float32 --max-batch-tokens 16384 --max-client-batch-size 32 --auto-truncate
+          for i in $(seq 1 60); do curl -sf localhost:8083/health > /dev/null && break; sleep 2; done
+          python bench/tiny/bench.py http tei19_st12_docs http://localhost:8083 --container tei-docs --docs || docker logs tei-docs | tail -30
+          docker rm -f tei-docs
+      - name: ONNX Runtime in-process (fp32 / int8, 1 and 4 threads) and HTTP shim
+        continue-on-error: true
+        run: |
+          for L in 12 6; do for v in model model_int8; do for th in 1 4; do
+            python bench/tiny/bench.py ort ort_st${L}_${v}_t$th /tmp/models/st$L /tmp/models/st$L/$v.onnx --threads $th
+          done; done; done
+          for v in model model_int8; do
+            python bench/tiny/shim.py /tmp/models/st12 /tmp/models/st12/$v.onnx 8090 4 & PID=$!
+            for i in $(seq 1 30); do curl -sf localhost:8090/health > /dev/null && break; sleep 1; done
+            python bench/tiny/bench.py http shim_st12_$v http://localhost:8090
+            echo "shim RSS: $(grep VmRSS /proc/$PID/status)" | tee -a "$GITHUB_STEP_SUMMARY"
+            kill $PID
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.replica }}
+          path: results.jsonl
