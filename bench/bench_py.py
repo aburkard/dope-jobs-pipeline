@@ -42,6 +42,13 @@ if variant.startswith("onnx"):
         return sess.run(["pooler_output_int8"], {"input_ids": t["input_ids"].astype(np.int64),
                                                  "attention_mask": t["attention_mask"].astype(np.int64)})
     res.update(timed(enc))
+elif variant.startswith("nano"):
+    import torch
+    from sentence_transformers import SentenceTransformer
+    torch.set_num_threads(4)
+    kw = {"model_kwargs": {"torch_dtype": torch.bfloat16}} if variant == "nano_bf16" else {}
+    m = SentenceTransformer("voyageai/voyage-4-nano", device="cpu", trust_remote_code=True, truncate_dim=512, **kw)
+    res.update(timed(lambda q: m.encode([q], prompt="Represent the query for retrieving supporting documents: ")))
 else:
     import torch
     from sentence_transformers import SentenceTransformer

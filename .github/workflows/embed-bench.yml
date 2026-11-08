@@ -35,43 +35,20 @@ jobs:
           pip install -q --index-url https://download.pytorch.org/whl/cpu torch
           pip install -q sentence-transformers onnxruntime transformers huggingface_hub requests numpy
 
-      - name: TEI leaf-ir (fp32) - load, parity, latency, doc throughput
-        continue-on-error: true
-        run: |
-          docker run -d --name tei-leaf --cpus 4 -p 8080:80 $TEI_IMAGE --model-id MongoDB/mdbr-leaf-ir --dtype float32
-          for i in $(seq 1 120); do curl -fs localhost:8080/health >/dev/null && break; sleep 5; done
-          docker logs tei-leaf 2>&1 | tail -15
-          python bench/bench_tei.py tei_leaf_ir_fp32 http://localhost:8080 --prefix "$LEAF_PREFIX" --docs --reference-model MongoDB/mdbr-leaf-ir
-          docker stats --no-stream --format 'tei-leaf mem {{.MemUsage}}' tei-leaf | tee -a "$GITHUB_STEP_SUMMARY"
-          docker rm -f tei-leaf
-
-      - name: TEI pplx-embed-v1-0.6B (fp32, same flags as the box) - latency
-        continue-on-error: true
-        run: |
-          docker run -d --name tei-pplx --cpus 4 -p 8081:80 $TEI_IMAGE --model-id perplexity-ai/pplx-embed-v1-0.6B \
-            --dtype float32 --max-batch-tokens 2048 --max-client-batch-size 1
-          for i in $(seq 1 180); do curl -fs localhost:8081/health >/dev/null && break; sleep 5; done
-          docker logs tei-pplx 2>&1 | tail -10
-          python bench/bench_tei.py tei_pplx_fp32_boxflags http://localhost:8081
-          docker stats --no-stream --format 'tei-pplx mem {{.MemUsage}}' tei-pplx | tee -a "$GITHUB_STEP_SUMMARY"
-          docker rm -f tei-pplx
-
       - name: TEI voyage-4-nano (fp32) - load, latency
         continue-on-error: true
         run: |
           docker run -d --name tei-nano --cpus 4 -p 8082:80 $TEI_IMAGE --model-id voyageai/voyage-4-nano --dtype float32
           for i in $(seq 1 180); do curl -fs localhost:8082/health >/dev/null && break; sleep 5; done
-          docker logs tei-nano 2>&1 | tail -15
+          docker ps -a --filter name=tei-nano --format '{{.Status}}'
+          docker logs tei-nano 2>&1 | tail -40
           python bench/bench_tei.py tei_voyage4_nano_fp32 http://localhost:8082 --prefix "Represent the query for retrieving supporting documents: "
           docker stats --no-stream --format 'tei-nano mem {{.MemUsage}}' tei-nano | tee -a "$GITHUB_STEP_SUMMARY"
           docker rm -f tei-nano
 
-      - name: ONNX Runtime pplx fp32 vs int8 (4 threads)
+      - name: voyage-4-nano sentence-transformers torch CPU (query latency, 4 threads)
         continue-on-error: true
         run: |
-          python bench/bench_py.py onnx_fp32
-          python bench/bench_py.py onnx_int8
-
-      - name: leaf-ir sentence-transformers torch (Actions load-job doc path)
-        continue-on-error: true
-        run: python bench/bench_py.py leaf_torch
+          pip install -q peft
+          python bench/bench_py.py nano_fp32
+          python bench/bench_py.py nano_bf16
