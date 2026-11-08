@@ -35,20 +35,24 @@ jobs:
           pip install -q --index-url https://download.pytorch.org/whl/cpu torch
           pip install -q sentence-transformers onnxruntime transformers huggingface_hub requests numpy
 
-      - name: TEI voyage-4-nano (fp32) - load, latency
+      - name: voyage-4-nano ONNX export + ORT fp32/int8 (4 threads)
         continue-on-error: true
         run: |
-          docker run -d --name tei-nano --cpus 4 -p 8082:80 $TEI_IMAGE --model-id voyageai/voyage-4-nano --dtype float32
-          for i in $(seq 1 180); do curl -fs localhost:8082/health >/dev/null && break; sleep 5; done
-          docker ps -a --filter name=tei-nano --format '{{.Status}}'
-          docker logs tei-nano 2>&1 | tail -40
-          python bench/bench_tei.py tei_voyage4_nano_fp32 http://localhost:8082 --prefix "Represent the query for retrieving supporting documents: "
-          docker stats --no-stream --format 'tei-nano mem {{.MemUsage}}' tei-nano | tee -a "$GITHUB_STEP_SUMMARY"
-          docker rm -f tei-nano
+          pip install -q peft onnx onnxscript
+          python bench/nano_onnx.py onnx
 
-      - name: voyage-4-nano sentence-transformers torch CPU (query latency, 4 threads)
+      - name: torch fp32, native ISA (nano vs pplx)
         continue-on-error: true
         run: |
-          pip install -q peft
-          python bench/bench_py.py nano_fp32
-          python bench/bench_py.py nano_bf16
+          python bench/nano_onnx.py torch_nano
+          python bench/nano_onnx.py torch_pplx
+
+      - name: torch fp32, restricted to AVX2 like the box (nano vs pplx)
+        continue-on-error: true
+        env:
+          ATEN_CPU_CAPABILITY: avx2
+          MKL_ENABLE_INSTRUCTIONS: AVX2
+          ONEDNN_MAX_CPU_ISA: AVX2
+        run: |
+          python bench/nano_onnx.py torch_nano
+          python bench/nano_onnx.py torch_pplx
