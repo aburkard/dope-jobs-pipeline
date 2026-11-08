@@ -165,6 +165,57 @@ def reconcile_meili(conn, client, dry_run: bool = True) -> dict[str, list[str]]:
     return plan
 
 
+CONVERT_BATCH_SIZE = 1000
+
+
+def convert_vectors_to_user_provided(client, dry_run: bool = True, limit: int | None = None) -> int:
+    """Re-send each document's existing vector marked regenerate:false.
+
+    Documents embedded by Meili are stored with regenerate:true, so a later
+    update or an embedder settings change can make Meili re-embed them. Writing
+    the same vector back as user-provided (partial update with only meili_id and
+    _vectors) costs no embedding call and makes the vector permanent until the
+    pipeline sends a new one. Already-converted documents are skipped.
+    """
+    from embeddings import EMBEDDER_NAME, user_provided_vectors
+
+    index = client.index(JOBS_INDEX)
+    offset = 0
+    converted = 0
+    scanned = 0
+    while limit is None or converted < limit:
+        page = index.get_documents({
+            "fields": ["meili_id"],
+            "retrieveVectors": True,
+            "limit": CONVERT_BATCH_SIZE,
+            "offset": offset,
+        })
+        if not page.results:
+            break
+        offset += len(page.results)
+        scanned += len(page.results)
+        updates = []
+        for doc in page.results:
+            values = dict(doc)
+            vector = (values.get("_vectors") or {}).get(EMBEDDER_NAME) or {}
+            embeddings = vector.get("embeddings") or []
+            if vector.get("regenerate") is False or len(embeddings) != 1:
+                continue
+            updates.append({"meili_id": values["meili_id"], "_vectors": user_provided_vectors(embeddings[0])})
+        if limit is not None:
+            updates = updates[:limit - converted]
+        if updates and not dry_run:
+            task = index.update_documents(updates, primary_key="meili_id")
+            if not _wait(client, task.task_uid):
+                print(f"  Stopping conversion at offset {offset}; rerun to continue")
+                break
+        converted += len(updates)
+        print(f"  scanned {scanned}/{page.total}, {'would convert' if dry_run else 'converted'} {converted}")
+        if offset >= page.total:
+            break
+    return converted
+
+
 def cancel_enqueued_deletions(client) -> None:
     """Cancel queued document deletions, e.g. stale bulk deletes from failed loads."""
     task = client.cancel_tasks({"statuses": ["enqueued"], "types": ["documentDeletion"]})

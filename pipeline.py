@@ -45,8 +45,10 @@ from db import (
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
 from job_groups import recompute_job_groups_for_boards
+from embeddings import attach_vectors
 from meili_reconcile import (
     cancel_enqueued_deletions,
+    convert_vectors_to_user_provided,
     make_meili_client,
     print_meili_status,
     reconcile_meili,
@@ -1202,6 +1204,9 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         # End the read transaction before waiting minutes for embeddings.
         conn.commit()
         if docs:
+            # Precompute vectors so Meili stores them instead of embedding
+            # during indexing (falls back to Meili embedding if this fails).
+            attach_vectors(docs)
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
             print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
@@ -1255,8 +1260,10 @@ def main():
                               help="Print Meili index, task queue, and embedder status (read-only)")
     source_group.add_argument("--reconcile-meili", action="store_true",
                               help="Compare DB load flags with Meili documents and fix both sides")
+    source_group.add_argument("--convert-meili-vectors", action="store_true",
+                              help="Re-send existing Meili vectors as user-provided (regenerate:false); no re-embedding")
     parser.add_argument("--dry-run", action="store_true",
-                        help="With --reconcile-meili: report the plan without changing anything")
+                        help="With --reconcile-meili or --convert-meili-vectors: report without changing anything")
     parser.add_argument("--cancel-enqueued-deletes", action="store_true",
                         help="With --reconcile-meili: cancel queued documentDeletion tasks first")
     parser.add_argument("--backlog-max-age-days", type=int, default=None,
@@ -1309,10 +1316,14 @@ def main():
         args.skip_scrape = True
         args.skip_parse = True
 
-    if args.meili_status or args.reconcile_meili:
+    if args.meili_status or args.reconcile_meili or args.convert_meili_vectors:
         meili_host = args.meili_host or os.environ.get("MEILISEARCH_HOST", "http://localhost:7700")
         client = make_meili_client(meili_host, args.meili_key)
         print_meili_status(client)
+        if args.convert_meili_vectors:
+            converted = convert_vectors_to_user_provided(client, dry_run=args.dry_run, limit=args.load_limit)
+            print(f"{'Would convert' if args.dry_run else 'Converted'} {converted} documents to user-provided vectors")
+            print_meili_status(client)
         if args.reconcile_meili:
             if args.cancel_enqueued_deletes and not args.dry_run:
                 cancel_enqueued_deletions(client)

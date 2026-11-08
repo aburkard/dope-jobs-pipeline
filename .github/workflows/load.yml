@@ -16,6 +16,8 @@ on:
           - meili-status
           - reconcile-meili-dry-run
           - reconcile-meili
+          - convert-meili-vectors-dry-run
+          - convert-meili-vectors
         default: "load-pending"
       backlog_max_age_days:
         description: "load-pending: skip never-loaded jobs first seen more than N days ago (empty = load the whole backlog)"
@@ -61,6 +63,9 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           REVALIDATE_URL: https://dopejobs.xyz/api/revalidate
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          # Document vectors are computed by the pipeline (embeddings.py) and sent
+          # as user-provided _vectors; without this key Meili embeds as before.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PYTHONUNBUFFERED: "1"
           # Scheduled (workflow_run) loads have no inputs: hold the backlog by default.
           BACKLOG_MAX_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.backlog_max_age_days || '2' }}
@@ -77,6 +82,7 @@ jobs:
                 ARGS+=(--cancel-enqueued-deletes)
               fi
               ;;
+            convert-meili-vectors-dry-run) ARGS=(--convert-meili-vectors --dry-run) ;;
             *) ARGS=(--"$MODE") ;;
           esac
           if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
