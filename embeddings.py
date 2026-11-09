@@ -8,9 +8,9 @@ embeds it with the same model/provider/dimensions, and sends
 `_vectors: {"default": {"embeddings": ..., "regenerate": false}}`. Meili then
 stores the vector without calling any embedder, and never regenerates it.
 
-Keep MODEL/DIMENSIONS/normalization identical to the Meili search embedder
-(`perplexity/pplx-embed-v1-0.6b`, 512 dims, L2-normalized); Meili cannot detect
-a mismatch between document and query vectors.
+Keep the space (PIPELINE_EMBED_SPACE) identical to the Meili search embedder of
+the index being loaded; Meili cannot detect a mismatch between document and
+query vectors.
 """
 import math
 import os
@@ -21,8 +21,28 @@ import requests
 
 EMBEDDER_NAME = "default"
 OPENROUTER_URL = os.environ.get("OPENROUTER_EMBEDDINGS_URL", "https://openrouter.ai/api/v1/embeddings")
-MODEL = os.environ.get("PIPELINE_EMBED_MODEL", "perplexity/pplx-embed-v1-0.6b")
-DIMENSIONS = int(os.environ.get("PIPELINE_EMBED_DIMENSIONS", "512"))
+# Vector space of the Meili index being loaded:
+#   pplx512      : perplexity/pplx-embed-v1-0.6b, 512 dims (the original `jobs` space)
+#   voy4liteP256 : mongodb/voyage-4-lite documents (input_type "document", native 1024 dims), L2-normalised,
+#                  times the learned 1024->256 projection in embedding_projection_voy4_1024_to_256.npy,
+#                  L2-normalised again. Search queries in this space come from the tiny query encoder
+#                  (embedding proxy route /openai-search-tiny). Document and query spaces must always match.
+EMBED_SPACE = os.environ.get("PIPELINE_EMBED_SPACE", "pplx512")
+if EMBED_SPACE == "voy4liteP256":
+    MODEL = "mongodb/voyage-4-lite"
+    DIMENSIONS = 256
+    INPUT_TYPE = "document"
+    REQUEST_DIMENSIONS = None  # native 1024; the projection needs the full vector
+    PROJECTION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "embedding_projection_voy4_1024_to_256.npy")
+elif EMBED_SPACE == "pplx512":
+    MODEL = os.environ.get("PIPELINE_EMBED_MODEL", "perplexity/pplx-embed-v1-0.6b")
+    DIMENSIONS = int(os.environ.get("PIPELINE_EMBED_DIMENSIONS", "512"))
+    INPUT_TYPE = None
+    REQUEST_DIMENSIONS = DIMENSIONS
+    PROJECTION_PATH = None
+else:
+    raise ValueError(f"unknown PIPELINE_EMBED_SPACE {EMBED_SPACE!r}")
+_PROJECTION = None
 BATCH_SIZE = 64
 CONCURRENCY = 4
 RETRIES = 4
@@ -79,6 +99,31 @@ def _normalize(vector: list[float]) -> list[float]:
     return [x / norm for x in vector]
 
 
+def _project(vectors: list[list[float]]) -> list[list[float]]:
+    """voy4liteP256: L2-normalise the 1024-d vectors, multiply by P (1024x256), L2-normalise."""
+    global _PROJECTION
+    import numpy as np
+
+    if _PROJECTION is None:
+        _PROJECTION = np.load(PROJECTION_PATH).astype(np.float32)
+    x = np.asarray(vectors, dtype=np.float32)
+    if x.ndim != 2 or x.shape[1] != _PROJECTION.shape[0]:
+        raise ValueError(f"expected {_PROJECTION.shape[0]}-d vectors, got {x.shape}")
+    x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    y = x @ _PROJECTION
+    y /= np.maximum(np.linalg.norm(y, axis=1, keepdims=True), 1e-12)
+    return y.astype(float).tolist()
+
+
+def _request_body(texts: list[str]) -> dict:
+    body = {"model": MODEL, "input": texts, "encoding_format": "float"}
+    if REQUEST_DIMENSIONS:
+        body["dimensions"] = REQUEST_DIMENSIONS
+    if INPUT_TYPE:
+        body["input_type"] = INPUT_TYPE
+    return body
+
+
 def _embed_batch(texts: list[str], session: requests.Session) -> list[list[float]]:
     last_error: Exception | None = None
     for attempt in range(RETRIES):
@@ -86,14 +131,15 @@ def _embed_batch(texts: list[str], session: requests.Session) -> list[list[float
             response = session.post(
                 OPENROUTER_URL,
                 headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
-                json={"model": MODEL, "input": texts, "dimensions": DIMENSIONS, "encoding_format": "float"},
+                json=_request_body(texts),
                 timeout=TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             data = sorted(response.json()["data"], key=lambda item: item["index"])
             if len(data) != len(texts):
                 raise ValueError(f"expected {len(texts)} embeddings, got {len(data)}")
-            vectors = [_normalize(item["embedding"]) for item in data]
+            raw = [item["embedding"] for item in data]
+            vectors = _project(raw) if PROJECTION_PATH else [_normalize(v) for v in raw]
             if any(len(vector) != DIMENSIONS for vector in vectors):
                 raise ValueError(f"embedding dimensions differ from {DIMENSIONS}")
             return vectors

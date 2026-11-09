@@ -108,3 +108,43 @@ def test_convert_vectors_skips_converted_and_honors_dry_run(monkeypatch):
     assert updates == []
     assert meili_reconcile.convert_vectors_to_user_provided(client, dry_run=False) == 1
     assert updates == [{"meili_id": "a", "_vectors": {"default": {"embeddings": [0.1, 0.2], "regenerate": False}}}]
+
+
+def test_voy4lite_p256_space_projects_and_requests_documents(monkeypatch):
+    import importlib
+    import numpy as np
+
+    monkeypatch.setenv("PIPELINE_EMBED_SPACE", "voy4liteP256")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    E = importlib.reload(embeddings)
+    try:
+        P = np.load(E.PROJECTION_PATH)
+        assert P.shape == (1024, 256)
+        raw = np.random.default_rng(0).normal(size=(3, 1024)).astype(np.float32)
+        seen = []
+
+        class Response:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"data": [{"index": i, "embedding": raw[i].tolist()} for i in range(len(seen[-1]["input"]))]}
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *exc): pass
+            def post(self, url, headers, json, timeout):
+                assert json["model"] == "mongodb/voyage-4-lite" and json["input_type"] == "document"
+                assert "dimensions" not in json
+                seen.append(json)
+                return Response()
+
+        monkeypatch.setattr(E.requests, "Session", Session)
+        docs = [{"title": f"t{i}"} for i in range(3)]
+        assert E.attach_vectors(docs) is True
+        got = np.array([d["_vectors"]["default"]["embeddings"] for d in docs])
+        x = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        want = x @ P
+        want /= np.linalg.norm(want, axis=1, keepdims=True)
+        assert got.shape == (3, 256) and np.allclose(got, want, atol=1e-5)
+    finally:
+        monkeypatch.delenv("PIPELINE_EMBED_SPACE")
+        importlib.reload(embeddings)

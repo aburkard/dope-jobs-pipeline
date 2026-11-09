@@ -66,6 +66,8 @@ jobs:
           # Document vectors are computed by the pipeline (embeddings.py) and sent
           # as user-provided _vectors; without this key Meili embeds as before.
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Vector space of the live `jobs` index (see embeddings.py). Must match its search embedder.
+          PIPELINE_EMBED_SPACE: voy4liteP256
           PYTHONUNBUFFERED: "1"
           # Scheduled (workflow_run) loads have no inputs and keep the 2-day backlog gate.
           # Decided in the shell: a GitHub `x && y || z` expression would turn an empty
