@@ -11,3 +11,14 @@ Production search notes:
 - Internal background Meili traffic should use `https://search-internal.dopejobs.xyz`, not `search.dopejobs.xyz`.
 - `search-internal.dopejobs.xyz` is Cloudflare-proxied, protected by Cloudflare Access service-token headers, and origin-blocked for non-Cloudflare source IPs.
 - The Hetzner origin exempts Cloudflare IP ranges from the coarse `80/443` connection throttle. If internal access breaks, first verify Cloudflare Access headers and then refresh the Cloudflare IP allowlist on the origin.
+- Index profiles (`index_profiles.py`, `PIPELINE_INDEX_PROFILE`):
+  - `pplx512` (default) is today's `jobs` index.
+  - `v2` is the voyage/student index:
+    - voyage-4-lite native 1024d docs (`input_type: document`), L2 → `models/proj_clean_voy4_1024_to_256.npy` (sha256 pinned in embeddings.py) → L2 = 256d
+    - slim docs (`V2_DROP_FIELDS`)
+    - lean settings plus a composite **rest** embedder with `distribution: null`. Never `openAi` + an OpenAI model name: Meili then applies a hidden DistributionShift.
+  - Queries come from the box proxy's `/voyage-search` (the tiny student) in the same 256d space.
+  - The loader refuses to write one profile's vectors into an index whose embedder has the other's dimensions.
+  - Meili test-embeds when embedder settings are applied, so `/voyage-search` and `/voyage-index` must be live before a v2 index is configured.
+  - Prod Meili allows loopback embedder URLs (`MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS=127.0.0.1/32`).
+  - Scheduled loads follow the repo variable `PIPELINE_INDEX_PROFILE`; flip it only at the index swap.

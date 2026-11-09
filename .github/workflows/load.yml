@@ -18,11 +18,22 @@ on:
           - reconcile-meili
           - convert-meili-vectors-dry-run
           - convert-meili-vectors
+          - full-load
         default: "load-pending"
       backlog_max_age_days:
         description: "load-pending: skip never-loaded jobs first seen more than N days ago (empty = load the whole backlog)"
         required: false
         default: "2"
+      index_uid:
+        description: "Target Meili index (empty = jobs). full-load into e.g. jobs_v2 builds a new index before a swap"
+        required: false
+        default: ""
+      index_profile:
+        description: "Vector space/settings profile (empty = repo variable PIPELINE_INDEX_PROFILE, else pplx512)"
+        type: choice
+        options: ["", "pplx512", "v2"]
+        required: false
+        default: ""
       cancel_enqueued_deletes:
         description: "reconcile-meili: cancel queued documentDeletion tasks first"
         type: boolean
@@ -66,6 +77,10 @@ jobs:
           # Document vectors are computed by the pipeline (embeddings.py) and sent
           # as user-provided _vectors; without this key Meili embeds as before.
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Which vector space this run writes. Scheduled loads follow the repo variable, which is
+          # flipped to v2 only at the index swap; until then everything stays pplx512.
+          PIPELINE_INDEX_PROFILE: ${{ inputs.index_profile || vars.PIPELINE_INDEX_PROFILE || 'pplx512' }}
+          INDEX_UID_INPUT: ${{ inputs.index_uid }}
           PYTHONUNBUFFERED: "1"
           # Scheduled (workflow_run) loads have no inputs and keep the 2-day backlog gate.
           # Decided in the shell: a GitHub `x && y || z` expression would turn an empty
@@ -86,8 +101,13 @@ jobs:
               fi
               ;;
             convert-meili-vectors-dry-run) ARGS=(--convert-meili-vectors --dry-run) ;;
+            full-load) ARGS=(--load-pending --full-load) ;;
             *) ARGS=(--"$MODE") ;;
           esac
+          if [ -n "$INDEX_UID_INPUT" ]; then
+            ARGS+=(--index-uid "$INDEX_UID_INPUT")
+          fi
+          echo "Index profile: $PIPELINE_INDEX_PROFILE, index: ${INDEX_UID_INPUT:-jobs}"
           if [ -n "$LOAD_LIMIT" ] && [ "$LOAD_LIMIT" != "0" ]; then
             ARGS+=(--load-limit "$LOAD_LIMIT")
           fi
