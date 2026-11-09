@@ -1120,7 +1120,11 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     def configure_jobs_index(index):
         if profile == "v2":
-            # Complete lean settings including the composite REST embedder (no DistributionShift).
+            if jobs_index_exists and not recreate_index:
+                # Never re-apply settings to an existing v2 index: changing the embedder's source/model,
+                # or the filterable/proximity settings, makes Meili reprocess every document mid-load.
+                print("  v2: existing index, leaving its settings untouched")
+                return
             index.update_settings(index_profiles.v2_settings())
             return
         index.update_filterable_attributes(filterable_attributes)

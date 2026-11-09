@@ -5,8 +5,8 @@
 - "v2": the voyage/student index. voyage-4-lite 1024d document vectors projected to 256d with the
   pinned clean projection P (models/proj_clean_voy4_1024_to_256.npy), slim documents, lean
   settings (proximityPrecision byAttribute, granular filterable attributes, posted_at_ts sort) and a
-  single REST embedder with an explicit 0.75/0.1 DistributionShift. Queries are embedded by the box proxy's
-  /openai-search-tiny route (the tiny student, aburkard/dope-jobs PR 1) into the same 256d space.
+  single openAi-source embedder with an explicit 0.75/0.1 DistributionShift. Queries are embedded by the box's
+  voyage-query service (the tiny student, 127.0.0.1:8089) into the same 256d space.
 
 The profile is chosen per run with PIPELINE_INDEX_PROFILE (load.yml: repo variable, or the dispatch
 input). Never write "v2" vectors into a "pplx512" index or the reverse: Meili cannot detect a
@@ -70,31 +70,33 @@ _OPENAI_SHAPED = {
 
 
 V2_DISTRIBUTION = {"mean": 0.75, "sigma": 0.1}
+V2_SEARCH_EMBED_URL_DEFAULT = "http://127.0.0.1:8089/v1/embeddings"  # voyage-query service (tiny student)
 
 
 def v2_embedder() -> dict:
-    """Single REST embedder for the v2 index, pointing at the box proxy's tiny query encoder.
+    """The one embedder JSON for v2 indexes (identical to what the live jobs_v2 is patched to).
 
-    - Single, not composite: Meili checks that a composite's search and indexing embedders agree
-      (angular distance <= 0.01 on a test text), which an asymmetric student-query / voyage-doc pair
-      fails. So the index has one embedder; document vectors always come from the pipeline
-      (`regenerate: false`), and in this profile the pipeline never sends a batch without vectors
-      (Meili would otherwise embed documents with the *query* encoder).
-    - `distribution` is set explicitly to the 0.75/0.1 shift. The full-scale gate's best student row
-      (hybrid @0.8, 0.887 vs 0.807) was measured with exactly this shift, which is what an `openAi`
-      source declaring `text-embedding-3-small` applies implicitly. Explicit here, so it is visible.
-      With this shift keep the frontend at semanticRatio 0.8 (0.6 measured worse).
+    - Single embedder: Meili rejects a composite whose search and indexing embedders disagree (angular
+      distance > 0.01 on a test text), which an asymmetric student-query / voyage-doc pair always does.
+      Document vectors always come from the pipeline (`regenerate: false`); in this profile the
+      pipeline never sends a batch without vectors (Meili would embed documents with the query encoder).
+    - `source: openAi` + `model: text-embedding-3-small` because that is how jobs_v2 was built, and in
+      Meili 1.56.1 changing `source` or `model` forces a full reindex while changing an openAi `url` or
+      `distribution` does not (verified on a local 20k-doc index: 0.16 s, vectors untouched; switching to
+      `rest` re-extracted every document). The model name is only a label here; the endpoint is ours.
+    - `distribution` explicit at 0.75/0.1: the value that model name implies by default, and exactly the
+      shift the gate's best student row (hybrid @0.8: 0.887 vs 0.807) was measured with. Explicit so a
+      Meili upgrade can't silently change it. Keep the frontend at semanticRatio 0.8.
     """
-    url = os.environ.get("MEILI_V2_SEARCH_EMBED_URL", "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings")
     return {
-        "source": "rest", "url": url, "dimensions": V2_DIMENSIONS, **_OPENAI_SHAPED,
+        "source": "openAi", "model": "text-embedding-3-small", "dimensions": V2_DIMENSIONS,
+        "url": os.environ.get("MEILI_V2_SEARCH_EMBED_URL", V2_SEARCH_EMBED_URL_DEFAULT),
         "distribution": dict(V2_DISTRIBUTION),
-        "documentTemplate": DOCUMENT_TEMPLATE, "documentTemplateMaxBytes": 8000,
     }
 
 
 def v2_settings() -> dict:
-    """Full settings for a new v2 index (applied once, when the index is created / fully reloaded)."""
+    """Full settings for a NEW v2 index. Never re-applied to an existing index (see pipeline)."""
     return {
         "searchableAttributes": V2_SEARCHABLE,
         "filterableAttributes": [

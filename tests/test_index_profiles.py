@@ -132,12 +132,10 @@ def test_v2_settings_cover_the_app_and_have_no_shift():
     assert s["sortableAttributes"] == ["posted_at_ts"]
     assert s["proximityPrecision"] == "byAttribute"
     emb = s["embedders"]["default"]
-    # Single REST embedder (a composite fails Meili's search-vs-indexing similarity check for an
-    # asymmetric pair) with the explicit 0.75/0.1 shift the gate's best student row was measured with.
-    assert emb["source"] == "rest" and emb["dimensions"] == 256
-    assert emb["distribution"] == {"mean": 0.75, "sigma": 0.1}
-    assert emb["url"].endswith("/openai-search-tiny/v1/embeddings")
-    assert emb["documentTemplate"] == index_profiles.DOCUMENT_TEMPLATE
+    # Exactly the live jobs_v2 embedder after its URL/distribution patch: single openAi-source embedder
+    # (source/model changes force a full reindex in Meili 1.56.1), explicit 0.75/0.1 shift, 256d.
+    assert emb == {"source": "openAi", "model": "text-embedding-3-small", "dimensions": 256,
+                   "url": "http://127.0.0.1:8089/v1/embeddings", "distribution": {"mean": 0.75, "sigma": 0.1}}
 
 
 def test_document_template_matches_python_renderer():
@@ -151,7 +149,7 @@ def test_document_template_matches_python_renderer():
         assert prefix in line and out.startswith(prefix)
 
 
-def _fake_meili(events, embedder_dims=None):
+def _fake_meili(events, embedder_dims=None, existing=("jobs", "jobs_v2")):
     class Index:
         def get_primary_key(self): return "meili_id"
         def get_embedders(self):
@@ -172,7 +170,12 @@ def _fake_meili(events, embedder_dims=None):
     class Client:
         def __init__(self, *a, **k): pass
         def get_index(self, uid):
-            events.append(("get_index", uid)); return Index()
+            events.append(("get_index", uid))
+            if uid not in existing:
+                raise Exception("index not found")
+            return Index()
+        def create_index(self, uid, options):
+            events.append(("create_index", uid)); return SimpleNamespace(task_uid=8)
         def index(self, uid):
             events.append(("index", uid)); return Index()
         def wait_for_task(self, uid, **k): return {"status": "succeeded"}
@@ -208,9 +211,10 @@ def _patch_load(monkeypatch, client, docs):
 def test_v2_full_load_targets_index_uid_applies_v2_settings_and_slims(monkeypatch):
     monkeypatch.setenv(index_profiles.PROFILE_ENV, "v2")
     events = []
-    conn = _patch_load(monkeypatch, _fake_meili(events, embedder_dims=256),
+    conn = _patch_load(monkeypatch, _fake_meili(events, embedder_dims=256, existing=("jobs",)),
                        {"id": "live", "title": "t", "_geojson": {"x": 1}, "salary_fx_as_of": "d", "ats_type": "ashby"})
     pipeline.step_load(conn, parsed_job_ids=["live"], full_reload=True, index_uid="jobs_v2")
+    assert ("create_index", "jobs_v2") in events
     assert ("index", "jobs_v2") in events and ("index", "jobs") not in events
     settings = [e[1] for e in events if e[0] == "settings"]
     assert settings and settings[0]["embedders"]["default"]["distribution"] == {"mean": 0.75, "sigma": 0.1}
@@ -276,3 +280,14 @@ def test_v2_load_stops_instead_of_sending_unvectored_docs(monkeypatch):
     with pytest.raises(RuntimeError, match="Document embedding unavailable: new jobs not loaded"):
         pipeline.step_load(conn, parsed_job_ids=["live"], index_uid="jobs_v2")
     assert not [e for e in events if e[0] == "upsert"]
+
+
+def test_v2_never_reapplies_settings_to_an_existing_index(monkeypatch):
+    # After the swap the live `jobs` is v2: a full or incremental v2 load must not PATCH its settings
+    # (an embedder source/model change would make Meili reprocess every document mid-load).
+    monkeypatch.setenv(index_profiles.PROFILE_ENV, "v2")
+    events = []
+    conn = _patch_load(monkeypatch, _fake_meili(events, embedder_dims=256), {"id": "live"})
+    pipeline.step_load(conn, parsed_job_ids=["live"], full_reload=True, index_uid="jobs")
+    assert not [e for e in events if e[0] == "settings"]
+    assert [e for e in events if e[0] == "upsert"]
