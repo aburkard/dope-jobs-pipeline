@@ -1004,11 +1004,17 @@ def _assert_profile_matches_index(index, profile: str) -> None:
     except Exception as exc:
         print(f"  Warning: could not read embedder settings to check the profile ({type(exc).__name__})")
         return
+    def plain(obj):
+        # The real client returns pydantic models (nested for composite embedders); tests pass dicts.
+        if obj is None or isinstance(obj, dict):
+            return obj or {}
+        dump = getattr(obj, "model_dump", None)
+        return dump() if callable(dump) else dict(getattr(obj, "__dict__", {}))
+
     embedders = embedders if isinstance(embedders, dict) else (getattr(embedders, "embedders", None) or {})
-    default = embedders.get("default") or {}
-    default = default if isinstance(default, dict) else dict(getattr(default, "__dict__", {}))
-    dims = default.get("dimensions") or (default.get("searchEmbedder") or {}).get("dimensions") \
-        or (default.get("search_embedder") or {}).get("dimensions")
+    default = plain(embedders.get("default"))
+    search = plain(default.get("searchEmbedder") or default.get("search_embedder"))
+    dims = default.get("dimensions") or search.get("dimensions")
     expected = _PROFILE_DIMENSIONS[profile]
     if dims and int(dims) != expected:
         raise RuntimeError(f"index profile {profile!r} writes {expected}d vectors but the target index's "
