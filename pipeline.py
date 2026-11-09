@@ -45,7 +45,7 @@ from db import (
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
 from job_groups import recompute_job_groups_for_boards
-from embeddings import attach_vectors
+from embeddings import EMBED_SPACE, attach_vectors
 from meili_reconcile import (
     cancel_enqueued_deletions,
     convert_vectors_to_user_provided,
@@ -1205,8 +1205,12 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         conn.commit()
         if docs:
             # Precompute vectors so Meili stores them instead of embedding
-            # during indexing (falls back to Meili embedding if this fails).
-            attach_vectors(docs)
+            # during indexing. In the pplx512 space a failure falls back to Meili
+            # embedding; in voy4liteP256 the index's embedder is the query encoder,
+            # so a batch without document vectors is skipped and retried next load.
+            if not attach_vectors(docs) and EMBED_SPACE != "pplx512":
+                print(f"  Skipping batch of {len(docs)} docs: no document vectors (stays pending)")
+                continue
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
             print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
