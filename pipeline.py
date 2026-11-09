@@ -45,7 +45,7 @@ from db import (
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
 from job_groups import recompute_job_groups_for_boards
-from embeddings import attach_vectors
+from embeddings import EmbeddingAuthError, attach_vectors
 from meili_reconcile import (
     cancel_enqueued_deletions,
     convert_vectors_to_user_provided,
@@ -1191,6 +1191,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     total_batches = (len(all_job_ids) + BATCH_SIZE - 1) // BATCH_SIZE
     consecutive_timeouts = 0
+    embedding_auth_error: EmbeddingAuthError | None = None
     for i in range(0, len(all_job_ids), BATCH_SIZE):
         chunk_ids = all_job_ids[i:i + BATCH_SIZE]
         chunk_rows = database.run(lambda c: get_active_jobs_for_meili(c, job_ids=chunk_ids))
@@ -1206,7 +1207,16 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         if docs:
             # Precompute vectors so Meili stores them instead of embedding
             # during indexing (falls back to Meili embedding if this fails).
-            attach_vectors(docs)
+            try:
+                attach_vectors(docs)
+            except EmbeddingAuthError as exc:
+                # The key is out of credit or rejected. Meili's indexing embedder uses the same key,
+                # so submitting without vectors would only fail again, slowly. Stop upserting; the
+                # unloaded jobs stay pending and retry on the next run.
+                embedding_auth_error = exc
+                print(f"  ERROR: {exc}. Stopping upserts; new jobs not loaded this run "
+                      f"({total_loaded} loaded before the error)")
+                break
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
             print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
@@ -1227,6 +1237,12 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     print(f"  Loaded {total_loaded} documents")
 
+    if embedding_auth_error is not None and recreate_index:
+        # Never swap a partially built rebuild index in for the live one.
+        delete_task = client.delete_index(active_index_uid)
+        wait_for_task(delete_task.task_uid, timeout_in_ms=120000)
+        raise RuntimeError(f"OpenRouter key limit/auth: full reload aborted, live index untouched ({embedding_auth_error})")
+
     if recreate_index:
         swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])
         if not wait_for_task(swap_task.task_uid):
@@ -1244,6 +1260,10 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
     # Full reloads rebuild search only; page caches expire via their backstop.
     if not full_reload and (deleted_job_ids or loaded_job_ids):
         database.run(lambda c: revalidate_changed_jobs(c, deleted_job_ids + loaded_job_ids))
+
+    if embedding_auth_error is not None:
+        # Fail the run red (after deletions and revalidation ran) so a dead key is noticed.
+        raise RuntimeError(f"OpenRouter key limit/auth: new jobs not loaded ({embedding_auth_error})")
 
 
 def main():

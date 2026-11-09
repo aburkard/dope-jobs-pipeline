@@ -28,6 +28,14 @@ CONCURRENCY = 4
 RETRIES = 4
 TIMEOUT_SECONDS = 60
 DOCUMENT_TEMPLATE_MAX_BYTES = 8000
+# OpenRouter answers 401 (bad key), 402 (credit/limit exhausted) or 403 (key disabled/forbidden).
+# None of these heal on retry, and Meili's own indexing embedder uses the same key, so falling
+# back to Meili embedding would only fail again, slowly.
+AUTH_STATUS_CODES = (401, 402, 403)
+
+
+class EmbeddingAuthError(RuntimeError):
+    """OpenRouter rejected the key (auth or spending limit). Not retryable; the load must stop."""
 
 
 def embeddings_enabled() -> bool:
@@ -89,6 +97,9 @@ def _embed_batch(texts: list[str], session: requests.Session) -> list[list[float
                 json={"model": MODEL, "input": texts, "dimensions": DIMENSIONS, "encoding_format": "float"},
                 timeout=TIMEOUT_SECONDS,
             )
+            if response.status_code in AUTH_STATUS_CODES:
+                raise EmbeddingAuthError(
+                    f"OpenRouter key limit/auth: HTTP {response.status_code} from embeddings endpoint")
             response.raise_for_status()
             data = sorted(response.json()["data"], key=lambda item: item["index"])
             if len(data) != len(texts):
@@ -116,11 +127,15 @@ def user_provided_vectors(embedding: list[float]) -> dict:
 
 def attach_vectors(docs: list[dict]) -> bool:
     """Embed docs in place. Returns False (docs untouched) if embedding fails,
-    so the load can fall back to Meili embedding them as before."""
+    so the load can fall back to Meili embedding them as before.
+
+    Raises EmbeddingAuthError on OpenRouter 401/402/403: the fallback uses the same key."""
     if not docs or not embeddings_enabled():
         return False
     try:
         vectors = embed_texts([render_document_text(doc) for doc in docs])
+    except EmbeddingAuthError:
+        raise
     except RuntimeError as exc:
         print(f"  Warning: pipeline embedding failed ({exc.__cause__!r}); Meili will embed this batch")
         return False

@@ -45,6 +45,7 @@ def test_attach_vectors_sets_user_provided_normalized(monkeypatch):
     calls = []
 
     class Response:
+        status_code = 200
         def raise_for_status(self): pass
         def json(self):
             texts = calls[-1]["input"]
@@ -108,3 +109,52 @@ def test_convert_vectors_skips_converted_and_honors_dry_run(monkeypatch):
     assert updates == []
     assert meili_reconcile.convert_vectors_to_user_provided(client, dry_run=False) == 1
     assert updates == [{"meili_id": "a", "_vectors": {"default": {"embeddings": [0.1, 0.2], "regenerate": False}}}]
+
+
+def test_attach_vectors_raises_on_openrouter_auth_or_limit_without_retry(monkeypatch):
+    # 401/402/403 never heal on retry and Meili's fallback embedder uses the same key:
+    # attach_vectors must raise (no silent fallback) and must not burn retries.
+    import pytest
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    sleeps = []
+    monkeypatch.setattr(embeddings.time, "sleep", lambda s: sleeps.append(s))
+    for status in (401, 402, 403):
+        calls = []
+
+        class Response:
+            status_code = status
+            def raise_for_status(self): raise embeddings.requests.HTTPError(str(status))
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def post(self, *args, **kwargs):
+                calls.append(1)
+                return Response()
+
+        monkeypatch.setattr(embeddings.requests, "Session", Session)
+        docs = [{"title": "t"}]
+        with pytest.raises(embeddings.EmbeddingAuthError, match=str(status)):
+            embeddings.attach_vectors(docs)
+        assert calls == [1]
+        assert "_vectors" not in docs[0]
+    assert sleeps == []
+
+
+def test_attach_vectors_still_falls_back_on_server_errors(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setattr(embeddings.time, "sleep", lambda s: None)
+
+    class Response:
+        status_code = 503
+        def raise_for_status(self): raise embeddings.requests.HTTPError("503")
+
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(embeddings.requests, "Session", Session)
+    docs = [{"title": "t"}]
+    assert embeddings.attach_vectors(docs) is False
+    assert "_vectors" not in docs[0]

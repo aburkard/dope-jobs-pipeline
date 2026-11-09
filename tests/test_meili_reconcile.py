@@ -137,6 +137,61 @@ def test_load_deletes_before_upserting_and_revalidates(monkeypatch):
     assert revalidated == ["gone", "live"]
 
 
+
+def test_load_stops_upserts_and_fails_red_on_openrouter_auth_error(monkeypatch):
+    import pytest
+    from embeddings import EmbeddingAuthError
+    events = []
+
+    class Connection:
+        def cursor(self): return self
+        def __enter__(self): return self
+        def __exit__(self, *exc): pass
+        def execute(self, *args): pass
+        def fetchall(self): return []
+        def commit(self): pass
+
+    class Index:
+        def get_primary_key(self): return "meili_id"
+        def delete_documents(self, ids):
+            events.append("delete")
+            return SimpleNamespace(task_uid=1)
+        def add_documents(self, docs, primary_key):
+            events.append("upsert")
+            return SimpleNamespace(task_uid=2)
+        def get_stats(self): return SimpleNamespace(number_of_documents=0)
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def get_index(self, uid): return Index()
+        def index(self, uid): return Index()
+        def wait_for_task(self, uid, **kwargs): return {"status": "succeeded"}
+
+    def attach_vectors(docs):
+        events.append("embed")
+        raise EmbeddingAuthError("OpenRouter key limit/auth: HTTP 402 from embeddings endpoint")
+
+    import sys
+    monkeypatch.setitem(sys.modules, "meilisearch", SimpleNamespace(Client=Client))
+    monkeypatch.setattr(pipeline, "attach_vectors", attach_vectors)
+    monkeypatch.setattr(pipeline, "get_latest_fx_rates", lambda c: ({}, None))
+    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda c, **kw: ["gone"])
+    monkeypatch.setattr(pipeline, "get_active_jobs_for_meili", lambda c, job_ids: [{"id": j} for j in job_ids])
+    monkeypatch.setattr(pipeline, "_build_docs_for_chunk", lambda rows, *a: [{"id": r["id"]} for r in rows])
+    loaded = []
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda c, ids: loaded.extend(ids))
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda c, ids: None)
+    revalidated = []
+    monkeypatch.setattr(pipeline, "revalidate_changed_jobs", lambda c, ids: revalidated.extend(ids))
+
+    with pytest.raises(RuntimeError, match="OpenRouter key limit/auth: new jobs not loaded"):
+        pipeline.step_load(Connection(), parsed_job_ids=["a", "b"], removed_job_ids=["gone"], meili_batch_size=1)
+
+    # Deletions still ran first and were revalidated; no upsert was attempted after the first auth error.
+    assert events == ["delete", "embed"]
+    assert loaded == []
+    assert revalidated == ["gone"]
+
 def test_revalidation_posts_tag_batches(monkeypatch):
     requests = []
 
