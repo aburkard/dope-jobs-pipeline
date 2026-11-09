@@ -135,7 +135,7 @@ def test_v2_settings_cover_the_app_and_have_no_shift():
     # Exactly the live jobs_v2 embedder after its URL/distribution patch: single openAi-source embedder
     # (source/model changes force a full reindex in Meili 1.56.1), explicit 0.75/0.1 shift, 256d.
     assert emb == {"source": "openAi", "model": "text-embedding-3-small", "dimensions": 256,
-                   "url": "http://127.0.0.1:8089/v1/embeddings", "distribution": {"mean": 0.75, "sigma": 0.1}}
+                   "url": "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings", "distribution": {"mean": 0.75, "sigma": 0.1}}
 
 
 def test_document_template_matches_python_renderer():

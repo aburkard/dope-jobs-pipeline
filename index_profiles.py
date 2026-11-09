@@ -6,7 +6,7 @@
   pinned clean projection P (models/proj_clean_voy4_1024_to_256.npy), slim documents, lean
   settings (proximityPrecision byAttribute, granular filterable attributes, posted_at_ts sort) and a
   single openAi-source embedder with an explicit 0.75/0.1 DistributionShift. Queries are embedded by the box's
-  voyage-query service (the tiny student, 127.0.0.1:8089) into the same 256d space.
+  proxy route /openai-search-tiny (the tiny student, aburkard/dope-jobs PR 1) into the same 256d space.
 
 The profile is chosen per run with PIPELINE_INDEX_PROFILE (load.yml: repo variable, or the dispatch
 input). Never write "v2" vectors into a "pplx512" index or the reverse: Meili cannot detect a
@@ -70,7 +70,7 @@ _OPENAI_SHAPED = {
 
 
 V2_DISTRIBUTION = {"mean": 0.75, "sigma": 0.1}
-V2_SEARCH_EMBED_URL_DEFAULT = "http://127.0.0.1:8089/v1/embeddings"  # voyage-query service (tiny student)
+V2_SEARCH_EMBED_URL_DEFAULT = "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings"  # box proxy route serving the tiny student
 
 
 def v2_embedder() -> dict:
