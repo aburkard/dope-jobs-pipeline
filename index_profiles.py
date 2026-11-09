@@ -6,7 +6,7 @@
   pinned clean projection P (models/proj_clean_voy4_1024_to_256.npy), slim documents, lean
   settings (proximityPrecision byAttribute, granular filterable attributes, posted_at_ts sort) and a
   composite REST embedder with no DistributionShift. Queries are embedded by the box proxy's
-  /voyage-search route (the tiny student) into the same 256d space.
+  /openai-search-tiny route (the tiny student, aburkard/dope-jobs PR 1) into the same 256d space.
 
 The profile is chosen per run with PIPELINE_INDEX_PROFILE (load.yml: repo variable, or the dispatch
 input). Never write "v2" vectors into a "pplx512" index or the reverse: Meili cannot detect a
@@ -76,8 +76,8 @@ def v2_embedder() -> dict:
     model's built-in DistributionShift (this is what prod's pplx index silently has). The gate
     measured v2 best with no shift, so `distribution` is explicitly null.
     """
-    search_url = os.environ.get("MEILI_V2_SEARCH_EMBED_URL", "http://127.0.0.1:8087/voyage-search/v1/embeddings")
-    index_url = os.environ.get("MEILI_V2_INDEX_EMBED_URL", "http://127.0.0.1:8087/voyage-index/v1/embeddings")
+    search_url = os.environ.get("MEILI_V2_SEARCH_EMBED_URL", "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings")
+    index_url = os.environ.get("MEILI_V2_INDEX_EMBED_URL", "http://127.0.0.1:8087/openai-index-tiny/v1/embeddings")
     return {
         "source": "composite",
         "distribution": None,
