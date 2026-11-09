@@ -9,6 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# `id` must stay filterable: the web app resolves ?loc=<geoname id> URLs with `id = "<id>"` filters.
+PLACES_FILTERABLE_ATTRIBUTES = ["kind", "country_code", "admin1_key", "supports_radius", "id"]
+
 
 def _admin1_key(country_code: str | None, admin1_code: str | None) -> str | None:
     if not country_code or not admin1_code:
@@ -91,7 +94,7 @@ def sync_places_index(conn, meili_host: str, meili_key: str | None = None,
 
     client = meilisearch.Client(meili_host, meili_key or os.environ.get("MEILISEARCH_MASTER_KEY", ""))
     index = client.index(index_name)
-    index.update_filterable_attributes(["kind", "country_code", "admin1_key", "supports_radius"])
+    index.update_filterable_attributes(PLACES_FILTERABLE_ATTRIBUTES)
     index.update_searchable_attributes([
         "display_name",
         "canonical_name",

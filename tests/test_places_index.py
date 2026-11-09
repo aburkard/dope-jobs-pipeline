@@ -69,3 +69,40 @@ def test_build_place_doc_admin1_prioritizes_before_locality():
     )
     doc = build_place_doc(row)
     assert doc["kind_priority"] == 1
+
+
+def test_sync_places_index_keeps_id_filterable(monkeypatch):
+    # The web app resolves ?loc=<geoname id> with `id = "<id>"` filters; without this every such URL 500s.
+    import sys
+    import types
+
+    import places_index
+
+    applied = {}
+
+    class FakeIndex:
+        def update_filterable_attributes(self, attrs):
+            applied["filterable"] = list(attrs)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: types.SimpleNamespace(task_uid=1, number_of_documents=0)
+
+    class FakeCursor:
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    fake_index = FakeIndex()
+    client = types.SimpleNamespace(index=lambda name: fake_index, wait_for_task=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "meilisearch", types.SimpleNamespace(Client=lambda host, key: client))
+    places_index.sync_places_index(types.SimpleNamespace(cursor=FakeCursor), "http://meili", "key")
+    assert "id" in applied["filterable"]
+    assert {"kind", "country_code", "admin1_key", "supports_radius"} <= set(applied["filterable"])
