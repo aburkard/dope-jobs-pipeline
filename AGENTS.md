@@ -11,3 +11,13 @@ Production search notes:
 - Internal background Meili traffic should use `https://search-internal.dopejobs.xyz`, not `search.dopejobs.xyz`.
 - `search-internal.dopejobs.xyz` is Cloudflare-proxied, protected by Cloudflare Access service-token headers, and origin-blocked for non-Cloudflare source IPs.
 - The Hetzner origin exempts Cloudflare IP ranges from the coarse `80/443` connection throttle. If internal access breaks, first verify Cloudflare Access headers and then refresh the Cloudflare IP allowlist on the origin.
+- Index profiles (`index_profiles.py`, `PIPELINE_INDEX_PROFILE`):
+  - `pplx512` (default) is today's `jobs` index.
+  - `v2` is the voyage/student index:
+    - voyage-4-lite native 1024d docs (`input_type: document`), L2 → `models/proj_clean_voy4_1024_to_256.npy` (sha256 pinned in embeddings.py) → L2 = 256d
+    - slim docs (`V2_DROP_FIELDS`)
+    - lean settings plus ONE embedder: `{"source":"openAi","model":"text-embedding-3-small","dimensions":256,"url":"http://127.0.0.1:8087/openai-search-tiny/v1/embeddings","distribution":{"mean":0.75,"sigma":0.1}}`. Composite fails Meili's search-vs-indexing similarity check; source/model changes force a full reindex, while openAi url/distribution changes don't. Keep the frontend at semanticRatio 0.8. In v2 the pipeline never sends docs without vectors and never re-applies settings to an existing index.
+  - Queries come from the box proxy route /openai-search-tiny (the tiny student) in the same 256d space.
+  - The loader refuses to write one profile's vectors into an index whose embedder has the other's dimensions.
+  - Prod Meili allows loopback embedder URLs (`MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS=127.0.0.1/32`).
+  - Scheduled loads follow the repo variable `PIPELINE_INDEX_PROFILE`; flip it only at the index swap.

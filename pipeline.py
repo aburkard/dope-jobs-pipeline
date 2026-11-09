@@ -45,7 +45,8 @@ from db import (
 from salary_normalization import normalize_salary_annual_usd
 from public_ids import meili_safe_job_id
 from job_groups import recompute_job_groups_for_boards
-from embeddings import EmbeddingAuthError, attach_vectors
+from embeddings import EmbeddingAuthError, EmbeddingRequiredError, attach_vectors
+import index_profiles
 from meili_reconcile import (
     cancel_enqueued_deletions,
     convert_vectors_to_user_provided,
@@ -991,17 +992,40 @@ class _LoadDatabase:
             return operation(self.conn)
 
 
+_PROFILE_DIMENSIONS = {"pplx512": 512, "v2": index_profiles.V2_DIMENSIONS}
+
+
+def _assert_profile_matches_index(index, profile: str) -> None:
+    """Refuse to write one profile's vectors into an index configured for another vector space."""
+    try:
+        embedders = index.get_embedders()
+    except AttributeError:  # client without the method (tests); nothing to check against
+        return
+    except Exception as exc:
+        print(f"  Warning: could not read embedder settings to check the profile ({type(exc).__name__})")
+        return
+    embedders = embedders if isinstance(embedders, dict) else (getattr(embedders, "embedders", None) or {})
+    default = embedders.get("default") or {}
+    default = default if isinstance(default, dict) else dict(getattr(default, "__dict__", {}))
+    dims = default.get("dimensions") or (default.get("searchEmbedder") or {}).get("dimensions") \
+        or (default.get("search_embedder") or {}).get("dimensions")
+    expected = _PROFILE_DIMENSIONS[profile]
+    if dims and int(dims) != expected:
+        raise RuntimeError(f"index profile {profile!r} writes {expected}d vectors but the target index's "
+                           f"embedder has {dims} dimensions; refusing to mix vector spaces")
+
+
 def step_load(conn, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
-              full_reload: bool = False, meili_batch_size: int = 1000):
+              full_reload: bool = False, meili_batch_size: int = 1000, index_uid: str = "jobs"):
     with _LoadDatabase(conn) as database:
         return _step_load(database, meili_host, meili_key, parsed_job_ids,
-                          removed_job_ids, full_reload, meili_batch_size)
+                          removed_job_ids, full_reload, meili_batch_size, index_uid)
 
 
 def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: str | None = None,
               parsed_job_ids: list[str] | None = None, removed_job_ids: list[str] | None = None,
-              full_reload: bool = False, meili_batch_size: int = 1000):
+              full_reload: bool = False, meili_batch_size: int = 1000, index_uid: str = "jobs"):
     """Load active jobs from DB into MeiliSearch, using ATS-only metadata when needed.
 
     Processes jobs in chunks to avoid loading all raw_json blobs into memory at once.
@@ -1091,7 +1115,18 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         "_geo",
     ]
 
+    profile = index_profiles.active_profile()
+    print(f"  Index profile: {profile}, target index: {index_uid}")
+
     def configure_jobs_index(index):
+        if profile == "v2":
+            if jobs_index_exists and not recreate_index:
+                # Never re-apply settings to an existing v2 index: changing the embedder's source/model,
+                # or the filterable/proximity settings, makes Meili reprocess every document mid-load.
+                print("  v2: existing index, leaving its settings untouched")
+                return
+            index.update_settings(index_profiles.v2_settings())
+            return
         index.update_filterable_attributes(filterable_attributes)
         index.update_searchable_attributes(searchable_attributes)
         index.update_sortable_attributes(sortable_attributes)
@@ -1110,7 +1145,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         except Exception:
             return False
 
-    target_index_uid = "jobs"
+    target_index_uid = index_uid
     jobs_index_exists = True
     try:
         jobs_index = client.get_index(target_index_uid)
@@ -1136,6 +1171,8 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         )
 
     index = client.index(active_index_uid)
+    if jobs_index_exists and not recreate_index:
+        _assert_profile_matches_index(index, profile)
     should_configure_index = recreate_index or not jobs_index_exists or full_reload
     if should_configure_index:
         configure_jobs_index(index)
@@ -1191,7 +1228,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     total_batches = (len(all_job_ids) + BATCH_SIZE - 1) // BATCH_SIZE
     consecutive_timeouts = 0
-    embedding_auth_error: EmbeddingAuthError | None = None
+    embedding_auth_error: RuntimeError | None = None
     for i in range(0, len(all_job_ids), BATCH_SIZE):
         chunk_ids = all_job_ids[i:i + BATCH_SIZE]
         chunk_rows = database.run(lambda c: get_active_jobs_for_meili(c, job_ids=chunk_ids))
@@ -1202,6 +1239,8 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         geo_resolver.conn = conn
         docs = _build_docs_for_chunk(chunk_rows, merge_api_data, geo_resolver, company_lookup,
                                      fx_rates, fx_as_of, geo_lookup, group_counts, boilerplate_cache, conn)
+        if profile == "v2":
+            docs = [index_profiles.slim_doc(doc) for doc in docs]
         # End the read transaction before waiting minutes for embeddings.
         conn.commit()
         if docs:
@@ -1209,7 +1248,7 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
             # during indexing (falls back to Meili embedding if this fails).
             try:
                 attach_vectors(docs)
-            except EmbeddingAuthError as exc:
+            except (EmbeddingAuthError, EmbeddingRequiredError) as exc:
                 # The key is out of credit or rejected. Meili's indexing embedder uses the same key,
                 # so submitting without vectors would only fail again, slowly. Stop upserting; the
                 # unloaded jobs stay pending and retry on the next run.
@@ -1241,7 +1280,8 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
         # Never swap a partially built rebuild index in for the live one.
         delete_task = client.delete_index(active_index_uid)
         wait_for_task(delete_task.task_uid, timeout_in_ms=120000)
-        raise RuntimeError(f"OpenRouter key limit/auth: full reload aborted, live index untouched ({embedding_auth_error})")
+        reason = "OpenRouter key limit/auth" if isinstance(embedding_auth_error, EmbeddingAuthError) else "Document embedding unavailable"
+        raise RuntimeError(f"{reason}: full reload aborted, live index untouched ({embedding_auth_error})")
 
     if recreate_index:
         swap_task = client.swap_indexes([{"indexes": [active_index_uid, target_index_uid]}])
@@ -1263,7 +1303,8 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
 
     if embedding_auth_error is not None:
         # Fail the run red (after deletions and revalidation ran) so a dead key is noticed.
-        raise RuntimeError(f"OpenRouter key limit/auth: new jobs not loaded ({embedding_auth_error})")
+        reason = "OpenRouter key limit/auth" if isinstance(embedding_auth_error, EmbeddingAuthError) else "Document embedding unavailable"
+        raise RuntimeError(f"{reason}: new jobs not loaded ({embedding_auth_error})")
 
 
 def main():
@@ -1310,6 +1351,10 @@ def main():
     parser.add_argument("--meili-host", default=None, help="MeiliSearch host (default: MEILISEARCH_HOST env var or localhost)")
     parser.add_argument("--meili-key", default=None, help="MeiliSearch master key (default: MEILISEARCH_MASTER_KEY env var)")
     parser.add_argument("--full-load", action="store_true", help="Rebuild and upsert all parsed jobs into MeiliSearch")
+    parser.add_argument("--index-uid", default=os.environ.get("MEILI_INDEX_UID", "jobs"),
+                        help="Meili index to load into (default jobs; e.g. jobs_v2 for a new index before a swap)")
+    parser.add_argument("--index-profile", choices=index_profiles.PROFILES, default=None,
+                        help="Vector space / settings profile (default: $PIPELINE_INDEX_PROFILE or pplx512)")
     parser.add_argument("--load-limit", type=int, default=None,
                         help="Max number of jobs to load into MeiliSearch (for testing)")
     parser.add_argument("--allow-load", action="store_true",
@@ -1319,6 +1364,8 @@ def main():
     parser.add_argument("--jobvite-refetch-existing-detail", action="store_true",
                         help="For Jobvite, backfill missing stored detail HTML/date metadata on existing jobs")
     args = parser.parse_args()
+    if args.index_profile:
+        os.environ[index_profiles.PROFILE_ENV] = args.index_profile
 
     if (args.shard_index is None) != (args.total_shards is None):
         parser.error("--shard-index and --total-shards must be provided together")
@@ -1456,6 +1503,7 @@ def main():
             parsed_job_ids=jobs_to_load,
             removed_job_ids=removed_to_load,
             full_reload=args.full_load,
+            index_uid=args.index_uid,
         )
     else:
         print("Skipping load")
