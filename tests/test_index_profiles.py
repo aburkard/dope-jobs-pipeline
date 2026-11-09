@@ -132,10 +132,12 @@ def test_v2_settings_cover_the_app_and_have_no_shift():
     assert s["sortableAttributes"] == ["posted_at_ts"]
     assert s["proximityPrecision"] == "byAttribute"
     emb = s["embedders"]["default"]
-    assert emb["source"] == "composite" and "distribution" in emb and emb["distribution"] is None
-    for side in ("searchEmbedder", "indexingEmbedder"):
-        assert emb[side]["source"] == "rest" and emb[side]["dimensions"] == 256
-    assert emb["indexingEmbedder"]["documentTemplate"] == index_profiles.DOCUMENT_TEMPLATE
+    # Single REST embedder (a composite fails Meili's search-vs-indexing similarity check for an
+    # asymmetric pair) with the explicit 0.75/0.1 shift the gate's best student row was measured with.
+    assert emb["source"] == "rest" and emb["dimensions"] == 256
+    assert emb["distribution"] == {"mean": 0.75, "sigma": 0.1}
+    assert emb["url"].endswith("/openai-search-tiny/v1/embeddings")
+    assert emb["documentTemplate"] == index_profiles.DOCUMENT_TEMPLATE
 
 
 def test_document_template_matches_python_renderer():
@@ -211,7 +213,7 @@ def test_v2_full_load_targets_index_uid_applies_v2_settings_and_slims(monkeypatc
     pipeline.step_load(conn, parsed_job_ids=["live"], full_reload=True, index_uid="jobs_v2")
     assert ("index", "jobs_v2") in events and ("index", "jobs") not in events
     settings = [e[1] for e in events if e[0] == "settings"]
-    assert settings and settings[0]["embedders"]["default"]["distribution"] is None
+    assert settings and settings[0]["embedders"]["default"]["distribution"] == {"mean": 0.75, "sigma": 0.1}
     assert not [e for e in events if e[0] == "legacy-filterable"]
     upserted = [e[1] for e in events if e[0] == "upsert"][0][0]
     assert "_geojson" not in upserted and "salary_fx_as_of" not in upserted and "ats_type" not in upserted
@@ -236,3 +238,41 @@ def test_default_profile_keeps_full_docs_and_legacy_settings(monkeypatch):
     assert [e for e in events if e[0] == "legacy-filterable"]
     upserted = [e[1] for e in events if e[0] == "upsert"][0][0]
     assert "_geojson" in upserted
+
+
+def test_v2_never_falls_back_to_meili_embedding(monkeypatch):
+    monkeypatch.setenv(index_profiles.PROFILE_ENV, "v2")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(embeddings.EmbeddingRequiredError):
+        embeddings.attach_vectors([{"title": "t"}])
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setattr(embeddings.time, "sleep", lambda s: None)
+
+    class Response:
+        status_code = 503
+        def raise_for_status(self): raise embeddings.requests.HTTPError("503")
+
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(embeddings.requests, "Session", Session)
+    docs = [{"title": "t"}]
+    with pytest.raises(embeddings.EmbeddingRequiredError):
+        embeddings.attach_vectors(docs)
+    assert "_vectors" not in docs[0]
+
+
+def test_v2_load_stops_instead_of_sending_unvectored_docs(monkeypatch):
+    monkeypatch.setenv(index_profiles.PROFILE_ENV, "v2")
+    events = []
+    conn = _patch_load(monkeypatch, _fake_meili(events, embedder_dims=256), {"id": "live"})
+
+    def attach(docs):
+        raise embeddings.EmbeddingRequiredError("document embedding failed")
+
+    monkeypatch.setattr(pipeline, "attach_vectors", attach)
+    with pytest.raises(RuntimeError, match="Document embedding unavailable: new jobs not loaded"):
+        pipeline.step_load(conn, parsed_job_ids=["live"], index_uid="jobs_v2")
+    assert not [e for e in events if e[0] == "upsert"]

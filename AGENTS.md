@@ -16,9 +16,9 @@ Production search notes:
   - `v2` is the voyage/student index:
     - voyage-4-lite native 1024d docs (`input_type: document`), L2 → `models/proj_clean_voy4_1024_to_256.npy` (sha256 pinned in embeddings.py) → L2 = 256d
     - slim docs (`V2_DROP_FIELDS`)
-    - lean settings plus a composite **rest** embedder with `distribution: null`. Never `openAi` + an OpenAI model name: Meili then applies a hidden DistributionShift.
+    - lean settings plus a single **rest** embedder (a composite fails Meili's search-vs-indexing similarity check for asymmetric encoders) with an explicit `distribution` 0.75/0.1. That's the shift the best student row was measured with; keep the frontend at semanticRatio 0.8. In v2 the pipeline never sends docs without vectors.
   - Queries come from the box proxy's `/openai-search-tiny` (the tiny student) in the same 256d space.
   - The loader refuses to write one profile's vectors into an index whose embedder has the other's dimensions.
-  - Meili test-embeds when embedder settings are applied, so `/openai-search-tiny` and `/openai-index-tiny` must be live before a v2 index is configured.
+  - `/openai-search-tiny` must be live before v2 searches.
   - Prod Meili allows loopback embedder URLs (`MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS=127.0.0.1/32`).
   - Scheduled loads follow the repo variable `PIPELINE_INDEX_PROFILE`; flip it only at the index swap.

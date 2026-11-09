@@ -72,6 +72,11 @@ def project_v2(raw: list[list[float]]) -> list[list[float]]:
     return y.tolist()
 
 
+class EmbeddingRequiredError(RuntimeError):
+    """v2 profile: document vectors could not be computed. Don't let Meili embed (its embedder is the
+    query encoder); the load must stop and leave the jobs pending."""
+
+
 class EmbeddingAuthError(RuntimeError):
     """OpenRouter rejected the key (auth or spending limit). Not retryable; the load must stop."""
 
@@ -176,13 +181,20 @@ def attach_vectors(docs: list[dict]) -> bool:
     so the load can fall back to Meili embedding them as before.
 
     Raises EmbeddingAuthError on OpenRouter 401/402/403: the fallback uses the same key."""
-    if not docs or not embeddings_enabled():
+    v2 = index_profiles.active_profile() == "v2"
+    if not docs:
+        return False
+    if not embeddings_enabled():
+        if v2:
+            raise EmbeddingRequiredError("v2 profile needs OPENROUTER_API_KEY to compute document vectors")
         return False
     try:
         vectors = embed_texts([render_document_text(doc) for doc in docs])
     except EmbeddingAuthError:
         raise
     except RuntimeError as exc:
+        if v2:
+            raise EmbeddingRequiredError(f"document embedding failed ({exc.__cause__!r}); not falling back to Meili") from exc
         print(f"  Warning: pipeline embedding failed ({exc.__cause__!r}); Meili will embed this batch")
         return False
     for doc, vector in zip(docs, vectors):

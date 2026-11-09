@@ -5,7 +5,7 @@
 - "v2": the voyage/student index. voyage-4-lite 1024d document vectors projected to 256d with the
   pinned clean projection P (models/proj_clean_voy4_1024_to_256.npy), slim documents, lean
   settings (proximityPrecision byAttribute, granular filterable attributes, posted_at_ts sort) and a
-  composite REST embedder with no DistributionShift. Queries are embedded by the box proxy's
+  single REST embedder with an explicit 0.75/0.1 DistributionShift. Queries are embedded by the box proxy's
   /openai-search-tiny route (the tiny student, aburkard/dope-jobs PR 1) into the same 256d space.
 
 The profile is chosen per run with PIPELINE_INDEX_PROFILE (load.yml: repo variable, or the dispatch
@@ -69,23 +69,27 @@ _OPENAI_SHAPED = {
 }
 
 
-def v2_embedder() -> dict:
-    """Composite REST embedder for the v2 index.
+V2_DISTRIBUTION = {"mean": 0.75, "sigma": 0.1}
 
-    source "rest" on purpose: an `openAi` source with an OpenAI model name makes Meili apply that
-    model's built-in DistributionShift (this is what prod's pplx index silently has). The gate
-    measured v2 best with no shift, so `distribution` is explicitly null.
+
+def v2_embedder() -> dict:
+    """Single REST embedder for the v2 index, pointing at the box proxy's tiny query encoder.
+
+    - Single, not composite: Meili checks that a composite's search and indexing embedders agree
+      (angular distance <= 0.01 on a test text), which an asymmetric student-query / voyage-doc pair
+      fails. So the index has one embedder; document vectors always come from the pipeline
+      (`regenerate: false`), and in this profile the pipeline never sends a batch without vectors
+      (Meili would otherwise embed documents with the *query* encoder).
+    - `distribution` is set explicitly to the 0.75/0.1 shift. The full-scale gate's best student row
+      (hybrid @0.8, 0.887 vs 0.807) was measured with exactly this shift, which is what an `openAi`
+      source declaring `text-embedding-3-small` applies implicitly. Explicit here, so it is visible.
+      With this shift keep the frontend at semanticRatio 0.8 (0.6 measured worse).
     """
-    search_url = os.environ.get("MEILI_V2_SEARCH_EMBED_URL", "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings")
-    index_url = os.environ.get("MEILI_V2_INDEX_EMBED_URL", "http://127.0.0.1:8087/openai-index-tiny/v1/embeddings")
+    url = os.environ.get("MEILI_V2_SEARCH_EMBED_URL", "http://127.0.0.1:8087/openai-search-tiny/v1/embeddings")
     return {
-        "source": "composite",
-        "distribution": None,
-        "searchEmbedder": {"source": "rest", "url": search_url, "dimensions": V2_DIMENSIONS, **_OPENAI_SHAPED},
-        "indexingEmbedder": {
-            "source": "rest", "url": index_url, "dimensions": V2_DIMENSIONS, **_OPENAI_SHAPED,
-            "documentTemplate": DOCUMENT_TEMPLATE, "documentTemplateMaxBytes": 8000,
-        },
+        "source": "rest", "url": url, "dimensions": V2_DIMENSIONS, **_OPENAI_SHAPED,
+        "distribution": dict(V2_DISTRIBUTION),
+        "documentTemplate": DOCUMENT_TEMPLATE, "documentTemplateMaxBytes": 8000,
     }
 
 
