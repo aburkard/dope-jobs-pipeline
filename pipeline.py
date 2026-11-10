@@ -993,6 +993,9 @@ class _LoadDatabase:
 
 
 _PROFILE_DIMENSIONS = {"pplx512": 512, "v2": index_profiles.V2_DIMENSIONS}
+# Most upsert tasks the loader leaves outstanding in Meili before it blocks on the oldest (~10k docs,
+# ~100 MB of queued payloads at most). See _step_load for why queuing makes loads faster.
+MEILI_UPSERTS_IN_FLIGHT = 10
 
 
 def _assert_profile_matches_index(index, profile: str) -> None:
@@ -1229,6 +1232,43 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
     total_batches = (len(all_job_ids) + BATCH_SIZE - 1) // BATCH_SIZE
     consecutive_timeouts = 0
     embedding_auth_error: RuntimeError | None = None
+    # Upsert tasks submitted but not yet confirmed, oldest first: (task_uid, job ids).
+    # Each Meili batch has a large fixed cost on a big index, and Meili folds every addition task
+    # enqueued while it is busy into its next batch. So keep submitting while it indexes, and only
+    # block once MEILI_UPSERTS_IN_FLIGHT tasks are outstanding.
+    in_flight: list[tuple[int, list[str]]] = []
+
+    def task_finished(task_uid: int) -> bool:
+        try:
+            task = client.get_task(task_uid)
+        except Exception:
+            return False
+        status = getattr(task, "status", None)
+        if status is None and isinstance(task, dict):
+            status = task.get("status")
+        return status in ("succeeded", "failed", "canceled")
+
+    def confirm_oldest() -> bool:
+        """Wait for the oldest in-flight upsert; mark its jobs loaded. False once Meili looks stuck."""
+        nonlocal total_loaded, consecutive_timeouts
+        task_uid, job_ids = in_flight.pop(0)
+        # Longer timeout for upserts: embeddings can be slow when Meili queue is backed up
+        if wait_for_task(task_uid, timeout_in_ms=600000):
+            database.run(lambda c: mark_jobs_meili_loaded(c, job_ids))
+            total_loaded += len(job_ids)
+            loaded_job_ids.extend(job_ids)
+            consecutive_timeouts = 0
+            return True
+        consecutive_timeouts += 1
+        print(f"  Warning: timed out on task {task_uid} after 10min "
+              f"({consecutive_timeouts} consecutive timeout{'s' if consecutive_timeouts > 1 else ''})")
+        # Bail after 3 in a row — Meili is probably stuck
+        if consecutive_timeouts >= 3:
+            print(f"  Stopping after {consecutive_timeouts} consecutive timeouts; remainder will retry next run")
+            return False
+        return True
+
+    meili_stuck = False
     for i in range(0, len(all_job_ids), BATCH_SIZE):
         chunk_ids = all_job_ids[i:i + BATCH_SIZE]
         chunk_rows = database.run(lambda c: get_active_jobs_for_meili(c, job_ids=chunk_ids))
@@ -1259,20 +1299,18 @@ def _step_load(database, meili_host: str = "http://localhost:7700", meili_key: s
             task = _add_documents_with_retry(docs)
             batch_num = i // BATCH_SIZE + 1
             print(f"  Upserting batch {batch_num}/{total_batches} ({len(docs)} docs)... (task {task.task_uid})")
-            # Longer timeout for upserts: embeddings can be slow when Meili queue is backed up
-            if wait_for_task(task.task_uid, timeout_in_ms=600000):
-                database.run(lambda c: mark_jobs_meili_loaded(c, [doc["id"] for doc in docs]))
-                total_loaded += len(docs)
-                loaded_job_ids.extend(doc["id"] for doc in docs)
-                consecutive_timeouts = 0
-            else:
-                consecutive_timeouts += 1
-                print(f"  Warning: timed out on task {task.task_uid} after 10min "
-                      f"({consecutive_timeouts} consecutive timeout{'s' if consecutive_timeouts > 1 else ''})")
-                # Bail after 3 in a row — Meili is probably stuck
-                if consecutive_timeouts >= 3:
-                    print(f"  Stopping after {consecutive_timeouts} consecutive timeouts; remainder will retry next run")
-                    break
+            in_flight.append((task.task_uid, [doc["id"] for doc in docs]))
+            # Record finished tasks without blocking; block only when the window is full.
+            while in_flight and not meili_stuck and (
+                    len(in_flight) >= MEILI_UPSERTS_IN_FLIGHT or task_finished(in_flight[0][0])):
+                meili_stuck = not confirm_oldest()
+            if meili_stuck:
+                break
+
+    # Confirm whatever is still queued (also after an embedding error: those tasks were submitted
+    # with vectors and their jobs must be marked). Once Meili looks stuck, leave the rest pending.
+    while in_flight and not meili_stuck:
+        meili_stuck = not confirm_oldest()
 
     print(f"  Loaded {total_loaded} documents")
 

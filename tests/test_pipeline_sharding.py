@@ -1099,8 +1099,8 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
     monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: None)
     monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: None)
 
-    # Provide enough jobs to trigger the consecutive-timeout bail (3+)
-    parsed_ids = [f"greenhouse__figma__{i}" for i in range(5)]
+    # Provide enough jobs to trigger the consecutive-timeout bail (3+) with upserts in flight
+    parsed_ids = [f"greenhouse__figma__{i}" for i in range(15)]
     monkeypatch.setattr(
         pipeline,
         "get_active_jobs_for_meili",
@@ -1151,8 +1151,202 @@ def test_step_load_stops_submitting_batches_after_timeout(monkeypatch):
         meili_batch_size=1,
     )
 
-    # Should bail after 3 consecutive timeouts, not all 5 batches
-    assert captured["client"]._index.add_calls == 3
+    # MEILI_UPSERTS_IN_FLIGHT tasks go out before the first wait; each timeout lets one more in.
+    # Bail after 3 consecutive timeouts, not all 15 batches.
+    assert captured["client"]._index.add_calls == pipeline.MEILI_UPSERTS_IN_FLIGHT + 2
+
+
+@pytest.mark.parametrize("meili_busy", [True, False])
+def test_step_load_keeps_upserts_in_flight_and_marks_each_after_success(monkeypatch, meili_busy):
+    captured = {}
+    events = []
+    marked = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.query = query
+            self.params = params
+
+        def fetchall(self):
+            if "FROM pipeline_companies" in self.query:
+                return [("greenhouse", "figma", "Figma", "figma", "figma.com", "https://example.com/logo.png")]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            return None
+
+    class FakeTask:
+        def __init__(self, task_uid):
+            self.task_uid = task_uid
+
+    class FakeIndex:
+        def __init__(self):
+            self.primary_key = "meili_id"
+            self.add_calls = 0
+
+        def get_primary_key(self):
+            return self.primary_key
+
+        def add_documents(self, docs, primary_key="id"):
+            self.add_calls += 1
+            events.append(("add", 100 + self.add_calls))
+            self.docs = docs
+            self.primary_key_arg = primary_key
+            return FakeTask(100 + self.add_calls)
+
+        def get_stats(self):
+            return types.SimpleNamespace(number_of_documents=1)
+
+    class FakeClient:
+        def __init__(self, host, key, **kwargs):
+            self._index = FakeIndex()
+            captured["client"] = self
+
+        def get_index(self, uid):
+            return self._index
+
+        def index(self, name):
+            return self._index
+
+        def wait_for_task(self, task_uid, timeout_in_ms=0):
+            events.append(("wait", task_uid))
+            return {"uid": task_uid, "status": "succeeded"}
+
+        def get_task(self, task_uid):
+            return {"uid": task_uid, "status": "processing" if meili_busy else "succeeded"}
+
+    fake_meili = types.SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "meilisearch", fake_meili)
+    import geo_resolver
+    monkeypatch.setattr(
+        geo_resolver,
+        "GeoResolver",
+        lambda conn: types.SimpleNamespace(resolve_parsed_geo=lambda parsed: parsed),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_active_jobs_for_meili",
+        lambda conn, job_ids=None, include_removed=False: [
+            {
+                "id": f"greenhouse__figma__{i}",
+                "public_job_id": f"abc{i}",
+                "ats": "greenhouse",
+                "board_token": "figma",
+                "title": f"Engineer {i}",
+                "parsed_json": {
+                    "tagline": "Build product quality systems at Figma.",
+                    "locations": [],
+                    "applicant_location_requirements": [],
+                    "office_type": "remote",
+                    "job_type": "full_time",
+                    "experience_level": "senior",
+                    "is_manager": False,
+                    "industry_primary": "enterprise_software",
+                    "industry_tags": ["enterprise_software"],
+                    "salary": None,
+                    "salary_transparency": "not_disclosed",
+                    "years_experience": {"min": 3, "max": 5},
+                    "education_level": "bachelors",
+                    "hard_skills": [],
+                    "soft_skills": [],
+                    "cool_factor": "interesting",
+                    "vibe_tags": [],
+                    "visa_sponsorship": "unknown",
+                    "equity": {"offered": False},
+                    "company_stage": "public",
+                    "benefits_categories": [],
+                    "benefits_highlights": [],
+                    "reports_to": "",
+                },
+                "job_group": None,
+                "raw_json": {"first_published": "2026-04-01T12:30:00Z"},
+            }
+            for i in range(2)
+        ],
+    )
+    monkeypatch.setattr(pipeline, "get_removed_job_ids", lambda conn, job_ids=None: [])
+    monkeypatch.setattr(pipeline, "get_latest_fx_rates", lambda conn: ({}, None))
+    monkeypatch.setattr(pipeline, "_load_geo_place_lookup", lambda conn, ids: {})
+    monkeypatch.setattr(pipeline, "_build_primary_geo", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geojson", lambda parsed: None)
+    monkeypatch.setattr(pipeline, "_build_job_geo_fields", lambda parsed, lookup: {})
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_loaded", lambda conn, ids: marked.extend(ids))
+    monkeypatch.setattr(pipeline, "mark_jobs_meili_deleted", lambda conn, ids: None)
+
+    # Provide enough jobs to trigger the consecutive-timeout bail (3+) with upserts in flight
+    parsed_ids = [f"greenhouse__figma__{i}" for i in range(15)]
+    monkeypatch.setattr(
+        pipeline,
+        "get_active_jobs_for_meili",
+        lambda conn, job_ids=None, include_removed=False: [
+            {
+                "id": jid,
+                "public_job_id": jid.split("__")[-1],
+                "ats": "greenhouse",
+                "board_token": "figma",
+                "title": f"Engineer {jid}",
+                "parsed_json": {
+                    "tagline": "Build product quality systems at Figma.",
+                    "locations": [],
+                    "applicant_location_requirements": [],
+                    "office_type": "remote",
+                    "job_type": "full_time",
+                    "experience_level": "senior",
+                    "is_manager": False,
+                    "industry_primary": "enterprise_software",
+                    "industry_tags": ["enterprise_software"],
+                    "salary": None,
+                    "salary_transparency": "not_disclosed",
+                    "years_experience": {"min": 3, "max": 5},
+                    "education_level": "bachelors",
+                    "hard_skills": [],
+                    "soft_skills": [],
+                    "cool_factor": "interesting",
+                    "vibe_tags": [],
+                    "visa_sponsorship": "unknown",
+                    "equity": {"offered": False},
+                    "company_stage": "public",
+                    "benefits_categories": [],
+                    "benefits_highlights": [],
+                    "reports_to": "",
+                },
+                "job_group": None,
+                "raw_json": {"first_published": "2026-04-01T12:30:00Z"},
+            }
+            for jid in (job_ids or parsed_ids)
+        ],
+    )
+    pipeline.step_load(
+        FakeConn(),
+        meili_host="http://example.com",
+        meili_key="key",
+        parsed_job_ids=parsed_ids,
+        removed_job_ids=[],
+        meili_batch_size=1,
+    )
+
+    n = pipeline.MEILI_UPSERTS_IN_FLIGHT
+    upserts = [e for e in events if e[1] >= 101]
+    kinds = [e[0] for e in upserts]
+    if meili_busy:
+        # While Meili is busy, n upserts go out before the loader blocks, then one wait per submit.
+        assert kinds[:n + 1] == ["add"] * n + ["wait"]
+    else:
+        # Finished tasks are recorded right after the next submit, without filling the window.
+        assert kinds == ["add", "wait"] * len(parsed_ids)
+    assert [uid for kind, uid in upserts if kind == "wait"] == list(range(101, 101 + len(parsed_ids)))
+    # Every batch is confirmed (including the ones still queued when the loop ends), in order.
+    assert marked == parsed_ids
 
 
 def test_step_load_includes_unparsed_active_jobs_with_ats_metadata(monkeypatch):
