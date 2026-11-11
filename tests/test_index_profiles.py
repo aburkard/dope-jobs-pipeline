@@ -291,3 +291,25 @@ def test_v2_never_reapplies_settings_to_an_existing_index(monkeypatch):
     pipeline.step_load(conn, parsed_job_ids=["live"], full_reload=True, index_uid="jobs")
     assert not [e for e in events if e[0] == "settings"]
     assert [e for e in events if e[0] == "upsert"]
+
+
+def _embedders_index(default):
+    from meilisearch.models.embedders import Embedders
+    return SimpleNamespace(get_embedders=lambda: Embedders(embedders={"default": default}))
+
+
+def test_profile_guard_reads_real_client_models():
+    # The meilisearch client returns pydantic models, nested for composite embedders; the guard
+    # once crashed on them with "'OpenAiEmbedder' object has no attribute 'get'".
+    from meilisearch.models.embedders import CompositeEmbedder, OpenAiEmbedder
+    composite = CompositeEmbedder(source="composite",
+                                  search_embedder=OpenAiEmbedder(source="openAi", dimensions=512),
+                                  indexing_embedder=OpenAiEmbedder(source="openAi", dimensions=512))
+    pipeline._assert_profile_matches_index(_embedders_index(composite), "pplx512")
+    with pytest.raises(RuntimeError, match="refusing to mix vector spaces"):
+        pipeline._assert_profile_matches_index(_embedders_index(composite), "v2")
+
+    flat = OpenAiEmbedder(source="openAi", dimensions=256)
+    pipeline._assert_profile_matches_index(_embedders_index(flat), "v2")
+    with pytest.raises(RuntimeError, match="refusing to mix vector spaces"):
+        pipeline._assert_profile_matches_index(_embedders_index(flat), "pplx512")
