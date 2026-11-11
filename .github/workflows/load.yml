@@ -16,6 +16,8 @@ on:
           - meili-status
           - reconcile-meili-dry-run
           - reconcile-meili
+          - slug-drift-dry-run
+          - slug-drift
           - convert-meili-vectors-dry-run
           - convert-meili-vectors
           - full-load
@@ -120,4 +122,8 @@ jobs:
             ARGS+=(--backlog-max-age-days "$BACKLOG_MAX_AGE_DAYS")
           fi
           [ "$MODE" = "load-pending" ] && echo "Backlog gate: event=$EVENT_NAME max_age_days=${BACKLOG_MAX_AGE_DAYS:-none}"
+          case "$MODE" in
+            slug-drift-dry-run) uv run python company_slug_drift.py --dry-run; exit ;;
+            slug-drift) uv run python company_slug_drift.py; exit ;;
+          esac
           uv run python pipeline.py "${ARGS[@]}"

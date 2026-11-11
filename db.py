@@ -1429,7 +1429,7 @@ def backfill_company_slugs(conn, only_missing: bool = True, chunk_size: int = 10
     for i in range(0, len(updates), chunk_size):
         chunk = updates[i:i + chunk_size]
         with conn.cursor() as cur:
-            execute_values(
+            changed = execute_values(
                 cur,
                 """
                 WITH incoming(ats, board_token, company_slug) AS (VALUES %s)
@@ -1439,11 +1439,14 @@ def backfill_company_slugs(conn, only_missing: bool = True, chunk_size: int = 10
                 WHERE pc.ats = incoming.ats
                   AND pc.board_token = incoming.board_token
                   AND COALESCE(pc.company_slug, '') <> incoming.company_slug
+                RETURNING pc.ats, pc.board_token
                 """,
                 chunk,
                 template="(%s, %s, %s)",
+                fetch=True,
             )
-            total_updated += max(cur.rowcount, 0)
+            total_updated += len(changed)
+            mark_company_jobs_for_meili_reload(cur, changed)
         conn.commit()
     return total_updated
 
@@ -1497,11 +1500,20 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
                     last_http_status: int | None | object = _UNSET):
     """Upsert a company record."""
     now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT company_slug, company_name, domain FROM pipeline_companies WHERE ats = %s AND board_token = %s",
+            (ats, board_token),
+        )
+        existing = cur.fetchone()
+    old_slug, old_name, old_domain = existing or (None, None, None)
+    # Derive the slug from the name/domain the row holds after the upsert (the COALESCEs below). A failed
+    # scrape passes neither, and deriving from that alone reset the slug to the board token.
     slug_map = derive_company_slug_map([{
         "ats": ats,
         "board_token": board_token,
-        "company_name": company_name,
-        "domain": domain,
+        "company_name": company_name if company_name is not None else old_name,
+        "domain": domain if domain is not None else old_domain,
     }])
     company_slug = slug_map[(ats, board_token)]
     scrape_status_is_set = scrape_status is not _UNSET
@@ -1553,7 +1565,27 @@ def upsert_company(conn, ats: str, board_token: str, company_name: str | None = 
             scrape_status_is_set, last_scrape_error_is_set, last_http_status_is_set,
             job_count_exact, job_count_exact,
         ))
+        # Indexed docs carry the slug the loader saw (`slug or board_token`); re-send them when it moves.
+        if existing and (old_slug or board_token) != company_slug:
+            mark_company_jobs_for_meili_reload(cur, [(ats, board_token)])
     conn.commit()
+
+
+def mark_company_jobs_for_meili_reload(cur, companies) -> None:
+    """Make load-pending re-send the already-loaded jobs of these (ats, board_token) companies."""
+    if not companies:
+        return
+    execute_values(
+        cur,
+        """
+        UPDATE pipeline_jobs AS j
+        SET meili_loaded_doc_version = NULL
+        FROM (VALUES %s) AS c(ats, board_token)
+        WHERE j.ats = c.ats AND j.board_token = c.board_token AND j.meili_loaded_at IS NOT NULL
+        """,
+        [tuple(company) for company in companies],
+        template="(%s, %s)",
+    )
 
 
 if __name__ == "__main__":
